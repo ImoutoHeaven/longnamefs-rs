@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::handle_table::HandleTable;
 use crate::namefile::{DirEntryInfo, list_logical_entries, remove_namefile, write_namefile};
-use crate::pathmap::{make_child_path, open_path, open_paths};
+use crate::pathmap::{clear_dir_fd_cache, make_child_path, open_path, open_paths};
 use crate::util::{
     access_mask_from_bits, errno_from_nix, file_attr_from_stat, oflag_from_bits, retry_eintr,
     string_to_cstring,
@@ -586,6 +586,7 @@ impl PathFilesystem for LongNameFs {
         self.invalidate_dir(pto.dir_fd.as_fd());
         write_namefile(&pto)?;
         remove_namefile(&pfrom)?;
+        clear_dir_fd_cache();
         Ok(())
     }
 

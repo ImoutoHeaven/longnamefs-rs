@@ -1,6 +1,7 @@
 use crate::util::errno_from_nix;
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
+use nix::sys::stat::fstat;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
 
@@ -10,6 +11,7 @@ pub struct Config {
     pub backend_path: PathBuf,
     pub backend_fd: OwnedFd,
     pub sync_data: bool,
+    backend_ns: String,
 }
 
 impl Config {
@@ -20,11 +22,14 @@ impl Config {
             Mode::empty(),
         )
         .map_err(errno_from_nix)?;
+        let st = fstat(&fd).map_err(errno_from_nix)?;
+        let backend_ns = format!("{}:{}", st.st_dev, st.st_ino);
 
         Ok(Self {
             backend_path: path,
             backend_fd: fd,
             sync_data,
+            backend_ns,
         })
     }
 
@@ -34,5 +39,9 @@ impl Config {
 
     pub fn sync_data(&self) -> bool {
         self.sync_data
+    }
+
+    pub fn cache_namespace(&self) -> &str {
+        &self.backend_ns
     }
 }

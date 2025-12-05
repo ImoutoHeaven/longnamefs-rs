@@ -5,7 +5,7 @@ use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
 use nix::unistd::dup;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::ops::Range;
 use std::os::fd::{AsFd, OwnedFd};
@@ -25,43 +25,84 @@ pub struct LnfsPath {
 
 #[derive(Debug)]
 struct DirFdCache {
-    entries: Mutex<HashMap<String, OwnedFd>>,
+    entries: Mutex<DirFdCacheInner>,
     capacity: usize,
 }
 
 impl DirFdCache {
     fn new(capacity: usize) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(DirFdCacheInner::new(capacity)),
             capacity,
         }
     }
 
     fn get(&self, key: &str) -> Option<OwnedFd> {
-        let guard = self.entries.lock().ok()?;
-        let fd = guard.get(key)?;
-        dup(fd.as_fd()).ok()
+        let mut guard = self.entries.lock().ok()?;
+        guard.get(key)
     }
 
     fn insert(&self, key: String, fd: OwnedFd) {
-        let mut guard = match self.entries.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-
-        if guard.len() >= self.capacity {
-            if let Some(k) = guard.keys().next().cloned() {
-                guard.remove(&k);
-            }
+        if let Ok(mut guard) = self.entries.lock() {
+            guard.insert(key, fd, self.capacity);
         }
-
-        guard.insert(key, fd);
     }
 
     fn clear(&self) {
         if let Ok(mut guard) = self.entries.lock() {
             guard.clear();
         }
+    }
+}
+
+#[derive(Debug)]
+struct DirFdCacheInner {
+    map: HashMap<String, OwnedFd>,
+    order: VecDeque<String>,
+}
+
+impl DirFdCacheInner {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<OwnedFd> {
+        let fd = self.map.get(key)?;
+        let dup_fd = dup(fd.as_fd()).ok();
+        self.touch(key);
+        dup_fd
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key.to_owned());
+        }
+    }
+
+    fn insert(&mut self, key: String, fd: OwnedFd, capacity: usize) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key.clone(), fd);
+            self.touch(&key);
+            return;
+        }
+
+        if self.map.len() >= capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+
+        self.order.push_back(key.clone());
+        self.map.insert(key, fd);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
     }
 }
 
@@ -150,15 +191,13 @@ fn open_path_with_cache(
     )
     .map_err(errno_from_nix)?;
 
-    let mut prefix = String::new();
+    let mut prefix = String::from(config.cache_namespace());
 
     if parts.len() > 2 {
         for seg in parts.iter().skip(1).take(parts.len() - 2) {
             let encoded = encode_name(seg);
 
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
+            prefix.push('/');
             prefix.push_str(&encoded);
 
             if use_cache {
@@ -209,6 +248,10 @@ pub fn open_path(config: &Config, path: &OsStr) -> Result<LnfsPath, fuse3::Errno
         }
         Err(err) => Err(err),
     }
+}
+
+pub fn clear_dir_fd_cache() {
+    dir_fd_cache().clear();
 }
 
 pub fn open_paths(
