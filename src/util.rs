@@ -165,7 +165,7 @@ pub fn sync_and_commit(
 pub fn fsync_dir(dir_fd: BorrowedFd<'_>) -> Result<(), fuse3::Errno> {
     match retry_eintr(|| fsync(dir_fd)) {
         Ok(()) => Ok(()),
-        Err(err) if err == NixErrno::EBADF => {
+        Err(NixErrno::EBADF) => {
             // Some kernels reject fsync on O_PATH; reopen dir for fsync.
             let reopened = openat(
                 dir_fd,
