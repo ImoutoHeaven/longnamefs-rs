@@ -49,7 +49,7 @@ Usage
 
 ```bash
 longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
-  [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--max-write-kb 1024] [--sync-data] [--collision-protect]
+  [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--max-write-kb 1024] [--sync-data] [--collision-protect] [--unsafe-namefile-writes]
 ```
 
 - `--backend` (required): directory where hashed entries and namefiles are stored.
@@ -60,6 +60,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--max-write-kb`: maximum write size advertised to FUSE in KiB (default 1024; kernel may clamp to its own maximum).
 - `--sync-data`: fdatasync data files after writes for stronger durability (at the cost of throughput).
 - `--collision-protect`: probe namefiles to detect/avoid hash collisions by using suffixed `<hash>.k` entries (default off; adds I/O).
+- `--unsafe-namefile-writes`: use non-transactional namefile updates (faster for many small files, but filename metadata may be lost or become inconsistent on crash).
 
 The process stays in the foreground and runs until the filesystem is unmounted
 or the process is terminated. This is intentional and makes it easy to use

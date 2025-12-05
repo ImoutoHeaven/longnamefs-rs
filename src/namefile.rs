@@ -11,6 +11,7 @@ use nix::unistd::{UnlinkatFlags, ftruncate, unlinkat};
 use std::ffi::OsString;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct DirEntryInfo {
@@ -18,6 +19,16 @@ pub struct DirEntryInfo {
     pub kind: FileType,
     pub encoded: String,
     pub attr: Option<fuse3::path::reply::FileAttr>,
+}
+
+static RELAXED_NAMEFILE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_relaxed_namefile_mode(relaxed: bool) {
+    RELAXED_NAMEFILE.store(relaxed, Ordering::Relaxed);
+}
+
+fn use_relaxed_namefile() -> bool {
+    RELAXED_NAMEFILE.load(Ordering::Relaxed)
 }
 
 fn namefile_suffix(fname: &str) -> Result<std::ffi::CString, fuse3::Errno> {
@@ -28,6 +39,14 @@ fn namefile_suffix(fname: &str) -> Result<std::ffi::CString, fuse3::Errno> {
 }
 
 pub fn write_namefile(path: &LnfsPath) -> Result<(), fuse3::Errno> {
+    if use_relaxed_namefile() {
+        write_namefile_simple(path)
+    } else {
+        write_namefile_durable(path)
+    }
+}
+
+fn write_namefile_durable(path: &LnfsPath) -> Result<(), fuse3::Errno> {
     let fname = namefile_suffix(&path.fname)?;
     let temp = begin_temp_file(path.dir_fd.as_fd(), fname.as_c_str(), "tn")?;
 
@@ -41,7 +60,35 @@ pub fn write_namefile(path: &LnfsPath) -> Result<(), fuse3::Errno> {
     sync_and_commit(path.dir_fd.as_fd(), temp, fname.as_c_str())
 }
 
+fn write_namefile_simple(path: &LnfsPath) -> Result<(), fuse3::Errno> {
+    let fname = namefile_suffix(&path.fname)?;
+    let fd = openat(
+        path.dir_fd.as_fd(),
+        fname.as_c_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o666),
+    )
+    .map_err(errno_from_nix)?;
+
+    let data = path.raw_name.as_bytes();
+    let written =
+        retry_eintr(|| nix::unistd::write(fd.as_fd(), data)).map_err(errno_from_nix)?;
+    if written != data.len() {
+        return Err(fuse3::Errno::from(libc::EIO));
+    }
+    ftruncate(&fd, written as i64).map_err(errno_from_nix)?;
+    Ok(())
+}
+
 pub fn remove_namefile(path: &LnfsPath) -> Result<(), fuse3::Errno> {
+    if use_relaxed_namefile() {
+        remove_namefile_simple(path)
+    } else {
+        remove_namefile_durable(path)
+    }
+}
+
+fn remove_namefile_durable(path: &LnfsPath) -> Result<(), fuse3::Errno> {
     let fname = namefile_suffix(&path.fname)?;
     let _ = unlinkat(
         path.dir_fd.as_fd(),
@@ -49,6 +96,16 @@ pub fn remove_namefile(path: &LnfsPath) -> Result<(), fuse3::Errno> {
         UnlinkatFlags::NoRemoveDir,
     );
     fsync_dir(path.dir_fd.as_fd())
+}
+
+fn remove_namefile_simple(path: &LnfsPath) -> Result<(), fuse3::Errno> {
+    let fname = namefile_suffix(&path.fname)?;
+    let _ = unlinkat(
+        path.dir_fd.as_fd(),
+        fname.as_c_str(),
+        UnlinkatFlags::NoRemoveDir,
+    );
+    Ok(())
 }
 
 pub fn list_logical_entries(

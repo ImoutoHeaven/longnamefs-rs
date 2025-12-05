@@ -61,6 +61,10 @@ struct Cli {
     /// Maximum write size advertised to FUSE in KiB (default 1024; kernel may clamp to its own maximum).
     #[arg(long, default_value_t = 1024)]
     max_write_kb: u32,
+
+    /// Use non-transactional namefile writes (faster but unsafe: filename metadata may be lost or become inconsistent on crash).
+    #[arg(long, default_value_t = false)]
+    unsafe_namefile_writes: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -71,6 +75,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::open_backend(cli.backend, cli.sync_data, cli.collision_protect)
         .map_err(std::io::Error::from)
         .map_err(anyhow::Error::from)?;
+
+    namefile::set_relaxed_namefile_mode(cli.unsafe_namefile_writes);
 
     let cache_ttl = if cli.no_dir_cache || cli.dir_cache_ttl_ms == 0 {
         None
