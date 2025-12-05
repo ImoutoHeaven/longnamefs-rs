@@ -5,9 +5,9 @@ use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
+use std::ops::Range;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::ops::Range;
 
 pub const MAX_NAME_LENGTH: usize = 4096;
 pub const BACKEND_HASH_OCTET_COUNT: usize = 16;
@@ -56,9 +56,7 @@ impl PathSegments {
     }
 
     fn last(&self) -> Option<&[u8]> {
-        self.parts
-            .last()
-            .map(|range| &self.buf[range.clone()])
+        self.parts.last().map(|range| &self.buf[range.clone()])
     }
 
     fn iter(&self) -> impl Iterator<Item = &[u8]> {

@@ -10,8 +10,16 @@ use config::Config;
 use fs::LongNameFs;
 use fuse3::MountOptions;
 use fuse3::path::Session;
+#[cfg(unix)]
+use futures_util::future::poll_fn;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::pin::Pin;
 use std::time::Duration;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
+#[cfg(unix)]
+use tokio::sync::oneshot;
 
 #[derive(Parser, Debug)]
 #[command(name = "longnamefs-rs")]
@@ -65,9 +73,57 @@ async fn main() -> anyhow::Result<()> {
     let session = Session::new(mount_opts);
     let handle = session.mount(fs, cli.mountpoint).await?;
 
-    // Block until the filesystem is unmounted. This keeps the
-    // process alive instead of exiting immediately after mount.
-    handle.await?;
+    #[cfg(unix)]
+    {
+        // Listen for termination signals and unmount cleanly before exiting.
+        let (unmount_tx, unmount_rx) = oneshot::channel::<()>();
+
+        let mut mount_task = tokio::spawn(async move {
+            let mut handle = Some(handle);
+            let mut handle_future = poll_fn(|cx| {
+                let handle = handle.as_mut().expect("mount handle missing");
+                Pin::new(handle).poll(cx)
+            });
+
+            let res = tokio::select! {
+                res = &mut handle_future => res,
+                _ = unmount_rx => {
+                    let handle = handle.take().expect("mount handle missing");
+                    handle.unmount().await
+                }
+            };
+
+            res.map_err(anyhow::Error::from)
+        });
+
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+
+        let signals = async {
+            tokio::select! {
+                _ = sigint.recv() => (),
+                _ = sigterm.recv() => (),
+            }
+        };
+        tokio::pin!(signals);
+
+        let result = tokio::select! {
+            res = &mut mount_task => res,
+            _ = &mut signals => {
+                let _ = unmount_tx.send(());
+                mount_task.await
+            }
+        };
+
+        result??;
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Block until the filesystem is unmounted. This keeps the
+        // process alive instead of exiting immediately after mount.
+        handle.await?;
+    }
 
     Ok(())
 }

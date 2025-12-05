@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::handle_table::HandleTable;
-use crate::namefile::{list_logical_entries, remove_namefile, write_namefile, DirEntryInfo};
+use crate::namefile::{DirEntryInfo, list_logical_entries, remove_namefile, write_namefile};
 use crate::pathmap::{make_child_path, open_path, open_paths};
 use crate::util::{
     access_mask_from_bits, errno_from_nix, file_attr_from_stat, oflag_from_bits, retry_eintr,
@@ -919,8 +919,7 @@ impl PathFilesystem for LongNameFs {
             .get_dir(fh)
             .ok_or_else(|| fuse3::Errno::from(libc::EBADF))?;
         let logical = self.load_dir_entries(handle.as_fd());
-        let mut entries: Vec<fuse3::Result<DirectoryEntry>> =
-            Vec::with_capacity(logical.len() + 2);
+        let mut entries: Vec<fuse3::Result<DirectoryEntry>> = Vec::with_capacity(logical.len() + 2);
 
         let mut idx: i64 = 0;
         entries.push(Ok(DirectoryEntry {
