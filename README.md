@@ -9,9 +9,33 @@ Rust + FUSE3 rewrite of `longnamefs`, compatible with the original C backend lay
 
 Requirements
 ------------
+- Runtime dependencies:
+  - A kernel with FUSE support enabled.
+  - `libfuse3` / `fuse3` available on the system.
+- Build-time (from source):
+  - Rust toolchain (edition 2024; `cargo` + `rustc`).
+  - C toolchain and headers.
+  - `libfuse3` development headers.
 
-- libfuse3 available on the system.
-- Rust toolchain (edition 2024). The binary uses Tokio runtime via the `fuse3` crate.
+Examples:
+
+On **Debian/Ubuntu**:
+
+```bash
+sudo apt update
+# To run an existing binary:
+sudo apt install -y fuse3 libfuse3-3
+# To build from source:
+sudo apt install -y build-essential pkg-config libfuse3-dev
+```
+
+To allow non-root users to mount with `--allow-other`:
+
+```bash
+sudo adduser "$USER" fuse
+echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+# then log out and log back in
+```
 
 Build
 -----
@@ -34,6 +58,10 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000).
 - `--no-dir-cache`: disable directory cache entirely (useful for debugging correctness).
 
+The process stays in the foreground and runs until the filesystem is unmounted
+or the process is terminated. This is intentional and makes it easy to use
+with process supervisors (e.g. systemd).
+
 Behavior
 --------
 
@@ -42,3 +70,43 @@ Behavior
 - Operations on `/` interact directly with the backend directory (chmod/chown/utimens supported; truncate disallowed).
 - Extended attributes (get/set/list/remove) are forwarded to the backend objects; `position` must be zero on Linux.
 - `readdirplus` returns names with attributes; `flush`/`fsyncdir` are implemented; `poll` is accepted (returns no ready events).
+
+systemd example
+---------------
+
+For long-running mounts it is recommended to let `systemd` supervise
+`longnamefs-rs` rather than trying to daemonize from inside the process.
+
+Example unit file (`/etc/systemd/system/longnamefs-rs.service`):
+
+```ini
+[Unit]
+Description=longnamefs-rs FUSE filesystem
+After=network.target
+
+[Service]
+Type=simple
+User=youruser
+Group=youruser
+ExecStart=/ext/longnamefs-rs --backend /ext/raw-long /ext/mnt-long --allow-other
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now longnamefs-rs.service
+```
+
+Un-mounting is handled automatically when the service stops (Ctrl+C on
+`ExecStart` or `systemctl stop`); you can also manually unmount with:
+
+```bash
+fusermount3 -u /ext/mnt-long
+# or
+sudo umount /ext/mnt-long
+```

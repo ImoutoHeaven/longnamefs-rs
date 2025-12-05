@@ -63,7 +63,11 @@ async fn main() -> anyhow::Result<()> {
     mount_opts.nonempty(cli.nonempty);
 
     let session = Session::new(mount_opts);
-    let _handle = session.mount(fs, cli.mountpoint).await?;
+    let handle = session.mount(fs, cli.mountpoint).await?;
+
+    // Block until the filesystem is unmounted. This keeps the
+    // process alive instead of exiting immediately after mount.
+    handle.await?;
 
     Ok(())
 }
