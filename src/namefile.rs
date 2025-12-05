@@ -1,7 +1,10 @@
 use crate::pathmap::{
     BACKEND_HASH_OCTET_COUNT, BACKEND_HASH_STRING_LENGTH, LnfsPath, MAX_NAME_LENGTH,
 };
-use crate::util::{errno_from_nix, file_type_from_mode, retry_eintr, string_to_cstring};
+use crate::util::{
+    begin_temp_file, errno_from_nix, file_type_from_mode, fsync_dir, retry_eintr,
+    string_to_cstring, sync_and_commit,
+};
 use fuse3::FileType;
 use libc;
 use nix::dir::Dir;
@@ -28,21 +31,16 @@ fn namefile_suffix(fname: &str) -> Result<std::ffi::CString, fuse3::Errno> {
 
 pub fn write_namefile(path: &LnfsPath) -> Result<(), fuse3::Errno> {
     let fname = namefile_suffix(&path.fname)?;
-    let fd = openat(
-        path.dir_fd.as_fd(),
-        fname.as_c_str(),
-        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_CLOEXEC,
-        Mode::from_bits_truncate(0o666),
-    )
-    .map_err(errno_from_nix)?;
+    let temp = begin_temp_file(path.dir_fd.as_fd(), fname.as_c_str(), "tn")?;
 
     let data = path.raw_name.as_bytes();
-    let written = retry_eintr(|| nix::unistd::write(&fd, data)).map_err(errno_from_nix)?;
+    let written =
+        retry_eintr(|| nix::unistd::write(temp.fd.as_fd(), data)).map_err(errno_from_nix)?;
     if written != data.len() {
         return Err(fuse3::Errno::from(libc::EIO));
     }
-    ftruncate(&fd, written as i64).map_err(errno_from_nix)?;
-    Ok(())
+    ftruncate(&temp.fd, written as i64).map_err(errno_from_nix)?;
+    sync_and_commit(path.dir_fd.as_fd(), temp, fname.as_c_str())
 }
 
 pub fn remove_namefile(path: &LnfsPath) -> Result<(), fuse3::Errno> {
@@ -52,7 +50,7 @@ pub fn remove_namefile(path: &LnfsPath) -> Result<(), fuse3::Errno> {
         fname.as_c_str(),
         UnlinkatFlags::NoRemoveDir,
     );
-    Ok(())
+    fsync_dir(path.dir_fd.as_fd())
 }
 
 pub fn list_logical_entries(

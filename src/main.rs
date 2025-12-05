@@ -47,13 +47,17 @@ struct Cli {
     /// Disable directory entry cache.
     #[arg(long, default_value_t = false)]
     no_dir_cache: bool,
+
+    /// fdatasync data files on write to improve durability (at the cost of latency).
+    #[arg(long, default_value_t = false)]
+    sync_data: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let config = Config::open_backend(cli.backend)
+    let config = Config::open_backend(cli.backend, cli.sync_data)
         .map_err(std::io::Error::from)
         .map_err(anyhow::Error::from)?;
 

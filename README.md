@@ -49,7 +49,7 @@ Usage
 
 ```bash
 longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
-  [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache]
+  [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--sync-data]
 ```
 
 - `--backend` (required): directory where hashed entries and namefiles are stored.
@@ -57,6 +57,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--nonempty`: allow mounting on a non-empty mountpoint.
 - `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000).
 - `--no-dir-cache`: disable directory cache entirely (useful for debugging correctness).
+- `--sync-data`: fdatasync data files after writes for stronger durability (at the cost of throughput).
 
 The process stays in the foreground and runs until the filesystem is unmounted
 or the process is terminated. This is intentional and makes it easy to use

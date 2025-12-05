@@ -673,6 +673,11 @@ impl PathFilesystem for LongNameFs {
 
         let written =
             retry_eintr(|| pwrite(handle.as_fd(), data, offset as i64)).map_err(errno_from_nix)?;
+
+        if self.config.sync_data() {
+            fdatasync(handle.as_fd()).map_err(errno_from_nix)?;
+        }
+
         Ok(ReplyWrite {
             written: written as u32,
         })
