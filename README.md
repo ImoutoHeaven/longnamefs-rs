@@ -49,7 +49,7 @@ Usage
 
 ```bash
 longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
-  [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--sync-data] [--collision-protect]
+  [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--max-write-kb 1024] [--sync-data] [--collision-protect]
 ```
 
 - `--backend` (required): directory where hashed entries and namefiles are stored.
@@ -57,6 +57,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--nonempty`: allow mounting on a non-empty mountpoint.
 - `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000).
 - `--no-dir-cache`: disable directory cache entirely (useful for debugging correctness).
+- `--max-write-kb`: maximum write size advertised to FUSE in KiB (default 1024; kernel may clamp to its own maximum).
 - `--sync-data`: fdatasync data files after writes for stronger durability (at the cost of throughput).
 - `--collision-protect`: probe namefiles to detect/avoid hash collisions by using suffixed `<hash>.k` entries (default off; adds I/O).
 

@@ -132,14 +132,19 @@ pub struct LongNameFs {
     config: Arc<Config>,
     handles: HandleTable,
     dir_cache: DirCache,
+    max_write: NonZeroU32,
 }
 
 impl LongNameFs {
-    pub fn new(config: Config, dir_cache_ttl: Option<Duration>) -> Self {
+    pub fn new(config: Config, dir_cache_ttl: Option<Duration>, max_write_kb: u32) -> Self {
+        let bytes = max_write_kb.saturating_mul(1024).max(4096);
+        let max_write =
+            NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
         Self {
             config: Arc::new(config),
             handles: HandleTable::new(),
             dir_cache: DirCache::new(dir_cache_ttl),
+            max_write,
         }
     }
 
@@ -332,9 +337,9 @@ impl LongNameFs {
 
 impl PathFilesystem for LongNameFs {
     async fn init(&self, _req: Request) -> Result<ReplyInit, fuse3::Errno> {
-        let max_write =
-            NonZeroU32::new(128 * 1024).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
-        Ok(ReplyInit { max_write })
+        Ok(ReplyInit {
+            max_write: self.max_write,
+        })
     }
 
     async fn destroy(&self, _req: Request) {}

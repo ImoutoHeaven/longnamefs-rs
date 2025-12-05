@@ -57,6 +57,10 @@ struct Cli {
     /// Check and avoid hash collisions by probing suffixed entries; slightly slower.
     #[arg(long, default_value_t = false)]
     collision_protect: bool,
+
+    /// Maximum write size advertised to FUSE in KiB (default 1024; kernel may clamp to its own maximum).
+    #[arg(long, default_value_t = 1024)]
+    max_write_kb: u32,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -74,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Duration::from_millis(cli.dir_cache_ttl_ms))
     };
 
-    let fs = LongNameFs::new(config, cache_ttl);
+    let fs = LongNameFs::new(config, cache_ttl, cli.max_write_kb);
 
     let mut mount_opts = MountOptions::default();
     mount_opts.fs_name("longnamefs-rs");
