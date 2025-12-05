@@ -234,7 +234,7 @@ impl LongNameFs {
     }
 
     fn open_file(&self, path: &OsStr, mode: u32, flags: u32) -> Result<u64, fuse3::Errno> {
-        let oflag = oflag_from_bits(flags) | OFlag::O_CLOEXEC;
+        let mut oflag = oflag_from_bits(flags) | OFlag::O_CLOEXEC;
 
         let fd = if path == OsStr::new("/") {
             openat(
@@ -247,6 +247,9 @@ impl LongNameFs {
         } else {
             let mapped = open_path(&self.config, path)?;
             let created = oflag.contains(OFlag::O_CREAT);
+            if created {
+                oflag |= OFlag::O_EXCL;
+            }
             let fname = string_to_cstring(&mapped.fname)?;
             let fd = openat(
                 mapped.dir_fd.as_fd(),
