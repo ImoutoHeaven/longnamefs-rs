@@ -51,13 +51,17 @@ struct Cli {
     /// fdatasync data files on write to improve durability (at the cost of latency).
     #[arg(long, default_value_t = false)]
     sync_data: bool,
+
+    /// Check and avoid hash collisions by probing suffixed entries; slightly slower.
+    #[arg(long, default_value_t = false)]
+    collision_protect: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let config = Config::open_backend(cli.backend, cli.sync_data)
+    let config = Config::open_backend(cli.backend, cli.sync_data, cli.collision_protect)
         .map_err(std::io::Error::from)
         .map_err(anyhow::Error::from)?;
 

@@ -1,12 +1,12 @@
 use crate::config::Config;
-use crate::util::{errno_from_nix, string_to_cstring};
+use crate::util::{errno_from_nix, retry_eintr, string_to_cstring};
 use libc;
-use nix::fcntl::{OFlag, openat};
+use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::Mode;
 use nix::unistd::dup;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::ops::Range;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -15,6 +15,8 @@ use std::sync::{Mutex, OnceLock};
 pub const MAX_NAME_LENGTH: usize = 4096;
 pub const BACKEND_HASH_OCTET_COUNT: usize = 16;
 pub const BACKEND_HASH_STRING_LENGTH: usize = BACKEND_HASH_OCTET_COUNT * 2;
+const MAX_COLLISION_SUFFIX: usize = 64;
+const MAX_COLLISION_PROBE: usize = MAX_COLLISION_SUFFIX + 1;
 
 #[derive(Debug)]
 pub struct LnfsPath {
@@ -164,10 +166,117 @@ pub fn encode_name(raw: &[u8]) -> String {
     hex::encode(&digest[..BACKEND_HASH_OCTET_COUNT])
 }
 
+fn read_namefile_match(
+    dir_fd: std::os::fd::BorrowedFd<'_>,
+    encoded: &str,
+    raw: &[u8],
+    buf: &mut Vec<u8>,
+) -> Result<Option<bool>, fuse3::Errno> {
+    let mut fname = encoded.as_bytes().to_vec();
+    fname.push(b'n');
+    let fname = CString::new(fname).map_err(|_| fuse3::Errno::from(libc::EINVAL))?;
+    let fd = match openat(
+        dir_fd,
+        fname.as_c_str(),
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(err) => return Err(errno_from_nix(err)),
+    };
+
+    if buf.len() < MAX_NAME_LENGTH {
+        buf.resize(MAX_NAME_LENGTH, 0);
+    }
+    let read_len = match retry_eintr(|| nix::unistd::read(&fd, buf)) {
+        Ok(len) => len,
+        Err(err) => return Err(errno_from_nix(err)),
+    };
+    Ok(Some(read_len == raw.len() && &buf[..read_len] == raw))
+}
+
+fn candidate_encoded_names(base: &str) -> impl Iterator<Item = String> + '_ {
+    (0..MAX_COLLISION_PROBE).map(move |idx| {
+        if idx == 0 {
+            base.to_owned()
+        } else {
+            format!("{}.{}", base, idx)
+        }
+    })
+}
+
+fn resolve_component(
+    dir_fd: std::os::fd::BorrowedFd<'_>,
+    raw: &[u8],
+    want_dir: bool,
+    allow_new: bool,
+    collision_protect: bool,
+) -> Result<(String, Option<OwnedFd>), fuse3::Errno> {
+    let base = encode_name(raw);
+
+    if !collision_protect {
+        return Ok((base, None));
+    }
+
+    let mut name_buf = Vec::new();
+    let mut first_free: Option<String> = None;
+
+    for encoded in candidate_encoded_names(&base) {
+        match read_namefile_match(dir_fd, &encoded, raw, &mut name_buf)? {
+            Some(true) => {
+                let mut flags = OFlag::O_PATH | OFlag::O_CLOEXEC;
+                if want_dir {
+                    flags |= OFlag::O_DIRECTORY;
+                } else {
+                    flags |= OFlag::O_NOFOLLOW;
+                }
+                let c_name =
+                    CString::new(encoded.clone()).map_err(|_| fuse3::Errno::from(libc::EINVAL))?;
+                let fd = openat(dir_fd, c_name.as_c_str(), flags, Mode::empty())
+                    .map_err(errno_from_nix)?;
+                return Ok((encoded, Some(fd)));
+            }
+            Some(false) => {
+                // namefile exists but does not match, try next suffix
+            }
+            None => {
+                // Missing namefile: consider as free slot if data file also absent
+                if first_free.is_none() {
+                    let c_name = CString::new(encoded.as_bytes().to_vec())
+                        .map_err(|_| fuse3::Errno::from(libc::EINVAL))?;
+                    let data_exists = match nix::sys::stat::fstatat(
+                        dir_fd,
+                        c_name.as_c_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(_) => true,
+                        Err(nix::errno::Errno::ENOENT) => false,
+                        Err(err) => return Err(errno_from_nix(err)),
+                    };
+                    if !data_exists {
+                        first_free = Some(encoded.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if allow_new {
+        if let Some(encoded) = first_free {
+            return Ok((encoded, None));
+        }
+        return Err(fuse3::Errno::from(libc::ENOSPC));
+    }
+
+    Err(fuse3::Errno::from(libc::ENOENT))
+}
+
 fn open_path_with_cache(
     config: &Config,
     path: &OsStr,
     use_cache: bool,
+    collision_protect: bool,
 ) -> Result<LnfsPath, fuse3::Errno> {
     if path == OsStr::new("/") {
         return Err(fuse3::Errno::from(libc::EFAULT));
@@ -195,7 +304,8 @@ fn open_path_with_cache(
 
     if parts.len() > 2 {
         for seg in parts.iter().skip(1).take(parts.len() - 2) {
-            let encoded = encode_name(seg);
+            let (encoded, opened) =
+                resolve_component(dir_fd.as_fd(), seg, true, false, collision_protect)?;
 
             prefix.push('/');
             prefix.push_str(&encoded);
@@ -208,13 +318,17 @@ fn open_path_with_cache(
             }
 
             let c_name = string_to_cstring(&encoded)?;
-            let next_fd = openat(
-                dir_fd.as_fd(),
-                c_name.as_c_str(),
-                OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(errno_from_nix)?;
+            let next_fd = if let Some(fd) = opened {
+                fd
+            } else {
+                openat(
+                    dir_fd.as_fd(),
+                    c_name.as_c_str(),
+                    OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(errno_from_nix)?
+            };
 
             if use_cache {
                 if let Ok(dup_fd) = dup(next_fd.as_fd()) {
@@ -226,8 +340,8 @@ fn open_path_with_cache(
         }
     }
 
-    let fname = encode_name(last_part);
     let raw_name = OsString::from_vec(last_part.to_vec());
+    let (fname, _) = resolve_component(dir_fd.as_fd(), last_part, false, true, collision_protect)?;
 
     Ok(LnfsPath {
         dir_fd,
@@ -237,14 +351,14 @@ fn open_path_with_cache(
 }
 
 pub fn open_path(config: &Config, path: &OsStr) -> Result<LnfsPath, fuse3::Errno> {
-    match open_path_with_cache(config, path, true) {
+    match open_path_with_cache(config, path, true, config.collision_protect()) {
         Ok(v) => Ok(v),
         Err(err)
             if (err == fuse3::Errno::from(libc::ENOENT)
                 || err == fuse3::Errno::from(libc::ENOTDIR)) =>
         {
             dir_fd_cache().clear();
-            open_path_with_cache(config, path, false)
+            open_path_with_cache(config, path, false, config.collision_protect())
         }
         Err(err) => Err(err),
     }

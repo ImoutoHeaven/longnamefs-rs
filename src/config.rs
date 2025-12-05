@@ -12,10 +12,15 @@ pub struct Config {
     pub backend_fd: OwnedFd,
     pub sync_data: bool,
     backend_ns: String,
+    collision_protect: bool,
 }
 
 impl Config {
-    pub fn open_backend(path: PathBuf, sync_data: bool) -> Result<Self, fuse3::Errno> {
+    pub fn open_backend(
+        path: PathBuf,
+        sync_data: bool,
+        collision_protect: bool,
+    ) -> Result<Self, fuse3::Errno> {
         let fd = open(
             &path,
             OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY,
@@ -30,6 +35,7 @@ impl Config {
             backend_fd: fd,
             sync_data,
             backend_ns,
+            collision_protect,
         })
     }
 
@@ -43,5 +49,9 @@ impl Config {
 
     pub fn cache_namespace(&self) -> &str {
         &self.backend_ns
+    }
+
+    pub fn collision_protect(&self) -> bool {
+        self.collision_protect
     }
 }

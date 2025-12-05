@@ -1,6 +1,4 @@
-use crate::pathmap::{
-    BACKEND_HASH_OCTET_COUNT, BACKEND_HASH_STRING_LENGTH, LnfsPath, MAX_NAME_LENGTH,
-};
+use crate::pathmap::{BACKEND_HASH_STRING_LENGTH, LnfsPath, MAX_NAME_LENGTH};
 use crate::util::{
     begin_temp_file, errno_from_nix, file_attr_from_stat, file_type_from_mode, fsync_dir,
     retry_eintr, string_to_cstring, sync_and_commit,
@@ -79,17 +77,27 @@ pub fn list_logical_entries(
         };
         let name = entry.file_name();
         let raw_bytes = name.to_bytes();
-        if raw_bytes.len() != BACKEND_HASH_STRING_LENGTH + 1 {
+        if raw_bytes.is_empty() || *raw_bytes.last().unwrap() != b'n' {
             continue;
         }
-        if raw_bytes[BACKEND_HASH_STRING_LENGTH] != b'n' {
+        let stem = &raw_bytes[..raw_bytes.len() - 1];
+        if stem.len() < BACKEND_HASH_STRING_LENGTH {
             continue;
         }
-        if !raw_bytes[..BACKEND_HASH_STRING_LENGTH]
+        if !stem[..BACKEND_HASH_STRING_LENGTH]
             .iter()
             .all(|c| c.is_ascii_hexdigit())
         {
             continue;
+        }
+        let suffix = &stem[BACKEND_HASH_STRING_LENGTH..];
+        if !suffix.is_empty() {
+            if suffix.len() < 2
+                || suffix[0] != b'.'
+                || !suffix[1..].iter().all(|c| c.is_ascii_digit())
+            {
+                continue;
+            }
         }
 
         let namefile_fd = match openat(
@@ -112,7 +120,7 @@ pub fn list_logical_entries(
 
         let raw_name = OsString::from_vec(name_buf[..read_len].to_vec());
 
-        let data_name = &raw_bytes[..BACKEND_HASH_OCTET_COUNT * 2];
+        let data_name = &stem[..];
         let data_name_str = match std::str::from_utf8(data_name) {
             Ok(s) => s,
             Err(_) => continue,
