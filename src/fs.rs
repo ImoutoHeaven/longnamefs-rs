@@ -277,7 +277,7 @@ impl LongNameFs {
 
     fn apply_times(
         &self,
-        dir: OwnedFd,
+        dir: BorrowedFd<'_>,
         fname: &str,
         set_attr: &SetAttr,
     ) -> Result<(), fuse3::Errno> {
@@ -296,7 +296,7 @@ impl LongNameFs {
             .unwrap_or(TimeSpec::UTIME_OMIT);
 
         utimensat(
-            dir.as_fd(),
+            dir,
             fname.as_c_str(),
             &atime,
             &mtime,
@@ -437,7 +437,8 @@ impl PathFilesystem for LongNameFs {
             nix::unistd::ftruncate(&file, size as i64).map_err(errno_from_nix)?;
         }
 
-        self.apply_times(mapped.dir_fd, &mapped.fname, &set_attr)?;
+        self.apply_times(mapped.dir_fd.as_fd(), &mapped.fname, &set_attr)?;
+        self.invalidate_dir(mapped.dir_fd.as_fd());
         self.build_attr_reply(path)
     }
 
@@ -659,7 +660,7 @@ impl PathFilesystem for LongNameFs {
     async fn write(
         &self,
         _req: Request,
-        _path: Option<&OsStr>,
+        path: Option<&OsStr>,
         fh: u64,
         offset: u64,
         data: &[u8],
@@ -676,6 +677,14 @@ impl PathFilesystem for LongNameFs {
 
         if self.config.sync_data() {
             fdatasync(handle.as_fd()).map_err(errno_from_nix)?;
+        }
+
+        if let Some(path) = path {
+            if path != OsStr::new("/") {
+                if let Ok(mapped) = open_path(&self.config, path) {
+                    self.invalidate_dir(mapped.dir_fd.as_fd());
+                }
+            }
         }
 
         Ok(ReplyWrite {
@@ -996,25 +1005,29 @@ impl PathFilesystem for LongNameFs {
 
         for entry in logical.iter() {
             idx += 1;
-            let c_name = match string_to_cstring(&entry.encoded) {
-                Ok(v) => v,
-                Err(err) => {
-                    entries.push(Err(err));
-                    continue;
-                }
+            let attr = if let Some(attr) = entry.attr.as_ref() {
+                attr.clone()
+            } else {
+                let c_name = match string_to_cstring(&entry.encoded) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        entries.push(Err(err));
+                        continue;
+                    }
+                };
+                let stat = match fstatat(
+                    handle.as_fd(),
+                    c_name.as_c_str(),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                ) {
+                    Ok(st) => st,
+                    Err(err) => {
+                        entries.push(Err(errno_from_nix(err)));
+                        continue;
+                    }
+                };
+                file_attr_from_stat(&stat)
             };
-            let stat = match fstatat(
-                handle.as_fd(),
-                c_name.as_c_str(),
-                AtFlags::AT_SYMLINK_NOFOLLOW,
-            ) {
-                Ok(st) => st,
-                Err(err) => {
-                    entries.push(Err(errno_from_nix(err)));
-                    continue;
-                }
-            };
-            let attr = file_attr_from_stat(&stat);
             entries.push(Ok(DirectoryEntryPlus {
                 kind: entry.kind,
                 name: entry.name.clone(),

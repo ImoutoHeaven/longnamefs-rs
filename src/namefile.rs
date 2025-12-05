@@ -2,8 +2,8 @@ use crate::pathmap::{
     BACKEND_HASH_OCTET_COUNT, BACKEND_HASH_STRING_LENGTH, LnfsPath, MAX_NAME_LENGTH,
 };
 use crate::util::{
-    begin_temp_file, errno_from_nix, file_type_from_mode, fsync_dir, retry_eintr,
-    string_to_cstring, sync_and_commit,
+    begin_temp_file, errno_from_nix, file_attr_from_stat, file_type_from_mode, fsync_dir,
+    retry_eintr, string_to_cstring, sync_and_commit,
 };
 use fuse3::FileType;
 use libc;
@@ -20,6 +20,7 @@ pub struct DirEntryInfo {
     pub name: OsString,
     pub kind: FileType,
     pub encoded: String,
+    pub attr: Option<fuse3::path::reply::FileAttr>,
 }
 
 fn namefile_suffix(fname: &str) -> Result<std::ffi::CString, fuse3::Errno> {
@@ -125,10 +126,12 @@ pub fn list_logical_entries(
             Err(_) => continue,
         };
         let kind = file_type_from_mode(stat.st_mode);
+        let attr = file_attr_from_stat(&stat);
         entries.push(DirEntryInfo {
             name: raw_name,
             kind,
             encoded: data_name_str.to_owned(),
+            attr: Some(attr),
         });
     }
 
