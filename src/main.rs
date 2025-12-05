@@ -12,6 +12,8 @@ use fuse3::MountOptions;
 use fuse3::path::Session;
 #[cfg(unix)]
 use futures_util::future::poll_fn;
+#[cfg(unix)]
+use nix::mount::{MntFlags, umount2};
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::pin::Pin;
@@ -60,6 +62,7 @@ struct Cli {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let mountpoint = cli.mountpoint.clone();
 
     let config = Config::open_backend(cli.backend, cli.sync_data, cli.collision_protect)
         .map_err(std::io::Error::from)
@@ -79,10 +82,24 @@ async fn main() -> anyhow::Result<()> {
     mount_opts.nonempty(cli.nonempty);
 
     let session = Session::new(mount_opts);
-    let handle = session.mount(fs, cli.mountpoint).await?;
+    let handle = session.mount(fs, mountpoint.clone()).await?;
 
     #[cfg(unix)]
     {
+        async fn detach_mountpoint(path: &std::path::Path) -> anyhow::Result<()> {
+            let owned = path.to_owned();
+            tokio::task::spawn_blocking(move || {
+                umount2(&owned, MntFlags::MNT_DETACH).map_err(anyhow::Error::from)
+            })
+            .await?
+        }
+
+        fn is_ebusy(err: &anyhow::Error) -> bool {
+            err.downcast_ref::<std::io::Error>()
+                .and_then(|io| io.raw_os_error())
+                == Some(libc::EBUSY)
+        }
+
         // Listen for termination signals and unmount cleanly before exiting.
         let (unmount_tx, unmount_rx) = oneshot::channel::<()>();
 
@@ -123,7 +140,14 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        result??;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) if is_ebusy(&err) => {
+                detach_mountpoint(&mountpoint).await?;
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(join_err) => return Err(join_err.into()),
+        }
     }
 
     #[cfg(not(unix))]
