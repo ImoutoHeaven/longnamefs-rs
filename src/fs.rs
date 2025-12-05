@@ -46,6 +46,8 @@ struct DirCacheEntry {
     entries: Arc<Vec<DirEntryInfo>>,
 }
 
+const DIR_CACHE_MAX_DIRS: usize = 4096;
+
 #[derive(Debug)]
 struct DirCache {
     ttl: Duration,
@@ -97,6 +99,9 @@ impl DirCache {
         let expires_at = Instant::now() + self.ttl;
         let entries = Arc::new(items);
         let mut guard = self.entries.write().unwrap();
+        if guard.len() >= DIR_CACHE_MAX_DIRS {
+            guard.clear();
+        }
         guard.insert(
             key,
             DirCacheEntry {
