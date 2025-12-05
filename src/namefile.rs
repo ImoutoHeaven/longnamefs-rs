@@ -4,7 +4,6 @@ use crate::util::{
     retry_eintr, string_to_cstring, sync_and_commit,
 };
 use fuse3::FileType;
-use libc;
 use nix::dir::Dir;
 use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::{Mode, fstatat};
@@ -91,13 +90,12 @@ pub fn list_logical_entries(
             continue;
         }
         let suffix = &stem[BACKEND_HASH_STRING_LENGTH..];
-        if !suffix.is_empty() {
-            if suffix.len() < 2
+        if !suffix.is_empty()
+            && (suffix.len() < 2
                 || suffix[0] != b'.'
-                || !suffix[1..].iter().all(|c| c.is_ascii_digit())
-            {
-                continue;
-            }
+                || !suffix[1..].iter().all(|c| c.is_ascii_digit()))
+        {
+            continue;
         }
 
         let namefile_fd = match openat(
@@ -120,8 +118,7 @@ pub fn list_logical_entries(
 
         let raw_name = OsString::from_vec(name_buf[..read_len].to_vec());
 
-        let data_name = &stem[..];
-        let data_name_str = match std::str::from_utf8(data_name) {
+        let data_name_str = match std::str::from_utf8(stem) {
             Ok(s) => s,
             Err(_) => continue,
         };

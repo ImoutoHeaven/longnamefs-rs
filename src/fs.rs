@@ -11,7 +11,6 @@ use fuse3::notify::Notify;
 use fuse3::path::prelude::*;
 use fuse3::path::reply::{DirectoryEntryPlus, ReplyPoll, ReplyXAttr};
 use fuse3::{FileType, SetAttr};
-use libc;
 use nix::fcntl::{AtFlags, OFlag, openat, readlinkat, renameat};
 use nix::sys::stat::{
     FchmodatFlags, Mode, SFlag, UtimensatFlags, fchmodat, fstat, fstatat, mkdirat, mknodat,
@@ -74,20 +73,20 @@ impl DirCache {
         let now = Instant::now();
         {
             let guard = self.entries.read().ok()?;
-            if let Some(entry) = guard.get(&key) {
-                if entry.expires_at > now {
-                    return Some(entry.entries.clone());
-                }
+            if let Some(entry) = guard.get(&key)
+                && entry.expires_at > now
+            {
+                return Some(entry.entries.clone());
             }
         }
 
         let mut guard = self.entries.write().ok()?;
-        if let Some(entry) = guard.get(&key) {
-            if entry.expires_at > now {
-                return Some(entry.entries.clone());
-            }
-            guard.remove(&key);
+        if let Some(entry) = guard.get(&key)
+            && entry.expires_at > now
+        {
+            return Some(entry.entries.clone());
         }
+        guard.remove(&key);
         None
     }
 
@@ -120,8 +119,8 @@ impl DirCache {
 
 fn dir_cache_key(fd: BorrowedFd<'_>) -> Option<DirCacheKey> {
     fstat(fd).ok().map(|stat| DirCacheKey {
-        dev: stat.st_dev as u64,
-        ino: stat.st_ino as u64,
+        dev: stat.st_dev,
+        ino: stat.st_ino,
     })
 }
 
@@ -152,19 +151,19 @@ impl LongNameFs {
 
     fn load_dir_entries(&self, dir_fd: BorrowedFd<'_>) -> Arc<Vec<DirEntryInfo>> {
         let key = dir_cache_key(dir_fd);
-        if let Some(cache_key) = key {
-            if let Some(entries) = self.dir_cache.get(cache_key) {
-                return entries;
-            }
+        if let Some(cache_key) = key
+            && let Some(entries) = self.dir_cache.get(cache_key)
+        {
+            return entries;
         }
 
         let mut name_buf = Vec::new();
         let mut logical = Vec::new();
         let result = list_logical_entries(dir_fd, &mut name_buf, &mut logical);
-        if let Some(cache_key) = key {
-            if result.is_ok() {
-                return self.dir_cache.insert(cache_key, logical);
-            }
+        if let Some(cache_key) = key
+            && result.is_ok()
+        {
+            return self.dir_cache.insert(cache_key, logical);
         }
 
         Arc::new(logical)
@@ -358,15 +357,13 @@ impl PathFilesystem for LongNameFs {
         fh: Option<u64>,
         _flags: u32,
     ) -> Result<ReplyAttr, fuse3::Errno> {
-        if let Some(handle_id) = fh {
-            if let Some(handle) = self.handles.get_file(handle_id) {
-                let stat = fstat(handle.as_fd()).map_err(errno_from_nix)?;
-                let attr = file_attr_from_stat(&stat);
-                return Ok(ReplyAttr {
-                    ttl: ATTR_TTL,
-                    attr,
-                });
-            }
+        if let Some(handle) = fh.and_then(|id| self.handles.get_file(id)) {
+            let stat = fstat(handle.as_fd()).map_err(errno_from_nix)?;
+            let attr = file_attr_from_stat(&stat);
+            return Ok(ReplyAttr {
+                ttl: ATTR_TTL,
+                attr,
+            });
         }
 
         let path = path.ok_or_else(fuse3::Errno::new_not_exist)?;
@@ -566,7 +563,7 @@ impl PathFilesystem for LongNameFs {
     ) -> Result<(), fuse3::Errno> {
         let from = make_child_path(origin_parent, origin_name);
         let to = make_child_path(parent, name);
-        if from == OsString::from("/") || to == OsString::from("/") {
+        if from == "/" || to == "/" {
             return Err(fuse3::Errno::from(libc::EFAULT));
         }
 
@@ -600,7 +597,7 @@ impl PathFilesystem for LongNameFs {
         let target = path;
         let dest = make_child_path(new_parent, new_name);
 
-        if target == OsStr::new("/") || dest == OsString::from("/") {
+        if target == OsStr::new("/") || dest == "/" {
             return Err(fuse3::Errno::from(libc::EFAULT));
         }
 
@@ -680,12 +677,11 @@ impl PathFilesystem for LongNameFs {
             fdatasync(handle.as_fd()).map_err(errno_from_nix)?;
         }
 
-        if let Some(path) = path {
-            if path != OsStr::new("/") {
-                if let Ok(mapped) = open_path(&self.config, path) {
-                    self.invalidate_dir(mapped.dir_fd.as_fd());
-                }
-            }
+        if let Some(path) = path
+            && path != "/"
+            && let Ok(mapped) = open_path(&self.config, path)
+        {
+            self.invalidate_dir(mapped.dir_fd.as_fd());
         }
 
         Ok(ReplyWrite {
@@ -989,7 +985,7 @@ impl PathFilesystem for LongNameFs {
             kind: FileType::Directory,
             name: OsString::from("."),
             offset: idx + 1,
-            attr: dir_attr.clone(),
+            attr: dir_attr,
             entry_ttl: ATTR_TTL,
             attr_ttl: ATTR_TTL,
         }));
@@ -998,7 +994,7 @@ impl PathFilesystem for LongNameFs {
             kind: FileType::Directory,
             name: OsString::from(".."),
             offset: idx + 1,
-            attr: dir_attr.clone(),
+            attr: dir_attr,
             entry_ttl: ATTR_TTL,
             attr_ttl: ATTR_TTL,
         }));
@@ -1007,7 +1003,7 @@ impl PathFilesystem for LongNameFs {
         for entry in logical.iter() {
             idx += 1;
             let attr = if let Some(attr) = entry.attr.as_ref() {
-                attr.clone()
+                *attr
             } else {
                 let c_name = match string_to_cstring(&entry.encoded) {
                     Ok(v) => v,

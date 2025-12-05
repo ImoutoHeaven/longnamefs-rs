@@ -1,6 +1,5 @@
 use fuse3::FileType;
 use fuse3::path::reply::FileAttr;
-use libc;
 use nix::errno::Errno as NixErrno;
 use nix::fcntl::{OFlag, openat, renameat};
 use nix::sys::stat::{FileStat, Mode};
@@ -45,9 +44,9 @@ pub fn file_attr_from_stat(stat: &FileStat) -> FileAttr {
     FileAttr {
         size: stat.st_size as u64,
         blocks: stat.st_blocks as u64,
-        atime: system_time_from_raw(stat.st_atime, stat.st_atime_nsec.into()),
-        mtime: system_time_from_raw(stat.st_mtime, stat.st_mtime_nsec.into()),
-        ctime: system_time_from_raw(stat.st_ctime, stat.st_ctime_nsec.into()),
+        atime: system_time_from_raw(stat.st_atime, stat.st_atime_nsec),
+        mtime: system_time_from_raw(stat.st_mtime, stat.st_mtime_nsec),
+        ctime: system_time_from_raw(stat.st_ctime, stat.st_ctime_nsec),
         kind,
         perm,
         nlink: stat.st_nlink as u32,
@@ -76,7 +75,7 @@ where
 {
     loop {
         match op() {
-            Err(err) if err == NixErrno::EINTR => continue,
+            Err(NixErrno::EINTR) => continue,
             other => return other,
         }
     }
@@ -144,7 +143,7 @@ pub fn begin_temp_file(
                 counter = counter.wrapping_add(1);
                 continue;
             }
-            Err(err) => return Err(errno_from_nix(err.into())),
+            Err(err) => return Err(errno_from_nix(err)),
         }
     }
 

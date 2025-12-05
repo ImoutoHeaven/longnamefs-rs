@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::util::{errno_from_nix, retry_eintr, string_to_cstring};
-use libc;
 use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::Mode;
 use nix::unistd::dup;
@@ -92,10 +91,10 @@ impl DirFdCacheInner {
             return;
         }
 
-        if self.map.len() >= capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
-            }
+        if self.map.len() >= capacity
+            && let Some(old) = self.order.pop_front()
+        {
+            self.map.remove(&old);
         }
 
         self.order.push_back(key.clone());
@@ -133,10 +132,10 @@ impl PathSegments {
             }
         }
         parts.push(start..buf.len());
-        if let Some(last) = parts.last() {
-            if last.start == buf.len() {
-                let _ = parts.pop();
-            }
+        if let Some(last) = parts.last()
+            && last.start == buf.len()
+        {
+            let _ = parts.pop();
         }
 
         Self { buf, parts }
@@ -310,11 +309,9 @@ fn open_path_with_cache(
             prefix.push('/');
             prefix.push_str(&encoded);
 
-            if use_cache {
-                if let Some(fd) = dir_fd_cache().get(&prefix) {
-                    dir_fd = fd;
-                    continue;
-                }
+            if use_cache && let Some(fd) = dir_fd_cache().get(&prefix) {
+                dir_fd = fd;
+                continue;
             }
 
             let c_name = string_to_cstring(&encoded)?;
@@ -330,10 +327,8 @@ fn open_path_with_cache(
                 .map_err(errno_from_nix)?
             };
 
-            if use_cache {
-                if let Ok(dup_fd) = dup(next_fd.as_fd()) {
-                    dir_fd_cache().insert(prefix.clone(), dup_fd);
-                }
+            if use_cache && let Ok(dup_fd) = dup(next_fd.as_fd()) {
+                dir_fd_cache().insert(prefix.clone(), dup_fd);
             }
             drop(dir_fd);
             dir_fd = next_fd;
