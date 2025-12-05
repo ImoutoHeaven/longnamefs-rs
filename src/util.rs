@@ -163,5 +163,21 @@ pub fn sync_and_commit(
 }
 
 pub fn fsync_dir(dir_fd: BorrowedFd<'_>) -> Result<(), fuse3::Errno> {
-    retry_eintr(|| fsync(dir_fd)).map_err(errno_from_nix)
+    match retry_eintr(|| fsync(dir_fd)) {
+        Ok(()) => Ok(()),
+        Err(err) if err == NixErrno::EBADF => {
+            // Some kernels reject fsync on O_PATH; reopen dir for fsync.
+            let reopened = openat(
+                dir_fd,
+                ".",
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(errno_from_nix)?;
+            let res = retry_eintr(|| fsync(reopened.as_fd())).map_err(errno_from_nix);
+            drop(reopened);
+            res
+        }
+        Err(err) => Err(errno_from_nix(err)),
+    }
 }
