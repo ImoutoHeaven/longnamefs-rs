@@ -1,0 +1,17 @@
+[package]
+name = "longnamefs-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.95"
+bytes = "1.7.2"
+clap = { version = "4.5.21", features = ["derive"] }
+fuse3 = { version = "0.8.1", features = ["tokio-runtime"] }
+futures-util = "0.3.31"
+hex = "0.4.3"
+nix = { version = "0.30.1", features = ["dir", "fs", "mount", "uio", "user"] }
+sha2 = "0.10.8"
+tokio = { version = "1.41.1", features = ["macros", "rt-multi-thread"] }
+libc = "0.2.178"
+trait-make = "0.1.0"
