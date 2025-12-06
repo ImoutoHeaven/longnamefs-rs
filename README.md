@@ -64,6 +64,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--sync-data`: fdatasync data files after writes for stronger durability (at the cost of throughput).
 - `--collision-protect`: probe namefiles to detect/avoid hash collisions by using suffixed `<hash>.k` entries (default off; adds I/O).
 - `--unsafe-namefile-writes`: use non-transactional namefile updates (faster for many small files, but filename metadata may be lost or become inconsistent on crash).
+- The process attempts to raise `RLIMIT_NOFILE` on Unix to mitigate `EMFILE` when v2 caches many directory FDs; in production, set a generous `ulimit -n` (e.g. 65536).
 
 The process stays in the foreground and runs until the filesystem is unmounted
 or the process is terminated. This is intentional and makes it easy to use

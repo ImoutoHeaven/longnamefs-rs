@@ -17,6 +17,8 @@ use fuse3::path::Session;
 use futures_util::future::poll_fn;
 #[cfg(unix)]
 use nix::mount::{MntFlags, umount2};
+#[cfg(unix)]
+use std::cmp::min;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::pin::Pin;
@@ -25,6 +27,27 @@ use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 #[cfg(unix)]
 use tokio::sync::oneshot;
+
+#[cfg(unix)]
+fn increase_rlimit_nofile() -> std::io::Result<()> {
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            let desired = min(65536 as libc::rlim_t, limit.rlim_max);
+            if desired > limit.rlim_cur {
+                let new_limit = libc::rlimit {
+                    rlim_cur: desired,
+                    rlim_max: limit.rlim_max,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &new_limit);
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "longnamefs-rs")]
@@ -110,6 +133,9 @@ impl From<IndexSyncCli> for IndexSync {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let _ = increase_rlimit_nofile();
+
     let cli = Cli::parse();
     let mountpoint = cli.mountpoint.clone();
 
