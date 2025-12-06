@@ -99,22 +99,15 @@ impl DirCache {
             return None;
         }
         let now = Instant::now();
-        {
-            let guard = self.entries.read().ok()?;
-            if let Some(entry) = guard.get(&key)
-                && entry.expires_at > now
-            {
+        let mut guard = self.entries.write().ok()?;
+        if let Some(entry) = guard.get_mut(&key) {
+            if entry.expires_at > now {
+                entry.expires_at = now + self.ttl;
                 return Some(entry.entries.clone());
             }
+            guard.remove(&key);
+            return None;
         }
-
-        let mut guard = self.entries.write().ok()?;
-        if let Some(entry) = guard.get(&key)
-            && entry.expires_at > now
-        {
-            return Some(entry.entries.clone());
-        }
-        guard.remove(&key);
         None
     }
 
