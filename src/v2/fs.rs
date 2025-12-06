@@ -72,6 +72,7 @@ struct DirCacheEntry {
 }
 
 const DIR_CACHE_MAX_DIRS: usize = 1024;
+const DIR_FD_CACHE_MAX_DIRS: usize = 1024;
 
 #[derive(Debug)]
 struct DirCache {
@@ -160,6 +161,123 @@ struct DirEntryInfo {
     kind: FileType,
     attr: Option<fuse3::path::reply::FileAttr>,
     backend_name: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct DirFdCacheEntry {
+    expires_at: Instant,
+    fd: Arc<OwnedFd>,
+}
+
+#[derive(Debug)]
+struct DirFdCache {
+    ttl: Duration,
+    enabled: bool,
+    entries: Mutex<HashMap<DirCacheKey, DirFdCacheEntry>>,
+    lru: Mutex<VecDeque<DirCacheKey>>,
+}
+
+impl DirFdCache {
+    fn new(ttl: Option<Duration>) -> Self {
+        let (enabled, ttl) = match ttl {
+            Some(t) => (true, t),
+            None => (false, Duration::ZERO),
+        };
+        Self {
+            ttl,
+            enabled,
+            entries: Mutex::new(HashMap::new()),
+            lru: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn touch_lru(&self, key: DirCacheKey) {
+        if !self.enabled {
+            return;
+        }
+        if let Ok(mut lru) = self.lru.lock() {
+            if let Some(pos) = lru.iter().position(|k| *k == key) {
+                lru.remove(pos);
+            }
+            lru.push_back(key);
+            while lru.len() > DIR_FD_CACHE_MAX_DIRS {
+                lru.pop_front();
+            }
+        }
+    }
+
+    fn evict_if_needed(&self) {
+        if !self.enabled {
+            return;
+        }
+        let mut entries = match self.entries.lock() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let mut lru = match self.lru.lock() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        while entries.len() > DIR_FD_CACHE_MAX_DIRS {
+            if let Some(old) = lru.pop_front() {
+                entries.remove(&old);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn get(&self, key: DirCacheKey) -> Option<Arc<OwnedFd>> {
+        if !self.enabled {
+            return None;
+        }
+        let now = Instant::now();
+        let mut entries = self.entries.lock().ok()?;
+        if let Some(entry) = entries.get(&key)
+            && entry.expires_at > now
+        {
+            let fd = entry.fd.clone();
+            drop(entries);
+            self.touch_lru(key);
+            return Some(fd);
+        }
+        entries.remove(&key);
+        None
+    }
+
+    fn insert(&self, key: DirCacheKey, fd: OwnedFd) -> Arc<OwnedFd> {
+        let fd = Arc::new(fd);
+        if !self.enabled {
+            return fd;
+        }
+        let expires_at = Instant::now() + self.ttl;
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(
+                key,
+                DirFdCacheEntry {
+                    expires_at,
+                    fd: fd.clone(),
+                },
+            );
+        }
+        self.touch_lru(key);
+        self.evict_if_needed();
+        fd
+    }
+
+    fn invalidate(&self, key: DirCacheKey) {
+        if !self.enabled {
+            return;
+        }
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(&key);
+        }
+        if let Ok(mut lru) = self.lru.lock()
+            && let Some(pos) = lru.iter().position(|k| *k == key)
+        {
+            lru.remove(pos);
+        }
+    }
 }
 
 fn map_dirent_type(entry: &nix::dir::Entry) -> Option<FileType> {
@@ -415,7 +533,7 @@ impl BackendName {
 
 #[derive(Debug)]
 struct Ln2Path {
-    dir_fd: OwnedFd,
+    dir_fd: Arc<OwnedFd>,
     backend_name: BackendName,
     raw_name: Vec<u8>,
     kind: SegmentKind,
@@ -423,7 +541,7 @@ struct Ln2Path {
 
 #[derive(Debug)]
 struct ParentCtx {
-    dir_fd: OwnedFd,
+    dir_fd: Arc<OwnedFd>,
     state: DirState,
 }
 
@@ -983,6 +1101,7 @@ pub struct LongNameFsV2 {
     pub config: Arc<Config>,
     handles: V2HandleTable,
     dir_cache: DirCache,
+    dir_fd_cache: DirFdCache,
     index_cache: IndexCache,
     max_write: NonZeroU32,
     max_name_len: usize,
@@ -1004,6 +1123,7 @@ impl LongNameFsV2 {
             config: Arc::new(config),
             handles: V2HandleTable::new(),
             dir_cache: DirCache::new(dir_cache_ttl),
+            dir_fd_cache: DirFdCache::new(dir_cache_ttl),
             index_cache: IndexCache::new(),
             max_write,
             max_name_len,
@@ -1014,8 +1134,47 @@ impl LongNameFsV2 {
     fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
         if let Some(key) = dir_cache_key(dir_fd) {
             self.dir_cache.invalidate(key);
+            self.dir_fd_cache.invalidate(key);
             self.handles.clear_dir_attr_cache(key);
         }
+    }
+
+    fn cached_root_fd(&self) -> Result<Arc<OwnedFd>, fuse3::Errno> {
+        let key =
+            dir_cache_key(self.config.backend_fd()).ok_or_else(fuse3::Errno::new_not_exist)?;
+        if let Some(fd) = self.dir_fd_cache.get(key) {
+            return Ok(fd);
+        }
+        let fd = open_backend_root(&self.config)?;
+        Ok(self.dir_fd_cache.insert(key, fd))
+    }
+
+    fn open_dir_cached(
+        &self,
+        parent_fd: BorrowedFd<'_>,
+        backend: &BackendName,
+    ) -> Result<Arc<OwnedFd>, fuse3::Errno> {
+        let c_name = backend.as_cstring()?;
+        let stat = fstatat(parent_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+            .map_err(errno_from_nix)?;
+        if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+            return Err(fuse3::Errno::from(libc::ENOTDIR));
+        }
+        let key = DirCacheKey {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        };
+        if let Some(fd) = self.dir_fd_cache.get(key) {
+            return Ok(fd);
+        }
+        let fd = nix::fcntl::openat(
+            parent_fd,
+            c_name.as_c_str(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(errno_from_nix)?;
+        Ok(self.dir_fd_cache.insert(key, fd))
     }
 
     fn load_dir_entries(&self, handle: &Arc<DirHandle>) -> Arc<Vec<DirEntryInfo>> {
@@ -1057,7 +1216,7 @@ impl LongNameFsV2 {
 
     fn resolve_dir(&self, path: &OsStr) -> Result<ParentCtx, fuse3::Errno> {
         if path == OsStr::new("/") {
-            let dir_fd = open_backend_root(&self.config)?;
+            let dir_fd = self.cached_root_fd()?;
             let state = load_dir_state(&self.index_cache, dir_fd.as_fd())?;
             return Ok(ParentCtx { dir_fd, state });
         }
@@ -1066,21 +1225,13 @@ impl LongNameFsV2 {
             return Err(fuse3::Errno::new_not_exist());
         }
 
-        let mut dir_fd = open_backend_root(&self.config)?;
+        let mut dir_fd = self.cached_root_fd()?;
         for seg in segs.drain(..) {
             let mut state = load_dir_state(&self.index_cache, dir_fd.as_fd())?;
             let (backend, _kind) =
                 map_segment_for_lookup(dir_fd.as_fd(), &mut state, &seg, self.max_name_len)?;
             maybe_flush_index(dir_fd.as_fd(), &mut state, self.index_sync)?;
-            let c_name = backend.as_cstring()?;
-            let next_fd = nix::fcntl::openat(
-                dir_fd.as_fd(),
-                c_name.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(errno_from_nix)?;
-            drop(dir_fd);
+            let next_fd = self.open_dir_cached(dir_fd.as_fd(), &backend)?;
             dir_fd = next_fd;
         }
         let state = load_dir_state(&self.index_cache, dir_fd.as_fd())?;
@@ -1096,21 +1247,13 @@ impl LongNameFsV2 {
         if segments.is_empty() {
             return Err(fuse3::Errno::new_not_exist());
         }
-        let mut dir_fd = open_backend_root(&self.config)?;
+        let mut dir_fd = self.cached_root_fd()?;
         for seg in segments[..segments.len() - 1].iter() {
             let mut state = load_dir_state(&self.index_cache, dir_fd.as_fd())?;
             let (backend, _) =
                 map_segment_for_lookup(dir_fd.as_fd(), &mut state, seg, self.max_name_len)?;
             maybe_flush_index(dir_fd.as_fd(), &mut state, self.index_sync)?;
-            let c_name = backend.as_cstring()?;
-            let next_fd = nix::fcntl::openat(
-                dir_fd.as_fd(),
-                c_name.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(errno_from_nix)?;
-            drop(dir_fd);
+            let next_fd = self.open_dir_cached(dir_fd.as_fd(), &backend)?;
             dir_fd = next_fd;
         }
 

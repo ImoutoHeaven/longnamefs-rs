@@ -56,7 +56,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--backend-layout` (default `v1`): `v1` is the current hash+namefile layout; `v2` enables the new xattr+index backend (incompatible with v1 backends; long-name hardlinks are rejected).
 - `--allow-other`: pass `allow_other` to FUSE.
 - `--nonempty`: allow mounting on a non-empty mountpoint.
-- `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000).
+- `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000); also drives the directory FD cache used by the v2 path resolver.
 - `--no-dir-cache`: disable directory cache entirely (useful for debugging correctness).
 - `--max-write-kb`: maximum write size advertised to FUSE in KiB (default 1024; kernel may clamp to its own maximum).
 - `--max-name-len`: maximum logical segment length accepted by the v2 backend (default 1024, failures surface as `ENAMETOOLONG` or `EINVAL`).
@@ -73,7 +73,7 @@ Behavior
 --------
 
 - Read/write, create, rename, link, symlink, mkdir/mknod, truncate, chmod/chown, utimens, and statfs mirror the C implementation.
-- Directory listings reconstruct original names by reading corresponding namefiles and ignore stray files not matching `<hash>n`; entries are cached per-directory for the configured TTL (default 1s) and invalidated on mutating ops to cut repeated backend I/O.
+- Directory listings reconstruct original names by reading corresponding namefiles and ignore stray files not matching `<hash>n`; entries are cached per-directory for the configured TTL (default 1s) and invalidated on mutating ops to cut repeated backend I/O. In v2 the same TTL controls an LRU of directory FDs to reduce open/close churn when resolving deep paths.
 - Operations on `/` interact directly with the backend directory (chmod/chown/utimens supported; truncate disallowed).
 - Extended attributes (get/set/list/remove) are forwarded to the backend objects; `position` must be zero on Linux.
 - `readdirplus` returns names with attributes; `flush`/`fsyncdir` are implemented; `poll` is accepted (returns no ready events).
