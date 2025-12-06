@@ -222,7 +222,16 @@ impl IndexCache {
         };
         while entries.len() > INDEX_CACHE_MAX_DIRS {
             if let Some(old) = lru.pop_front() {
-                entries.remove(&old);
+                let can_drop = entries
+                    .get(&old)
+                    .map(|entry| Arc::strong_count(&entry.value) == 1)
+                    .unwrap_or(true);
+                if can_drop {
+                    entries.remove(&old);
+                    continue;
+                }
+                lru.push_back(old);
+                break;
             } else {
                 break;
             }
