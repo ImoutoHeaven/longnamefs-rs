@@ -71,8 +71,7 @@ fn write_namefile_simple(path: &LnfsPath) -> Result<(), fuse3::Errno> {
     .map_err(errno_from_nix)?;
 
     let data = path.raw_name.as_bytes();
-    let written =
-        retry_eintr(|| nix::unistd::write(fd.as_fd(), data)).map_err(errno_from_nix)?;
+    let written = retry_eintr(|| nix::unistd::write(fd.as_fd(), data)).map_err(errno_from_nix)?;
     if written != data.len() {
         return Err(fuse3::Errno::from(libc::EIO));
     }

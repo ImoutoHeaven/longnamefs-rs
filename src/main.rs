@@ -4,8 +4,9 @@ mod handle_table;
 mod namefile;
 mod pathmap;
 mod util;
+mod v2;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use config::Config;
 use fs::LongNameFs;
 use fuse3::MountOptions;
@@ -27,6 +28,10 @@ use tokio::sync::oneshot;
 #[command(name = "longnamefs-rs")]
 #[command(about = "FUSE3 long file name shim compatible with the C longnamefs backend layout")]
 struct Cli {
+    /// Backend layout version (v1: current hash+namefile; v2: xattr+index, WIP).
+    #[arg(long, value_enum, default_value_t = BackendLayout::V1)]
+    backend_layout: BackendLayout,
+
     /// Backend directory where hashed names and namefiles are stored.
     #[arg(long)]
     backend: PathBuf,
@@ -67,10 +72,22 @@ struct Cli {
     unsafe_namefile_writes: bool,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum BackendLayout {
+    V1,
+    V2,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mountpoint = cli.mountpoint.clone();
+
+    if cli.backend_layout == BackendLayout::V2 {
+        anyhow::bail!(
+            "backend-layout=v2 is not implemented yet. See refine-fs-plan.md for roadmap."
+        );
+    }
 
     let config = Config::open_backend(cli.backend, cli.sync_data, cli.collision_protect)
         .map_err(std::io::Error::from)

@@ -49,10 +49,11 @@ Usage
 
 ```bash
 longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
-  [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--max-write-kb 1024] [--sync-data] [--collision-protect] [--unsafe-namefile-writes]
+  [--backend-layout v1] [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--max-write-kb 1024] [--sync-data] [--collision-protect] [--unsafe-namefile-writes]
 ```
 
 - `--backend` (required): directory where hashed entries and namefiles are stored.
+- `--backend-layout` (default `v1`): `v1` is the current hash+namefile layout; `v2` (xattr+index) is planned and not yet implemented in this binary.
 - `--allow-other`: pass `allow_other` to FUSE.
 - `--nonempty`: allow mounting on a non-empty mountpoint.
 - `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000).

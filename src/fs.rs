@@ -143,8 +143,7 @@ pub struct LongNameFs {
 impl LongNameFs {
     pub fn new(config: Config, dir_cache_ttl: Option<Duration>, max_write_kb: u32) -> Self {
         let bytes = max_write_kb.saturating_mul(1024).max(4096);
-        let max_write =
-            NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
+        let max_write = NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
         Self {
             config: Arc::new(config),
             handles: HandleTable::new(),
