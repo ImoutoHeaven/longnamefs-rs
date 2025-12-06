@@ -45,6 +45,16 @@ fn is_internal_meta(raw: &[u8]) -> bool {
     raw == INDEX_NAME.as_bytes() || raw == JOURNAL_NAME.as_bytes()
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum IndexSync {
+    Always,
+    Batch {
+        max_pending: usize,
+        max_age: Duration,
+    },
+    Off,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct DirCacheKey {
     dev: u64,
@@ -148,16 +158,23 @@ struct DirEntryInfo {
 }
 
 #[derive(Debug)]
+struct DirState {
+    index: DirIndex,
+    pending: usize,
+    last_flush: Instant,
+}
+
+#[derive(Debug)]
 struct DirHandle {
     fd: OwnedFd,
-    index: RwLock<DirIndex>,
+    state: RwLock<DirState>,
 }
 
 impl DirHandle {
-    fn new(fd: OwnedFd, index: DirIndex) -> Self {
+    fn new(fd: OwnedFd, state: DirState) -> Self {
         Self {
             fd,
-            index: RwLock::new(index),
+            state: RwLock::new(state),
         }
     }
 
@@ -270,7 +287,7 @@ struct Ln2Path {
 #[derive(Debug)]
 struct ParentCtx {
     dir_fd: OwnedFd,
-    index: DirIndex,
+    state: DirState,
 }
 
 fn cstring_from_bytes(bytes: &[u8]) -> Result<CString, fuse3::Errno> {
@@ -388,17 +405,45 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> Result<DirIndex, fu
     Ok(index)
 }
 
-fn load_dir_index(dir_fd: BorrowedFd<'_>) -> Result<DirIndex, fuse3::Errno> {
-    match read_dir_index(dir_fd)? {
-        Some(idx) => Ok(idx),
-        None => rebuild_dir_index_from_backend(dir_fd),
-    }
+fn load_dir_state(dir_fd: BorrowedFd<'_>) -> Result<DirState, fuse3::Errno> {
+    let index = match read_dir_index(dir_fd)? {
+        Some(idx) => idx,
+        None => rebuild_dir_index_from_backend(dir_fd)?,
+    };
+    Ok(DirState {
+        index,
+        pending: 0,
+        last_flush: Instant::now(),
+    })
 }
 
-fn save_index_if_dirty(dir_fd: BorrowedFd<'_>, index: &mut DirIndex) -> Result<(), fuse3::Errno> {
-    if index.is_dirty() {
-        write_dir_index(dir_fd, index)?;
-        index.clear_dirty();
+fn mark_dirty(state: &mut DirState) {
+    state.index.mark_dirty();
+    state.pending = state.pending.saturating_add(1);
+}
+
+fn maybe_flush_index(
+    dir_fd: BorrowedFd<'_>,
+    state: &mut DirState,
+    strategy: IndexSync,
+) -> Result<(), fuse3::Errno> {
+    let should_flush = match strategy {
+        IndexSync::Always => state.index.is_dirty(),
+        IndexSync::Batch {
+            max_pending,
+            max_age,
+        } => {
+            state.index.is_dirty()
+                && (state.pending >= max_pending || state.last_flush.elapsed() >= max_age)
+        }
+        IndexSync::Off => false,
+    };
+
+    if should_flush {
+        write_dir_index(dir_fd, &state.index)?;
+        state.index.clear_dirty();
+        state.pending = 0;
+        state.last_flush = Instant::now();
     }
     Ok(())
 }
@@ -406,6 +451,7 @@ fn save_index_if_dirty(dir_fd: BorrowedFd<'_>, index: &mut DirIndex) -> Result<(
 fn list_logical_entries(
     handle: &DirHandle,
     max_name_len: usize,
+    index_sync: IndexSync,
 ) -> Result<Vec<DirEntryInfo>, fuse3::Errno> {
     let dir_fd = handle.as_fd();
     let mut dir = Dir::openat(
@@ -416,7 +462,7 @@ fn list_logical_entries(
     )
     .map_err(errno_from_nix)?;
 
-    let mut index = handle.index.write().unwrap();
+    let mut state = handle.state.write().unwrap();
     let mut entries = Vec::new();
 
     for entry in dir.iter() {
@@ -439,7 +485,7 @@ fn list_logical_entries(
                 Ok(s) => s.to_owned(),
                 Err(_) => continue,
             };
-            if !index.contains_key(&backend_name) {
+            if !state.index.contains_key(&backend_name) {
                 // 孤儿条目，尝试修复索引
                 let c_name = match cstring_from_bytes(&name_bytes) {
                     Ok(v) => v,
@@ -457,10 +503,11 @@ fn list_logical_entries(
                 if let Ok(raw_name) = get_internal_rawname(fd.as_fd())
                     && raw_name.len() <= max_name_len
                 {
-                    index.upsert(backend_name.clone(), raw_name);
+                    state.index.upsert(backend_name.clone(), raw_name);
+                    mark_dirty(&mut state);
                 }
             }
-            let raw_name = match index.get(&backend_name) {
+            let raw_name = match state.index.get(&backend_name) {
                 Some(entry) => entry.raw_name.clone(),
                 None => continue,
             };
@@ -496,17 +543,17 @@ fn list_logical_entries(
         }
     }
 
-    save_index_if_dirty(dir_fd, &mut index)?;
+    maybe_flush_index(dir_fd, &mut state, index_sync)?;
     Ok(entries)
 }
 
 fn map_long_for_lookup(
     dir_fd: BorrowedFd<'_>,
-    index: &mut DirIndex,
+    state: &mut DirState,
     raw: &[u8],
 ) -> Result<String, fuse3::Errno> {
     let mut matched: Option<String> = None;
-    for (k, v) in index.iter() {
+    for (k, v) in state.index.iter() {
         if v.raw_name == raw {
             matched = Some(k.clone());
             break;
@@ -517,8 +564,8 @@ fn map_long_for_lookup(
         match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(_) => return Ok(entry),
             Err(nix::errno::Errno::ENOENT) => {
-                index.remove(&entry);
-                index.mark_dirty();
+                state.index.remove(&entry);
+                mark_dirty(state);
             }
             Err(err) => return Err(errno_from_nix(err)),
         }
@@ -540,7 +587,8 @@ fn map_long_for_lookup(
                 if let Ok(raw_name) = get_internal_rawname(fd.as_fd())
                     && raw_name == raw
                 {
-                    index.upsert(candidate.clone(), raw_name);
+                    state.index.upsert(candidate.clone(), raw_name);
+                    mark_dirty(state);
                     return Ok(candidate);
                 }
             }
@@ -554,7 +602,7 @@ fn map_long_for_lookup(
 
 fn map_segment_for_lookup(
     dir_fd: BorrowedFd<'_>,
-    index: &mut DirIndex,
+    state: &mut DirState,
     raw: &[u8],
     max_name_len: usize,
 ) -> Result<(BackendName, SegmentKind), fuse3::Errno> {
@@ -568,14 +616,14 @@ fn map_segment_for_lookup(
     match kind {
         SegmentKind::Short => Ok((BackendName::Short(raw.to_vec()), kind)),
         SegmentKind::Long => {
-            let backend = map_long_for_lookup(dir_fd, index, raw)?;
+            let backend = map_long_for_lookup(dir_fd, state, raw)?;
             Ok((BackendName::Internal(backend), kind))
         }
     }
 }
 
 fn map_segment_for_create(
-    index: &DirIndex,
+    state: &DirState,
     raw: &[u8],
     max_name_len: usize,
 ) -> Result<(BackendName, SegmentKind), fuse3::Errno> {
@@ -588,17 +636,17 @@ fn map_segment_for_create(
         SegmentKind::Long => {
             let hash = encode_long_name(raw);
             let base = backend_basename_from_hash(&hash, None);
-            if let Some(entry) = index.get(&base)
+            if let Some(entry) = state.index.get(&base)
                 && entry.raw_name == raw
             {
                 return Err(fuse3::Errno::from(libc::EEXIST));
             }
-            if !index.contains_key(&base) {
+            if !state.index.contains_key(&base) {
                 return Ok((BackendName::Internal(base), kind));
             }
             for suffix in 1..=MAX_COLLISION_SUFFIX {
                 let candidate = backend_basename_from_hash(&hash, Some(suffix));
-                match index.get(&candidate) {
+                match state.index.get(&candidate) {
                     None => return Ok((BackendName::Internal(candidate), kind)),
                     Some(entry) if entry.raw_name == raw => {
                         return Err(fuse3::Errno::from(libc::EEXIST));
@@ -619,7 +667,7 @@ enum CreateDecision {
 
 fn handle_backend_eexist_index_missing(
     dir_fd: BorrowedFd<'_>,
-    index: &mut DirIndex,
+    state: &mut DirState,
     backend_name: &str,
     desired_raw: &[u8],
 ) -> Result<CreateDecision, fuse3::Errno> {
@@ -632,7 +680,10 @@ fn handle_backend_eexist_index_missing(
     )
     .map_err(errno_from_nix)?;
     let existing_raw = get_internal_rawname(fd.as_fd())?;
-    index.upsert(backend_name.to_owned(), existing_raw.clone());
+    state
+        .index
+        .upsert(backend_name.to_owned(), existing_raw.clone());
+    mark_dirty(state);
     if existing_raw == desired_raw {
         Ok(CreateDecision::AlreadyExistsSameName)
     } else {
@@ -672,11 +723,12 @@ fn resolve_dir(
     config: &Config,
     path: &OsStr,
     max_name_len: usize,
+    index_sync: IndexSync,
 ) -> Result<ParentCtx, fuse3::Errno> {
     if path == OsStr::new("/") {
         let dir_fd = open_backend_root(config)?;
-        let index = load_dir_index(dir_fd.as_fd())?;
-        return Ok(ParentCtx { dir_fd, index });
+        let state = load_dir_state(dir_fd.as_fd())?;
+        return Ok(ParentCtx { dir_fd, state });
     }
     let mut segs = path_segments(path);
     if segs.is_empty() {
@@ -685,10 +737,10 @@ fn resolve_dir(
 
     let mut dir_fd = open_backend_root(config)?;
     for seg in segs.drain(..) {
-        let mut index = load_dir_index(dir_fd.as_fd())?;
+        let mut state = load_dir_state(dir_fd.as_fd())?;
         let (backend, _kind) =
-            map_segment_for_lookup(dir_fd.as_fd(), &mut index, &seg, max_name_len)?;
-        save_index_if_dirty(dir_fd.as_fd(), &mut index)?;
+            map_segment_for_lookup(dir_fd.as_fd(), &mut state, &seg, max_name_len)?;
+        maybe_flush_index(dir_fd.as_fd(), &mut state, index_sync)?;
         let c_name = backend.as_cstring()?;
         let next_fd = nix::fcntl::openat(
             dir_fd.as_fd(),
@@ -700,14 +752,15 @@ fn resolve_dir(
         drop(dir_fd);
         dir_fd = next_fd;
     }
-    let index = load_dir_index(dir_fd.as_fd())?;
-    Ok(ParentCtx { dir_fd, index })
+    let state = load_dir_state(dir_fd.as_fd())?;
+    Ok(ParentCtx { dir_fd, state })
 }
 
 fn resolve_path(
     config: &Config,
     path: &OsStr,
     max_name_len: usize,
+    index_sync: IndexSync,
 ) -> Result<Ln2Path, fuse3::Errno> {
     if path == OsStr::new("/") {
         return Err(fuse3::Errno::from(libc::EFAULT));
@@ -719,9 +772,9 @@ fn resolve_path(
     }
     let mut dir_fd = open_backend_root(config)?;
     for seg in segments[..segments.len() - 1].iter() {
-        let mut index = load_dir_index(dir_fd.as_fd())?;
-        let (backend, _) = map_segment_for_lookup(dir_fd.as_fd(), &mut index, seg, max_name_len)?;
-        save_index_if_dirty(dir_fd.as_fd(), &mut index)?;
+        let mut state = load_dir_state(dir_fd.as_fd())?;
+        let (backend, _) = map_segment_for_lookup(dir_fd.as_fd(), &mut state, seg, max_name_len)?;
+        maybe_flush_index(dir_fd.as_fd(), &mut state, index_sync)?;
         let c_name = backend.as_cstring()?;
         let next_fd = nix::fcntl::openat(
             dir_fd.as_fd(),
@@ -734,11 +787,11 @@ fn resolve_path(
         dir_fd = next_fd;
     }
 
-    let mut index = load_dir_index(dir_fd.as_fd())?;
+    let mut state = load_dir_state(dir_fd.as_fd())?;
     let raw_last = segments.last().unwrap().clone();
     let (backend_name, kind) =
-        map_segment_for_lookup(dir_fd.as_fd(), &mut index, &raw_last, max_name_len)?;
-    save_index_if_dirty(dir_fd.as_fd(), &mut index)?;
+        map_segment_for_lookup(dir_fd.as_fd(), &mut state, &raw_last, max_name_len)?;
+    maybe_flush_index(dir_fd.as_fd(), &mut state, index_sync)?;
 
     Ok(Ln2Path {
         dir_fd,
@@ -754,6 +807,7 @@ pub struct LongNameFsV2 {
     dir_cache: DirCache,
     max_write: NonZeroU32,
     max_name_len: usize,
+    index_sync: IndexSync,
 }
 
 impl LongNameFsV2 {
@@ -762,6 +816,7 @@ impl LongNameFsV2 {
         max_name_len: usize,
         dir_cache_ttl: Option<Duration>,
         max_write_kb: u32,
+        index_sync: IndexSync,
     ) -> Result<Self, fuse3::Errno> {
         verify_backend_supports_xattr(config.backend_fd())?;
         let bytes = max_write_kb.saturating_mul(1024).max(4096);
@@ -772,6 +827,7 @@ impl LongNameFsV2 {
             dir_cache: DirCache::new(dir_cache_ttl),
             max_write,
             max_name_len,
+            index_sync,
         })
     }
 
@@ -789,7 +845,8 @@ impl LongNameFsV2 {
             return entries;
         }
 
-        let logical = list_logical_entries(handle, self.max_name_len).unwrap_or_default();
+        let logical =
+            list_logical_entries(handle, self.max_name_len, self.index_sync).unwrap_or_default();
         if let Some(cache_key) = key {
             return self.dir_cache.insert(cache_key, logical);
         }
@@ -806,7 +863,7 @@ impl LongNameFsV2 {
             .map_err(errno_from_nix)?;
             return Ok(file_attr_from_stat(&stat));
         }
-        let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+        let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
         let fname = mapped.backend_name.as_cstring()?;
         let stat = fstatat(
             mapped.dir_fd.as_fd(),
@@ -833,11 +890,11 @@ impl PathFilesystem for LongNameFsV2 {
         parent: &OsStr,
         name: &OsStr,
     ) -> Result<ReplyEntry, fuse3::Errno> {
-        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len)?;
+        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len, self.index_sync)?;
         let raw = normalize_osstr(name);
         let (backend, _) =
-            map_segment_for_lookup(ctx.dir_fd.as_fd(), &mut ctx.index, &raw, self.max_name_len)?;
-        save_index_if_dirty(ctx.dir_fd.as_fd(), &mut ctx.index)?;
+            map_segment_for_lookup(ctx.dir_fd.as_fd(), &mut ctx.state, &raw, self.max_name_len)?;
+        maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         let attr = {
             let fname = backend.as_cstring()?;
             let stat = fstatat(
@@ -918,7 +975,7 @@ impl PathFilesystem for LongNameFsV2 {
             return self.getattr(_req, Some(path), None, 0).await;
         }
 
-        let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+        let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
         let fname = mapped.backend_name.as_cstring()?;
         if let Some(mode) = set_attr.mode {
             fchmodat(
@@ -976,7 +1033,7 @@ impl PathFilesystem for LongNameFsV2 {
     }
 
     async fn readlink(&self, _req: Request, path: &OsStr) -> Result<ReplyData, fuse3::Errno> {
-        let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+        let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
         let fname = mapped.backend_name.as_cstring()?;
         let target = readlinkat(mapped.dir_fd.as_fd(), fname.as_c_str()).map_err(errno_from_nix)?;
         let bytes = target.into_vec();
@@ -990,9 +1047,9 @@ impl PathFilesystem for LongNameFsV2 {
         name: &OsStr,
         link_path: &OsStr,
     ) -> Result<ReplyEntry, fuse3::Errno> {
-        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len)?;
+        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len, self.index_sync)?;
         let raw = normalize_osstr(name);
-        let (backend, kind) = map_segment_for_create(&ctx.index, &raw, self.max_name_len)?;
+        let (backend, kind) = map_segment_for_create(&ctx.state, &raw, self.max_name_len)?;
         let fname = backend.as_cstring()?;
         symlinkat(link_path, ctx.dir_fd.as_fd(), fname.as_c_str()).map_err(errno_from_nix)?;
         if matches!(kind, SegmentKind::Long) {
@@ -1004,9 +1061,11 @@ impl PathFilesystem for LongNameFsV2 {
             )
             .map_err(errno_from_nix)?;
             set_internal_rawname(fd.as_fd(), &raw)?;
-            ctx.index
+            ctx.state
+                .index
                 .upsert(String::from_utf8(backend.display_bytes()).unwrap(), raw);
-            save_index_if_dirty(ctx.dir_fd.as_fd(), &mut ctx.index)?;
+            mark_dirty(&mut ctx.state);
+            maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         }
         self.invalidate_dir(ctx.dir_fd.as_fd());
         let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
@@ -1024,9 +1083,9 @@ impl PathFilesystem for LongNameFsV2 {
         mode: u32,
         rdev: u32,
     ) -> Result<ReplyEntry, fuse3::Errno> {
-        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len)?;
+        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len, self.index_sync)?;
         let raw = normalize_osstr(name);
-        let (backend, kind) = map_segment_for_create(&ctx.index, &raw, self.max_name_len)?;
+        let (backend, kind) = map_segment_for_create(&ctx.state, &raw, self.max_name_len)?;
         let fname = backend.as_cstring()?;
         let sflag = nix::sys::stat::SFlag::from_bits_truncate(mode);
         let perm = Mode::from_bits_truncate(mode);
@@ -1041,9 +1100,11 @@ impl PathFilesystem for LongNameFsV2 {
             )
             .map_err(errno_from_nix)?;
             set_internal_rawname(fd.as_fd(), &raw)?;
-            ctx.index
+            ctx.state
+                .index
                 .upsert(String::from_utf8(backend.display_bytes()).unwrap(), raw);
-            save_index_if_dirty(ctx.dir_fd.as_fd(), &mut ctx.index)?;
+            mark_dirty(&mut ctx.state);
+            maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         }
         self.invalidate_dir(ctx.dir_fd.as_fd());
         let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
@@ -1061,9 +1122,9 @@ impl PathFilesystem for LongNameFsV2 {
         mode: u32,
         _umask: u32,
     ) -> Result<ReplyEntry, fuse3::Errno> {
-        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len)?;
+        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len, self.index_sync)?;
         let raw = normalize_osstr(name);
-        let (backend, kind) = map_segment_for_create(&ctx.index, &raw, self.max_name_len)?;
+        let (backend, kind) = map_segment_for_create(&ctx.state, &raw, self.max_name_len)?;
         let fname = backend.as_cstring()?;
         mkdirat(
             ctx.dir_fd.as_fd(),
@@ -1080,9 +1141,11 @@ impl PathFilesystem for LongNameFsV2 {
             )
             .map_err(errno_from_nix)?;
             set_internal_rawname(fd.as_fd(), &raw)?;
-            ctx.index
+            ctx.state
+                .index
                 .upsert(String::from_utf8(backend.display_bytes()).unwrap(), raw);
-            save_index_if_dirty(ctx.dir_fd.as_fd(), &mut ctx.index)?;
+            mark_dirty(&mut ctx.state);
+            maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         }
         self.invalidate_dir(ctx.dir_fd.as_fd());
         let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
@@ -1098,10 +1161,10 @@ impl PathFilesystem for LongNameFsV2 {
         parent: &OsStr,
         name: &OsStr,
     ) -> Result<(), fuse3::Errno> {
-        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len)?;
+        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len, self.index_sync)?;
         let raw = normalize_osstr(name);
         let (backend, kind) =
-            map_segment_for_lookup(ctx.dir_fd.as_fd(), &mut ctx.index, &raw, self.max_name_len)?;
+            map_segment_for_lookup(ctx.dir_fd.as_fd(), &mut ctx.state, &raw, self.max_name_len)?;
         let fname = backend.as_cstring()?;
         unlinkat(
             ctx.dir_fd.as_fd(),
@@ -1110,19 +1173,21 @@ impl PathFilesystem for LongNameFsV2 {
         )
         .map_err(errno_from_nix)?;
         if matches!(kind, SegmentKind::Long) {
-            ctx.index
+            ctx.state
+                .index
                 .remove(&String::from_utf8(backend.display_bytes()).unwrap());
-            save_index_if_dirty(ctx.dir_fd.as_fd(), &mut ctx.index)?;
+            mark_dirty(&mut ctx.state);
         }
+        maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         self.invalidate_dir(ctx.dir_fd.as_fd());
         Ok(())
     }
 
     async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<(), fuse3::Errno> {
-        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len)?;
+        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len, self.index_sync)?;
         let raw = normalize_osstr(name);
         let (backend, kind) =
-            map_segment_for_lookup(ctx.dir_fd.as_fd(), &mut ctx.index, &raw, self.max_name_len)?;
+            map_segment_for_lookup(ctx.dir_fd.as_fd(), &mut ctx.state, &raw, self.max_name_len)?;
         let fname = backend.as_cstring()?;
         unlinkat(
             ctx.dir_fd.as_fd(),
@@ -1131,10 +1196,12 @@ impl PathFilesystem for LongNameFsV2 {
         )
         .map_err(errno_from_nix)?;
         if matches!(kind, SegmentKind::Long) {
-            ctx.index
+            ctx.state
+                .index
                 .remove(&String::from_utf8(backend.display_bytes()).unwrap());
-            save_index_if_dirty(ctx.dir_fd.as_fd(), &mut ctx.index)?;
+            mark_dirty(&mut ctx.state);
         }
+        maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         self.invalidate_dir(ctx.dir_fd.as_fd());
         Ok(())
     }
@@ -1147,15 +1214,25 @@ impl PathFilesystem for LongNameFsV2 {
         parent: &OsStr,
         name: &OsStr,
     ) -> Result<(), fuse3::Errno> {
-        let mut from_ctx = resolve_dir(&self.config, origin_parent, self.max_name_len)?;
-        let mut to_ctx = resolve_dir(&self.config, parent, self.max_name_len)?;
+        let mut from_ctx = resolve_dir(
+            &self.config,
+            origin_parent,
+            self.max_name_len,
+            self.index_sync,
+        )?;
+        let mut to_ctx = resolve_dir(&self.config, parent, self.max_name_len, self.index_sync)?;
         let raw_from = normalize_osstr(origin_name);
         let raw_to = normalize_osstr(name);
         let (from_backend, from_kind) = map_segment_for_lookup(
             from_ctx.dir_fd.as_fd(),
-            &mut from_ctx.index,
+            &mut from_ctx.state,
             &raw_from,
             self.max_name_len,
+        )?;
+        maybe_flush_index(
+            from_ctx.dir_fd.as_fd(),
+            &mut from_ctx.state,
+            self.index_sync,
         )?;
         let to_kind = classify_segment(&raw_to, self.max_name_len)?;
         if from_kind != to_kind {
@@ -1167,6 +1244,7 @@ impl PathFilesystem for LongNameFsV2 {
         } else {
             // 可能已有同名长名
             if let Some(entry) = to_ctx
+                .state
                 .index
                 .iter()
                 .find_map(|(k, v)| (v.raw_name == raw_to).then(|| k.clone()))
@@ -1174,7 +1252,7 @@ impl PathFilesystem for LongNameFsV2 {
                 BackendName::Internal(entry)
             } else {
                 let (candidate, _) =
-                    map_segment_for_create(&to_ctx.index, &raw_to, self.max_name_len)?;
+                    map_segment_for_create(&to_ctx.state, &raw_to, self.max_name_len)?;
                 candidate
             }
         };
@@ -1199,14 +1277,21 @@ impl PathFilesystem for LongNameFsV2 {
             .map_err(errno_from_nix)?;
             set_internal_rawname(to_fd.as_fd(), &raw_to)?;
             from_ctx
+                .state
                 .index
                 .remove(&String::from_utf8(from_backend.display_bytes()).unwrap());
-            to_ctx.index.upsert(
+            mark_dirty(&mut from_ctx.state);
+            to_ctx.state.index.upsert(
                 String::from_utf8(dest_backend.display_bytes()).unwrap(),
                 raw_to,
             );
-            save_index_if_dirty(from_ctx.dir_fd.as_fd(), &mut from_ctx.index)?;
-            save_index_if_dirty(to_ctx.dir_fd.as_fd(), &mut to_ctx.index)?;
+            mark_dirty(&mut to_ctx.state);
+            maybe_flush_index(
+                from_ctx.dir_fd.as_fd(),
+                &mut from_ctx.state,
+                self.index_sync,
+            )?;
+            maybe_flush_index(to_ctx.dir_fd.as_fd(), &mut to_ctx.state, self.index_sync)?;
         }
 
         self.invalidate_dir(from_ctx.dir_fd.as_fd());
@@ -1221,14 +1306,14 @@ impl PathFilesystem for LongNameFsV2 {
         new_parent: &OsStr,
         new_name: &OsStr,
     ) -> Result<ReplyEntry, fuse3::Errno> {
-        let target = resolve_path(&self.config, path, self.max_name_len)?;
+        let target = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
         if target.backend_name.is_internal() {
             return Err(fuse3::Errno::from(libc::EOPNOTSUPP));
         }
-        let ctx = resolve_dir(&self.config, new_parent, self.max_name_len)?;
+        let ctx = resolve_dir(&self.config, new_parent, self.max_name_len, self.index_sync)?;
         let raw_new = normalize_osstr(new_name);
         let (dest_backend, dest_kind) =
-            map_segment_for_create(&ctx.index, &raw_new, self.max_name_len)?;
+            map_segment_for_create(&ctx.state, &raw_new, self.max_name_len)?;
         if matches!(dest_kind, SegmentKind::Long) {
             return Err(fuse3::Errno::from(libc::EOPNOTSUPP));
         }
@@ -1256,7 +1341,7 @@ impl PathFilesystem for LongNameFsV2 {
         path: &OsStr,
         flags: u32,
     ) -> Result<ReplyOpen, fuse3::Errno> {
-        let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+        let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
         let oflag = oflag_from_bits(flags) | OFlag::O_CLOEXEC;
         let fname = mapped.backend_name.as_cstring()?;
         let fd = nix::fcntl::openat(
@@ -1317,7 +1402,7 @@ impl PathFilesystem for LongNameFsV2 {
 
         if let Some(path) = path
             && path != "/"
-            && let Ok(mapped) = resolve_path(&self.config, path, self.max_name_len)
+            && let Ok(mapped) = resolve_path(&self.config, path, self.max_name_len, self.index_sync)
         {
             self.invalidate_dir(mapped.dir_fd.as_fd());
         }
@@ -1391,7 +1476,7 @@ impl PathFilesystem for LongNameFsV2 {
             }
             return Ok(());
         }
-        let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+        let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
         let fname = mapped.backend_name.as_cstring()?;
         let fd = nix::fcntl::openat(
             mapped.dir_fd.as_fd(),
@@ -1430,7 +1515,7 @@ impl PathFilesystem for LongNameFsV2 {
         let fd_raw = if path == OsStr::new("/") {
             self.config.backend_fd().as_raw_fd()
         } else {
-            let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+            let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
             let fname = mapped.backend_name.as_cstring()?;
             let fd = nix::fcntl::openat(
                 mapped.dir_fd.as_fd(),
@@ -1477,7 +1562,7 @@ impl PathFilesystem for LongNameFsV2 {
         let fd_raw = if path == OsStr::new("/") {
             self.config.backend_fd().as_raw_fd()
         } else {
-            let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+            let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
             let fname = mapped.backend_name.as_cstring()?;
             let fd = nix::fcntl::openat(
                 mapped.dir_fd.as_fd(),
@@ -1540,7 +1625,7 @@ impl PathFilesystem for LongNameFsV2 {
         let fd_raw = if path == OsStr::new("/") {
             self.config.backend_fd().as_raw_fd()
         } else {
-            let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+            let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
             let fname = mapped.backend_name.as_cstring()?;
             let fd = nix::fcntl::openat(
                 mapped.dir_fd.as_fd(),
@@ -1580,7 +1665,7 @@ impl PathFilesystem for LongNameFsV2 {
             return Ok(());
         }
 
-        let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+        let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
         let fname = mapped.backend_name.as_cstring()?;
         faccessat(
             mapped.dir_fd.as_fd(),
@@ -1600,9 +1685,9 @@ impl PathFilesystem for LongNameFsV2 {
         mode: u32,
         flags: u32,
     ) -> Result<ReplyCreated, fuse3::Errno> {
-        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len)?;
+        let mut ctx = resolve_dir(&self.config, parent, self.max_name_len, self.index_sync)?;
         let raw = normalize_osstr(name);
-        let mut backend = map_segment_for_create(&ctx.index, &raw, self.max_name_len)?;
+        let mut backend = map_segment_for_create(&ctx.state, &raw, self.max_name_len)?;
 
         let mut attempt = 0;
         loop {
@@ -1616,11 +1701,12 @@ impl PathFilesystem for LongNameFsV2 {
                 Ok(fd) => {
                     if matches!(backend.1, SegmentKind::Long) {
                         set_internal_rawname(fd.as_fd(), &raw)?;
-                        ctx.index.upsert(
+                        ctx.state.index.upsert(
                             String::from_utf8(backend.0.display_bytes()).unwrap(),
                             raw.clone(),
                         );
-                        save_index_if_dirty(ctx.dir_fd.as_fd(), &mut ctx.index)?;
+                        mark_dirty(&mut ctx.state);
+                        maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
                     }
                     self.invalidate_dir(ctx.dir_fd.as_fd());
                     let fh = self.handles.insert_file(fd);
@@ -1639,17 +1725,17 @@ impl PathFilesystem for LongNameFsV2 {
                     }
                     let decision = handle_backend_eexist_index_missing(
                         ctx.dir_fd.as_fd(),
-                        &mut ctx.index,
+                        &mut ctx.state,
                         &String::from_utf8(backend.0.display_bytes()).unwrap(),
                         &raw,
                     )?;
-                    save_index_if_dirty(ctx.dir_fd.as_fd(), &mut ctx.index)?;
+                    maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
                     match decision {
                         CreateDecision::AlreadyExistsSameName => {
                             return Err(fuse3::Errno::from(libc::EEXIST));
                         }
                         CreateDecision::NeedNewSuffix => {
-                            backend = map_segment_for_create(&ctx.index, &raw, self.max_name_len)?;
+                            backend = map_segment_for_create(&ctx.state, &raw, self.max_name_len)?;
                             attempt += 1;
                             continue;
                         }
@@ -1668,11 +1754,11 @@ impl PathFilesystem for LongNameFsV2 {
     ) -> Result<ReplyOpen, fuse3::Errno> {
         if path == OsStr::new("/") {
             let fd = open_backend_root(&self.config)?;
-            let index = load_dir_index(fd.as_fd())?;
+            let index = load_dir_state(fd.as_fd())?;
             let handle = self.handles.insert_dir(DirHandle::new(fd, index));
             return Ok(ReplyOpen { fh: handle, flags });
         }
-        let mapped = resolve_path(&self.config, path, self.max_name_len)?;
+        let mapped = resolve_path(&self.config, path, self.max_name_len, self.index_sync)?;
         let fname = mapped.backend_name.as_cstring()?;
         let fd = nix::fcntl::openat(
             mapped.dir_fd.as_fd(),
@@ -1681,7 +1767,7 @@ impl PathFilesystem for LongNameFsV2 {
             Mode::empty(),
         )
         .map_err(errno_from_nix)?;
-        let index = load_dir_index(fd.as_fd())?;
+        let index = load_dir_state(fd.as_fd())?;
         let handle = self.handles.insert_dir(DirHandle::new(fd, index));
         Ok(ReplyOpen { fh: handle, flags })
     }

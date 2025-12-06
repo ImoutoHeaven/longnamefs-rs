@@ -49,7 +49,7 @@ Usage
 
 ```bash
 longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
-  [--backend-layout v1] [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--max-write-kb 1024] [--max-name-len 1024] [--sync-data] [--collision-protect] [--unsafe-namefile-writes]
+  [--backend-layout v1] [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--max-write-kb 1024] [--max-name-len 1024] [--index-sync batch] [--sync-data] [--collision-protect] [--unsafe-namefile-writes]
 ```
 
 - `--backend` (required): directory where hashed entries and namefiles are stored.
@@ -60,6 +60,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--no-dir-cache`: disable directory cache entirely (useful for debugging correctness).
 - `--max-write-kb`: maximum write size advertised to FUSE in KiB (default 1024; kernel may clamp to its own maximum).
 - `--max-name-len`: maximum logical segment length accepted by the v2 backend (default 1024, failures surface as `ENAMETOOLONG` or `EINVAL`).
+- `--index-sync` (v2 only): `always` flush index on every mutation, `batch` (default) flushes when 128 pending changes or 5s elapsed, `off` disables background flush (index rebuild will recover).
 - `--sync-data`: fdatasync data files after writes for stronger durability (at the cost of throughput).
 - `--collision-protect`: probe namefiles to detect/avoid hash collisions by using suffixed `<hash>.k` entries (default off; adds I/O).
 - `--unsafe-namefile-writes`: use non-transactional namefile updates (faster for many small files, but filename metadata may be lost or become inconsistent on crash).

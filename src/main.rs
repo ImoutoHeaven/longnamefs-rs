@@ -6,7 +6,7 @@ mod pathmap;
 mod util;
 mod v2;
 
-use crate::v2::fs::LongNameFsV2;
+use crate::v2::fs::{IndexSync, LongNameFsV2};
 use clap::{Parser, ValueEnum};
 use config::Config;
 use fs::LongNameFs;
@@ -73,6 +73,10 @@ struct Cli {
     #[arg(long, default_value_t = 1024)]
     max_name_len: usize,
 
+    /// v2 index flush strategy: always sync, batch by time/ops, or off (no flush).
+    #[arg(long, value_enum, default_value_t = IndexSyncCli::Batch)]
+    index_sync: IndexSyncCli,
+
     /// Use non-transactional namefile writes (faster but unsafe: filename metadata may be lost or become inconsistent on crash).
     #[arg(long, default_value_t = false)]
     unsafe_namefile_writes: bool,
@@ -82,6 +86,26 @@ struct Cli {
 enum BackendLayout {
     V1,
     V2,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum IndexSyncCli {
+    Always,
+    Batch,
+    Off,
+}
+
+impl From<IndexSyncCli> for IndexSync {
+    fn from(value: IndexSyncCli) -> Self {
+        match value {
+            IndexSyncCli::Always => IndexSync::Always,
+            IndexSyncCli::Batch => IndexSync::Batch {
+                max_pending: 128,
+                max_age: Duration::from_secs(5),
+            },
+            IndexSyncCli::Off => IndexSync::Off,
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -111,7 +135,13 @@ async fn main() -> anyhow::Result<()> {
             run_mount(fs, mountpoint, mount_opts).await
         }
         BackendLayout::V2 => {
-            let fs = LongNameFsV2::new(config, cli.max_name_len, cache_ttl, cli.max_write_kb)?;
+            let fs = LongNameFsV2::new(
+                config,
+                cli.max_name_len,
+                cache_ttl,
+                cli.max_write_kb,
+                cli.index_sync.into(),
+            )?;
             run_mount(fs, mountpoint, mount_opts).await
         }
     }
