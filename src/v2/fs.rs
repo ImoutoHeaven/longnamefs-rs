@@ -69,6 +69,13 @@ struct DirCacheKey {
 struct DirCacheEntry {
     expires_at: Instant,
     entries: Arc<Vec<DirEntryInfo>>,
+    has_attrs: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DirCacheHit {
+    entries: Arc<Vec<DirEntryInfo>>,
+    has_attrs: bool,
 }
 
 const DIR_CACHE_MAX_DIRS: usize = 1024;
@@ -94,7 +101,7 @@ impl DirCache {
         }
     }
 
-    fn get(&self, key: DirCacheKey) -> Option<Arc<Vec<DirEntryInfo>>> {
+    fn get(&self, key: DirCacheKey) -> Option<DirCacheHit> {
         if !self.enabled {
             return None;
         }
@@ -103,7 +110,10 @@ impl DirCache {
         if let Some(entry) = guard.get_mut(&key) {
             if entry.expires_at > now {
                 entry.expires_at = now + self.ttl;
-                return Some(entry.entries.clone());
+                return Some(DirCacheHit {
+                    entries: entry.entries.clone(),
+                    has_attrs: entry.has_attrs,
+                });
             }
             guard.remove(&key);
             return None;
@@ -111,7 +121,12 @@ impl DirCache {
         None
     }
 
-    fn insert(&self, key: DirCacheKey, items: Vec<DirEntryInfo>) -> Arc<Vec<DirEntryInfo>> {
+    fn insert(
+        &self,
+        key: DirCacheKey,
+        items: Vec<DirEntryInfo>,
+        has_attrs: bool,
+    ) -> Arc<Vec<DirEntryInfo>> {
         if !self.enabled {
             return Arc::new(items);
         }
@@ -126,6 +141,7 @@ impl DirCache {
             DirCacheEntry {
                 expires_at,
                 entries: entries.clone(),
+                has_attrs,
             },
         );
         entries
@@ -1174,16 +1190,16 @@ impl LongNameFsV2 {
     fn load_dir_entries(&self, handle: &Arc<DirHandle>, need_attr: bool) -> Arc<Vec<DirEntryInfo>> {
         let key = dir_cache_key(handle.as_fd());
         if let Some(cache_key) = key
-            && let Some(entries) = self.dir_cache.get(cache_key)
-            && (!need_attr || entries.iter().all(|e| e.attr.is_some()))
+            && let Some(hit) = self.dir_cache.get(cache_key)
+            && (!need_attr || hit.has_attrs)
         {
-            return entries;
+            return hit.entries;
         }
 
         let logical = list_logical_entries(handle, self.max_name_len, self.index_sync, need_attr)
             .unwrap_or_default();
         if let Some(cache_key) = key {
-            return self.dir_cache.insert(cache_key, logical);
+            return self.dir_cache.insert(cache_key, logical, need_attr);
         }
         Arc::new(logical)
     }
