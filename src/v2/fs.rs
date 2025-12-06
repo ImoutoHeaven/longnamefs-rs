@@ -766,6 +766,7 @@ fn list_logical_entries(
     handle: &DirHandle,
     max_name_len: usize,
     index_sync: IndexSync,
+    need_attr: bool,
 ) -> Result<Vec<DirEntryInfo>, fuse3::Errno> {
     let dir_fd = handle.as_fd();
     let mut dir = Dir::openat(
@@ -845,7 +846,7 @@ fn list_logical_entries(
                     None => continue,
                 }
             };
-            if attr.is_none() || kind.is_none() {
+            if (need_attr && attr.is_none()) || kind.is_none() {
                 let c_name = match cstring_from_bytes(&name_bytes) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -869,7 +870,7 @@ fn list_logical_entries(
             });
             seen_backend.insert(name_bytes);
         } else {
-            if attr.is_none() || kind.is_none() {
+            if (need_attr && attr.is_none()) || kind.is_none() {
                 let c_name = match cstring_from_bytes(&name_bytes) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -1170,16 +1171,17 @@ impl LongNameFsV2 {
         Ok(self.dir_fd_cache.insert(key, fd))
     }
 
-    fn load_dir_entries(&self, handle: &Arc<DirHandle>) -> Arc<Vec<DirEntryInfo>> {
+    fn load_dir_entries(&self, handle: &Arc<DirHandle>, need_attr: bool) -> Arc<Vec<DirEntryInfo>> {
         let key = dir_cache_key(handle.as_fd());
         if let Some(cache_key) = key
             && let Some(entries) = self.dir_cache.get(cache_key)
+            && (!need_attr || entries.iter().all(|e| e.attr.is_some()))
         {
             return entries;
         }
 
-        let logical =
-            list_logical_entries(handle, self.max_name_len, self.index_sync).unwrap_or_default();
+        let logical = list_logical_entries(handle, self.max_name_len, self.index_sync, need_attr)
+            .unwrap_or_default();
         if let Some(cache_key) = key {
             return self.dir_cache.insert(cache_key, logical);
         }
@@ -2212,7 +2214,7 @@ impl PathFilesystem for LongNameFsV2 {
             .handles
             .get_dir(fh)
             .ok_or_else(|| fuse3::Errno::from(libc::EBADF))?;
-        let logical = self.load_dir_entries(&handle);
+        let logical = self.load_dir_entries(&handle, false);
         let mut entries: Vec<fuse3::Result<DirectoryEntry>> = Vec::with_capacity(logical.len() + 2);
 
         let mut idx: i64 = 0;
@@ -2256,7 +2258,7 @@ impl PathFilesystem for LongNameFsV2 {
             .handles
             .get_dir(fh)
             .ok_or_else(|| fuse3::Errno::from(libc::EBADF))?;
-        let logical = self.load_dir_entries(&handle);
+        let logical = self.load_dir_entries(&handle, true);
         let mut entries: Vec<fuse3::Result<DirectoryEntryPlus>> =
             Vec::with_capacity(logical.len() + 2);
         let dir_attr = fstat(handle.as_fd())
