@@ -31,15 +31,19 @@ use std::io;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::sync::mpsc;
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
+use std::thread;
 use std::time::{Duration, Instant};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
 const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const JOURNAL_NAME: &str = ".ln2_journal";
+const PARALLEL_REBUILD_THRESHOLD: usize = 64;
+const PARALLEL_REBUILD_WORKERS: usize = 4;
 
 fn is_internal_meta(raw: &[u8]) -> bool {
     raw == INDEX_NAME.as_bytes() || raw == JOURNAL_NAME.as_bytes()
@@ -155,6 +159,19 @@ struct DirEntryInfo {
     name: OsString,
     kind: FileType,
     attr: Option<fuse3::path::reply::FileAttr>,
+    backend_name: Vec<u8>,
+}
+
+fn map_dirent_type(entry: &nix::dir::Entry) -> Option<FileType> {
+    entry.file_type().map(|dt| match dt {
+        nix::dir::Type::Directory => FileType::Directory,
+        nix::dir::Type::Symlink => FileType::Symlink,
+        nix::dir::Type::File => FileType::RegularFile,
+        nix::dir::Type::BlockDevice => FileType::BlockDevice,
+        nix::dir::Type::CharacterDevice => FileType::CharDevice,
+        nix::dir::Type::Fifo => FileType::NamedPipe,
+        nix::dir::Type::Socket => FileType::Socket,
+    })
 }
 
 #[derive(Debug)]
@@ -360,7 +377,8 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> Result<DirIndex, fu
         Mode::empty(),
     )
     .map_err(errno_from_nix)?;
-    let mut index = DirIndex::new();
+
+    let mut internal = Vec::new();
     for entry in dir.iter() {
         let entry = match entry {
             Ok(v) => v,
@@ -375,31 +393,96 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> Result<DirIndex, fu
         {
             continue;
         }
-        if !name_bytes.starts_with(INTERNAL_PREFIX.as_bytes()) {
-            continue;
+        if name_bytes.starts_with(INTERNAL_PREFIX.as_bytes()) {
+            internal.push(name_bytes);
+        }
+    }
+
+    let mut index = DirIndex::new();
+    if internal.len() <= PARALLEL_REBUILD_THRESHOLD {
+        for name_bytes in internal {
+            let c_name = match cstring_from_bytes(&name_bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let fd = match nix::fcntl::openat(
+                dir_fd,
+                c_name.as_c_str(),
+                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(_) => continue,
+            };
+            let raw_name = match get_internal_rawname(fd.as_fd()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let backend_name = match std::str::from_utf8(&name_bytes) {
+                Ok(s) => s.to_owned(),
+                Err(_) => continue,
+            };
+            index.upsert(backend_name, raw_name);
+        }
+        return Ok(index);
+    }
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (res_tx, res_rx) = mpsc::channel::<(String, Vec<u8>)>();
+    let workers = PARALLEL_REBUILD_WORKERS.max(1);
+
+    thread::scope(|scope| {
+        let shared_rx = Arc::new(Mutex::new(rx));
+        for _ in 0..workers {
+            let rx = Arc::clone(&shared_rx);
+            let res_tx = res_tx.clone();
+            let dup_fd = match nix::unistd::dup(dir_fd) {
+                Ok(fd) => fd,
+                Err(_) => continue,
+            };
+            scope.spawn(move || {
+                loop {
+                    let name_bytes = {
+                        let guard = rx.lock().unwrap();
+                        match guard.recv() {
+                            Ok(v) => v,
+                            Err(_) => break,
+                        }
+                    };
+                    let c_name = match cstring_from_bytes(&name_bytes) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let fd = match nix::fcntl::openat(
+                        dup_fd.as_fd(),
+                        c_name.as_c_str(),
+                        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                        Mode::empty(),
+                    ) {
+                        Ok(fd) => fd,
+                        Err(_) => continue,
+                    };
+                    let raw_name = match get_internal_rawname(fd.as_fd()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let backend_name = match std::str::from_utf8(&name_bytes) {
+                        Ok(s) => s.to_owned(),
+                        Err(_) => continue,
+                    };
+                    let _ = res_tx.send((backend_name, raw_name));
+                }
+            });
         }
 
-        let c_name = match cstring_from_bytes(&name_bytes) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let fd = match nix::fcntl::openat(
-            dir_fd,
-            c_name.as_c_str(),
-            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(_) => continue,
-        };
-        let raw_name = match get_internal_rawname(fd.as_fd()) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let backend_name = match std::str::from_utf8(&name_bytes) {
-            Ok(s) => s.to_owned(),
-            Err(_) => continue,
-        };
+        for name in internal {
+            let _ = tx.send(name);
+        }
+        drop(tx);
+    });
+    drop(res_tx);
+
+    for (backend_name, raw_name) in res_rx {
         index.upsert(backend_name, raw_name);
     }
     Ok(index)
@@ -511,34 +594,46 @@ fn list_logical_entries(
                 Some(entry) => entry.raw_name.clone(),
                 None => continue,
             };
-            let c_name = match cstring_from_bytes(&name_bytes) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let stat = match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-                Ok(st) => st,
-                Err(_) => continue,
-            };
-            let kind = file_type_from_mode(stat.st_mode);
-            let attr = file_attr_from_stat(&stat);
+            let mut kind = map_dirent_type(&entry);
+            let mut attr = None;
+            if kind.is_none() {
+                let c_name = match cstring_from_bytes(&name_bytes) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let stat = match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+                    Ok(st) => st,
+                    Err(_) => continue,
+                };
+                kind = Some(file_type_from_mode(stat.st_mode));
+                attr = Some(file_attr_from_stat(&stat));
+            }
             entries.push(DirEntryInfo {
                 name: OsString::from_vec(raw_name),
-                kind,
-                attr: Some(attr),
+                kind: kind.unwrap_or(FileType::RegularFile),
+                attr,
+                backend_name: name_bytes,
             });
         } else {
-            let c_name = match cstring_from_bytes(&name_bytes) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let stat = match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-                Ok(st) => st,
-                Err(_) => continue,
-            };
+            let mut kind = map_dirent_type(&entry);
+            let mut attr = None;
+            if kind.is_none() {
+                let c_name = match cstring_from_bytes(&name_bytes) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let stat = match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+                    Ok(st) => st,
+                    Err(_) => continue,
+                };
+                kind = Some(file_type_from_mode(stat.st_mode));
+                attr = Some(file_attr_from_stat(&stat));
+            }
             entries.push(DirEntryInfo {
                 name: OsString::from_vec(name_bytes),
-                kind: file_type_from_mode(stat.st_mode),
-                attr: Some(file_attr_from_stat(&stat)),
+                kind: kind.unwrap_or(FileType::RegularFile),
+                attr,
+                backend_name: entry.file_name().to_bytes().to_vec(),
             });
         }
     }
@@ -1865,24 +1960,28 @@ impl PathFilesystem for LongNameFsV2 {
 
         for entry in logical.iter() {
             idx += 1;
-            let attr = entry.attr.unwrap_or(fuse3::path::reply::FileAttr {
-                size: 0,
-                blocks: 0,
-                atime: std::time::UNIX_EPOCH,
-                mtime: std::time::UNIX_EPOCH,
-                ctime: std::time::UNIX_EPOCH,
-                kind: entry.kind,
-                perm: 0,
-                nlink: 0,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                blksize: 0,
-                #[cfg(target_os = "macos")]
-                crtime: std::time::UNIX_EPOCH,
-                #[cfg(target_os = "macos")]
-                flags: 0,
-            });
+            let attr = if let Some(attr) = entry.attr {
+                attr
+            } else {
+                let c_name = match cstring_from_bytes(&entry.backend_name) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        entries.push(Err(err));
+                        continue;
+                    }
+                };
+                match fstatat(
+                    handle.as_fd(),
+                    c_name.as_c_str(),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                ) {
+                    Ok(st) => file_attr_from_stat(&st),
+                    Err(err) => {
+                        entries.push(Err(errno_from_nix(err)));
+                        continue;
+                    }
+                }
+            };
             entries.push(Ok(DirectoryEntryPlus {
                 kind: entry.kind,
                 name: entry.name.clone(),
