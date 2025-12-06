@@ -1,15 +1,14 @@
 use crate::config::Config;
-use crate::handle_table::HandleTable;
 use crate::util::{
     access_mask_from_bits, errno_from_nix, file_attr_from_stat, file_type_from_mode,
     oflag_from_bits, retry_eintr, string_to_cstring,
 };
-use bytes::Bytes;
 use crate::v2::index::{DirIndex, INDEX_NAME, read_dir_index, write_dir_index};
 use crate::v2::path::{
     INTERNAL_PREFIX, MAX_COLLISION_SUFFIX, SegmentKind, backend_basename_from_hash,
-    classify_segment, encode_long_name, normalize_osstr,
+    classify_segment, encode_long_name, is_reserved_prefix, normalize_osstr,
 };
+use bytes::Bytes;
 use fuse3::notify::Notify;
 use fuse3::path::prelude::*;
 use fuse3::path::reply::{DirectoryEntryPlus, ReplyPoll, ReplyXAttr};
@@ -23,8 +22,8 @@ use nix::sys::statvfs::fstatvfs;
 use nix::sys::time::TimeSpec;
 use nix::sys::uio::{pread, pwrite};
 use nix::unistd::{
-    Gid, LinkatFlags, Uid, UnlinkatFlags, faccessat, fchownat, fdatasync, fsync, linkat,
-    symlinkat, unlinkat,
+    Gid, LinkatFlags, Uid, UnlinkatFlags, faccessat, fchownat, fdatasync, fsync, linkat, symlinkat,
+    unlinkat,
 };
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
@@ -32,12 +31,19 @@ use std::io;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
 const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const JOURNAL_NAME: &str = ".ln2_journal";
+
+fn is_internal_meta(raw: &[u8]) -> bool {
+    raw == INDEX_NAME.as_bytes() || raw == JOURNAL_NAME.as_bytes()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct DirCacheKey {
@@ -139,6 +145,90 @@ struct DirEntryInfo {
     name: OsString,
     kind: FileType,
     attr: Option<fuse3::path::reply::FileAttr>,
+}
+
+#[derive(Debug)]
+struct DirHandle {
+    fd: OwnedFd,
+    index: RwLock<DirIndex>,
+}
+
+impl DirHandle {
+    fn new(fd: OwnedFd, index: DirIndex) -> Self {
+        Self {
+            fd,
+            index: RwLock::new(index),
+        }
+    }
+
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Handle {
+    File(Arc<OwnedFd>),
+    Dir(Arc<DirHandle>),
+}
+
+impl Handle {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Handle::File(fd) => fd.as_fd(),
+            Handle::Dir(dir) => dir.as_fd(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct V2HandleTable {
+    next_id: AtomicU64,
+    entries: RwLock<HashMap<u64, Handle>>,
+}
+
+impl V2HandleTable {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert_file(&self, fd: OwnedFd) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.entries
+            .write()
+            .unwrap()
+            .insert(id, Handle::File(Arc::new(fd)));
+        id
+    }
+
+    fn insert_dir(&self, handle: DirHandle) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.entries
+            .write()
+            .unwrap()
+            .insert(id, Handle::Dir(Arc::new(handle)));
+        id
+    }
+
+    fn get_file(&self, id: u64) -> Option<Arc<OwnedFd>> {
+        let guard = self.entries.read().unwrap();
+        match guard.get(&id)? {
+            Handle::File(fd) => Some(fd.clone()),
+            _ => None,
+        }
+    }
+
+    fn get_dir(&self, id: u64) -> Option<Arc<DirHandle>> {
+        let guard = self.entries.read().unwrap();
+        match guard.get(&id)? {
+            Handle::Dir(dir) => Some(dir.clone()),
+            _ => None,
+        }
+    }
+
+    fn remove(&self, id: u64) -> Option<Handle> {
+        self.entries.write().unwrap().remove(&id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -314,9 +404,10 @@ fn save_index_if_dirty(dir_fd: BorrowedFd<'_>, index: &mut DirIndex) -> Result<(
 }
 
 fn list_logical_entries(
-    dir_fd: BorrowedFd<'_>,
+    handle: &DirHandle,
     max_name_len: usize,
 ) -> Result<Vec<DirEntryInfo>, fuse3::Errno> {
+    let dir_fd = handle.as_fd();
     let mut dir = Dir::openat(
         dir_fd,
         ".",
@@ -325,7 +416,7 @@ fn list_logical_entries(
     )
     .map_err(errno_from_nix)?;
 
-    let mut index = load_dir_index(dir_fd)?;
+    let mut index = handle.index.write().unwrap();
     let mut entries = Vec::new();
 
     for entry in dir.iter() {
@@ -446,7 +537,9 @@ fn map_long_for_lookup(
                     Mode::empty(),
                 )
                 .map_err(errno_from_nix)?;
-                if let Ok(raw_name) = get_internal_rawname(fd.as_fd()) && raw_name == raw {
+                if let Ok(raw_name) = get_internal_rawname(fd.as_fd())
+                    && raw_name == raw
+                {
                     index.upsert(candidate.clone(), raw_name);
                     return Ok(candidate);
                 }
@@ -465,6 +558,12 @@ fn map_segment_for_lookup(
     raw: &[u8],
     max_name_len: usize,
 ) -> Result<(BackendName, SegmentKind), fuse3::Errno> {
+    if is_internal_meta(raw) {
+        return Err(fuse3::Errno::from(libc::EPERM));
+    }
+    if is_reserved_prefix(raw) {
+        return Err(fuse3::Errno::from(libc::EPERM));
+    }
     let kind = classify_segment(raw, max_name_len)?;
     match kind {
         SegmentKind::Short => Ok((BackendName::Short(raw.to_vec()), kind)),
@@ -480,6 +579,9 @@ fn map_segment_for_create(
     raw: &[u8],
     max_name_len: usize,
 ) -> Result<(BackendName, SegmentKind), fuse3::Errno> {
+    if is_internal_meta(raw) {
+        return Err(fuse3::Errno::from(libc::EPERM));
+    }
     let kind = classify_segment(raw, max_name_len)?;
     match kind {
         SegmentKind::Short => Ok((BackendName::Short(raw.to_vec()), kind)),
@@ -648,7 +750,7 @@ fn resolve_path(
 
 pub struct LongNameFsV2 {
     pub config: Arc<Config>,
-    handles: HandleTable,
+    handles: V2HandleTable,
     dir_cache: DirCache,
     max_write: NonZeroU32,
     max_name_len: usize,
@@ -666,7 +768,7 @@ impl LongNameFsV2 {
         let max_write = NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
         Ok(Self {
             config: Arc::new(config),
-            handles: HandleTable::new(),
+            handles: V2HandleTable::new(),
             dir_cache: DirCache::new(dir_cache_ttl),
             max_write,
             max_name_len,
@@ -679,15 +781,15 @@ impl LongNameFsV2 {
         }
     }
 
-    fn load_dir_entries(&self, dir_fd: BorrowedFd<'_>) -> Arc<Vec<DirEntryInfo>> {
-        let key = dir_cache_key(dir_fd);
+    fn load_dir_entries(&self, handle: &Arc<DirHandle>) -> Arc<Vec<DirEntryInfo>> {
+        let key = dir_cache_key(handle.as_fd());
         if let Some(cache_key) = key
             && let Some(entries) = self.dir_cache.get(cache_key)
         {
             return entries;
         }
 
-        let logical = list_logical_entries(dir_fd, self.max_name_len).unwrap_or_default();
+        let logical = list_logical_entries(handle, self.max_name_len).unwrap_or_default();
         if let Some(cache_key) = key {
             return self.dir_cache.insert(cache_key, logical);
         }
@@ -1566,7 +1668,8 @@ impl PathFilesystem for LongNameFsV2 {
     ) -> Result<ReplyOpen, fuse3::Errno> {
         if path == OsStr::new("/") {
             let fd = open_backend_root(&self.config)?;
-            let handle = self.handles.insert_dir(fd);
+            let index = load_dir_index(fd.as_fd())?;
+            let handle = self.handles.insert_dir(DirHandle::new(fd, index));
             return Ok(ReplyOpen { fh: handle, flags });
         }
         let mapped = resolve_path(&self.config, path, self.max_name_len)?;
@@ -1578,7 +1681,8 @@ impl PathFilesystem for LongNameFsV2 {
             Mode::empty(),
         )
         .map_err(errno_from_nix)?;
-        let handle = self.handles.insert_dir(fd);
+        let index = load_dir_index(fd.as_fd())?;
+        let handle = self.handles.insert_dir(DirHandle::new(fd, index));
         Ok(ReplyOpen { fh: handle, flags })
     }
 
@@ -1602,7 +1706,7 @@ impl PathFilesystem for LongNameFsV2 {
             .handles
             .get_dir(fh)
             .ok_or_else(|| fuse3::Errno::from(libc::EBADF))?;
-        let logical = self.load_dir_entries(handle.as_fd());
+        let logical = self.load_dir_entries(&handle);
         let mut entries: Vec<fuse3::Result<DirectoryEntry>> = Vec::with_capacity(logical.len() + 2);
 
         let mut idx: i64 = 0;
@@ -1646,7 +1750,7 @@ impl PathFilesystem for LongNameFsV2 {
             .handles
             .get_dir(fh)
             .ok_or_else(|| fuse3::Errno::from(libc::EBADF))?;
-        let logical = self.load_dir_entries(handle.as_fd());
+        let logical = self.load_dir_entries(&handle);
         let mut entries: Vec<fuse3::Result<DirectoryEntryPlus>> =
             Vec::with_capacity(logical.len() + 2);
         let dir_attr = fstat(handle.as_fd())

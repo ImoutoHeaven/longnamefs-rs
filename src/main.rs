@@ -117,11 +117,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_mount<F>(
-    fs: F,
-    mountpoint: PathBuf,
-    mount_opts: MountOptions,
-) -> anyhow::Result<()>
+async fn run_mount<F>(fs: F, mountpoint: PathBuf, mount_opts: MountOptions) -> anyhow::Result<()>
 where
     F: PathFilesystem + Send + Sync + 'static,
 {

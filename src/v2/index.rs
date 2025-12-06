@@ -187,8 +187,7 @@ pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> Result<(), f
     let tmp = begin_temp_file(dir_fd, final_name.as_c_str(), "idx")?;
     let mut written = 0;
     while written < data.len() {
-        let n =
-            retry_eintr(|| write(tmp.fd.as_fd(), &data[written..])).map_err(errno_from_nix)?;
+        let n = retry_eintr(|| write(tmp.fd.as_fd(), &data[written..])).map_err(errno_from_nix)?;
         written += n;
     }
     sync_and_commit(dir_fd, tmp, final_name.as_c_str())
