@@ -21,6 +21,7 @@ pub struct DirIndexEntry {
 #[derive(Debug, Default, Clone)]
 pub struct DirIndex {
     entries: HashMap<String, DirIndexEntry>,
+    raw_to_backend: HashMap<Vec<u8>, String>,
     dirty: bool,
 }
 
@@ -28,6 +29,7 @@ impl DirIndex {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            raw_to_backend: HashMap::new(),
             dirty: false,
         }
     }
@@ -37,12 +39,19 @@ impl DirIndex {
             backend_name: backend_name.clone(),
             raw_name,
         };
-        self.entries.insert(backend_name, entry);
+        if let Some(prev) = self.entries.insert(backend_name.clone(), entry) {
+            self.raw_to_backend.remove(&prev.raw_name);
+        }
+        self.raw_to_backend
+            .insert(self.entries[&backend_name].raw_name.clone(), backend_name);
         self.dirty = true;
     }
 
     pub fn remove(&mut self, backend_name: &str) -> Option<DirIndexEntry> {
         let removed = self.entries.remove(backend_name);
+        if let Some(entry) = &removed {
+            self.raw_to_backend.remove(&entry.raw_name);
+        }
         if removed.is_some() {
             self.dirty = true;
         }
@@ -74,7 +83,11 @@ impl DirIndex {
     }
 
     pub fn contains_raw_name(&self, raw: &[u8]) -> bool {
-        self.entries.values().any(|e| e.raw_name == raw)
+        self.raw_to_backend.contains_key(raw)
+    }
+
+    pub fn backend_for_raw(&self, raw: &[u8]) -> Option<&String> {
+        self.raw_to_backend.get(raw)
     }
 }
 
@@ -153,6 +166,11 @@ fn decode_index_bytes(bytes: &[u8]) -> Option<DirIndex> {
     }
 
     index.dirty = false;
+    for entry in index.entries.values() {
+        index
+            .raw_to_backend
+            .insert(entry.raw_name.clone(), entry.backend_name.clone());
+    }
     Some(index)
 }
 

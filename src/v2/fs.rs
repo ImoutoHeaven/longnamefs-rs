@@ -25,7 +25,7 @@ use nix::unistd::{
     Gid, LinkatFlags, Uid, UnlinkatFlags, faccessat, fchownat, fdatasync, fsync, linkat, symlinkat,
     unlinkat,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::num::NonZeroU32;
@@ -179,24 +179,34 @@ struct DirState {
     index: DirIndex,
     pending: usize,
     last_flush: Instant,
+    attr_cache: HashMap<Vec<u8>, fuse3::path::reply::FileAttr>,
 }
 
 #[derive(Debug)]
 struct DirHandle {
     fd: OwnedFd,
     state: RwLock<DirState>,
+    cache_key: Option<DirCacheKey>,
 }
 
 impl DirHandle {
     fn new(fd: OwnedFd, state: DirState) -> Self {
+        let cache_key = dir_cache_key(fd.as_fd());
         Self {
             fd,
             state: RwLock::new(state),
+            cache_key,
         }
     }
 
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    fn clear_cached_attrs(&self) {
+        if let Ok(mut state) = self.state.write() {
+            state.attr_cache.clear();
+        }
     }
 }
 
@@ -262,6 +272,18 @@ impl V2HandleTable {
 
     fn remove(&self, id: u64) -> Option<Handle> {
         self.entries.write().unwrap().remove(&id)
+    }
+
+    fn clear_dir_attr_cache(&self, key: DirCacheKey) {
+        if let Ok(guard) = self.entries.read() {
+            for handle in guard.values() {
+                if let Handle::Dir(dir) = handle
+                    && dir.cache_key == Some(key)
+                {
+                    dir.clear_cached_attrs();
+                }
+            }
+        }
     }
 }
 
@@ -497,12 +519,14 @@ fn load_dir_state(dir_fd: BorrowedFd<'_>) -> Result<DirState, fuse3::Errno> {
         index,
         pending: 0,
         last_flush: Instant::now(),
+        attr_cache: HashMap::new(),
     })
 }
 
 fn mark_dirty(state: &mut DirState) {
     state.index.mark_dirty();
     state.pending = state.pending.saturating_add(1);
+    state.attr_cache.clear();
 }
 
 fn maybe_flush_index(
@@ -547,6 +571,7 @@ fn list_logical_entries(
 
     let mut state = handle.state.write().unwrap();
     let mut entries = Vec::new();
+    let mut seen_backend = HashSet::new();
 
     for entry in dir.iter() {
         let entry = match entry {
@@ -561,6 +586,14 @@ fn list_logical_entries(
             || name_bytes.starts_with(JOURNAL_NAME.as_bytes())
         {
             continue;
+        }
+
+        let mut kind = map_dirent_type(&entry);
+        let mut attr = state.attr_cache.get(&name_bytes).cloned();
+        if kind.is_none()
+            && let Some(cached) = attr.as_ref()
+        {
+            kind = Some(cached.kind);
         }
 
         if name_bytes.starts_with(INTERNAL_PREFIX.as_bytes()) {
@@ -594,9 +627,7 @@ fn list_logical_entries(
                 Some(entry) => entry.raw_name.clone(),
                 None => continue,
             };
-            let mut kind = map_dirent_type(&entry);
-            let mut attr = None;
-            if kind.is_none() {
+            if attr.is_none() || kind.is_none() {
                 let c_name = match cstring_from_bytes(&name_bytes) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -605,19 +636,24 @@ fn list_logical_entries(
                     Ok(st) => st,
                     Err(_) => continue,
                 };
-                kind = Some(file_type_from_mode(stat.st_mode));
-                attr = Some(file_attr_from_stat(&stat));
+                let file_attr = file_attr_from_stat(&stat);
+                state
+                    .attr_cache
+                    .insert(name_bytes.clone(), file_attr);
+                if kind.is_none() {
+                    kind = Some(file_type_from_mode(stat.st_mode));
+                }
+                attr = Some(file_attr);
             }
             entries.push(DirEntryInfo {
                 name: OsString::from_vec(raw_name),
                 kind: kind.unwrap_or(FileType::RegularFile),
                 attr,
-                backend_name: name_bytes,
+                backend_name: name_bytes.clone(),
             });
+            seen_backend.insert(name_bytes);
         } else {
-            let mut kind = map_dirent_type(&entry);
-            let mut attr = None;
-            if kind.is_none() {
+            if attr.is_none() || kind.is_none() {
                 let c_name = match cstring_from_bytes(&name_bytes) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -626,18 +662,26 @@ fn list_logical_entries(
                     Ok(st) => st,
                     Err(_) => continue,
                 };
-                kind = Some(file_type_from_mode(stat.st_mode));
-                attr = Some(file_attr_from_stat(&stat));
+                let file_attr = file_attr_from_stat(&stat);
+                state
+                    .attr_cache
+                    .insert(name_bytes.clone(), file_attr);
+                if kind.is_none() {
+                    kind = Some(file_type_from_mode(stat.st_mode));
+                }
+                attr = Some(file_attr);
             }
             entries.push(DirEntryInfo {
-                name: OsString::from_vec(name_bytes),
+                name: OsString::from_vec(name_bytes.clone()),
                 kind: kind.unwrap_or(FileType::RegularFile),
                 attr,
-                backend_name: entry.file_name().to_bytes().to_vec(),
+                backend_name: name_bytes.clone(),
             });
+            seen_backend.insert(name_bytes);
         }
     }
 
+    state.attr_cache.retain(|k, _| seen_backend.contains(k));
     maybe_flush_index(dir_fd, &mut state, index_sync)?;
     Ok(entries)
 }
@@ -647,14 +691,7 @@ fn map_long_for_lookup(
     state: &mut DirState,
     raw: &[u8],
 ) -> Result<String, fuse3::Errno> {
-    let mut matched: Option<String> = None;
-    for (k, v) in state.index.iter() {
-        if v.raw_name == raw {
-            matched = Some(k.clone());
-            break;
-        }
-    }
-    if let Some(entry) = matched {
+    if let Some(entry) = state.index.backend_for_raw(raw).cloned() {
         let c_name = string_to_cstring(&entry)?;
         match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(_) => return Ok(entry),
@@ -929,6 +966,7 @@ impl LongNameFsV2 {
     fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
         if let Some(key) = dir_cache_key(dir_fd) {
             self.dir_cache.invalidate(key);
+            self.handles.clear_dir_attr_cache(key);
         }
     }
 
@@ -1338,13 +1376,8 @@ impl PathFilesystem for LongNameFsV2 {
             BackendName::Short(raw_to.clone())
         } else {
             // 可能已有同名长名
-            if let Some(entry) = to_ctx
-                .state
-                .index
-                .iter()
-                .find_map(|(k, v)| (v.raw_name == raw_to).then(|| k.clone()))
-            {
-                BackendName::Internal(entry)
+            if let Some(entry) = to_ctx.state.index.backend_for_raw(&raw_to) {
+                BackendName::Internal(entry.clone())
             } else {
                 let (candidate, _) =
                     map_segment_for_create(&to_ctx.state, &raw_to, self.max_name_len)?;

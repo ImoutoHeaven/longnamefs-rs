@@ -135,6 +135,9 @@ async fn main() -> anyhow::Result<()> {
             run_mount(fs, mountpoint, mount_opts).await
         }
         BackendLayout::V2 => {
+            eprintln!(
+                "WARNING: backend layout v2 is experimental and incompatible with v1 data; use a dedicated empty backend directory."
+            );
             let fs = LongNameFsV2::new(
                 config,
                 cli.max_name_len,
