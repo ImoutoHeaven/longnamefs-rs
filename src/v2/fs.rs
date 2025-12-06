@@ -1616,12 +1616,43 @@ impl PathFilesystem for LongNameFsV2 {
         let (backend, kind) =
             map_segment_for_lookup(ctx.dir_fd.as_fd(), &mut ctx.state, &raw, self.max_name_len)?;
         let fname = backend.as_cstring()?;
-        unlinkat(
+        match unlinkat(
             ctx.dir_fd.as_fd(),
             fname.as_c_str(),
             UnlinkatFlags::RemoveDir,
-        )
-        .map_err(errno_from_nix)?;
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ENOTEMPTY) => {
+                if let Ok(target_dir_fd) = nix::fcntl::openat(
+                    ctx.dir_fd.as_fd(),
+                    fname.as_c_str(),
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    if let Ok(index_cstr) = string_to_cstring(INDEX_NAME) {
+                        let _ = unlinkat(
+                            target_dir_fd.as_fd(),
+                            index_cstr.as_c_str(),
+                            UnlinkatFlags::NoRemoveDir,
+                        );
+                    }
+                    if let Ok(journal_cstr) = string_to_cstring(JOURNAL_NAME) {
+                        let _ = unlinkat(
+                            target_dir_fd.as_fd(),
+                            journal_cstr.as_c_str(),
+                            UnlinkatFlags::NoRemoveDir,
+                        );
+                    }
+                }
+                unlinkat(
+                    ctx.dir_fd.as_fd(),
+                    fname.as_c_str(),
+                    UnlinkatFlags::RemoveDir,
+                )
+                .map_err(errno_from_nix)?;
+            }
+            Err(err) => return Err(errno_from_nix(err)),
+        }
         if matches!(kind, SegmentKind::Long) {
             {
                 let mut guard = ctx.state.index.write().unwrap();
