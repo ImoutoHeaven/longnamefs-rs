@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use sha2::{Digest, Sha256};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
 pub const INTERNAL_PREFIX: &str = ".__ln2_";
@@ -48,4 +48,17 @@ pub fn backend_basename_from_hash(hash_hex: &str, suffix: Option<u32>) -> String
 
 pub fn normalize_osstr(value: &OsStr) -> Vec<u8> {
     value.as_bytes().to_vec()
+}
+
+pub fn make_child_path(parent: &OsStr, name: &OsStr) -> OsString {
+    if parent == OsStr::new("/") {
+        let mut composed = OsString::from("/");
+        composed.push(name);
+        composed
+    } else {
+        let mut composed = OsString::from(parent);
+        composed.push(OsStr::new("/"));
+        composed.push(name);
+        composed
+    }
 }

@@ -49,16 +49,17 @@ Usage
 
 ```bash
 longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
-  [--backend-layout v1] [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--max-write-kb 1024] [--sync-data] [--collision-protect] [--unsafe-namefile-writes]
+  [--backend-layout v1] [--allow-other] [--nonempty] [--dir-cache-ttl-ms 1000 | --no-dir-cache] [--max-write-kb 1024] [--max-name-len 1024] [--sync-data] [--collision-protect] [--unsafe-namefile-writes]
 ```
 
 - `--backend` (required): directory where hashed entries and namefiles are stored.
-- `--backend-layout` (default `v1`): `v1` is the current hash+namefile layout; `v2` (xattr+index) is planned and not yet implemented in this binary.
+- `--backend-layout` (default `v1`): `v1` is the current hash+namefile layout; `v2` enables the new xattr+index backend (incompatible with v1 backends; long-name hardlinks are rejected).
 - `--allow-other`: pass `allow_other` to FUSE.
 - `--nonempty`: allow mounting on a non-empty mountpoint.
 - `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000).
 - `--no-dir-cache`: disable directory cache entirely (useful for debugging correctness).
 - `--max-write-kb`: maximum write size advertised to FUSE in KiB (default 1024; kernel may clamp to its own maximum).
+- `--max-name-len`: maximum logical segment length accepted by the v2 backend (default 1024, failures surface as `ENAMETOOLONG` or `EINVAL`).
 - `--sync-data`: fdatasync data files after writes for stronger durability (at the cost of throughput).
 - `--collision-protect`: probe namefiles to detect/avoid hash collisions by using suffixed `<hash>.k` entries (default off; adds I/O).
 - `--unsafe-namefile-writes`: use non-transactional namefile updates (faster for many small files, but filename metadata may be lost or become inconsistent on crash).
@@ -75,6 +76,7 @@ Behavior
 - Operations on `/` interact directly with the backend directory (chmod/chown/utimens supported; truncate disallowed).
 - Extended attributes (get/set/list/remove) are forwarded to the backend objects; `position` must be zero on Linux.
 - `readdirplus` returns names with attributes; `flush`/`fsyncdir` are implemented; `poll` is accepted (returns no ready events).
+- With `--backend-layout v2`, long names are mapped to internal `.__ln2_*` entries with the original bytes stored in `user.ln2.rawname`; internal names and `.ln2_index` are hidden from directory listings, and creating hardlinks for long-name entries returns `EOPNOTSUPP`.
 
 systemd example
 ---------------

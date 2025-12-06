@@ -6,10 +6,12 @@ mod pathmap;
 mod util;
 mod v2;
 
+use crate::v2::fs::LongNameFsV2;
 use clap::{Parser, ValueEnum};
 use config::Config;
 use fs::LongNameFs;
 use fuse3::MountOptions;
+use fuse3::path::PathFilesystem;
 use fuse3::path::Session;
 #[cfg(unix)]
 use futures_util::future::poll_fn;
@@ -67,6 +69,10 @@ struct Cli {
     #[arg(long, default_value_t = 1024)]
     max_write_kb: u32,
 
+    /// Maximum logical path segment length allowed (v2 only; enforced before hashing).
+    #[arg(long, default_value_t = 1024)]
+    max_name_len: usize,
+
     /// Use non-transactional namefile writes (faster but unsafe: filename metadata may be lost or become inconsistent on crash).
     #[arg(long, default_value_t = false)]
     unsafe_namefile_writes: bool,
@@ -83,17 +89,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mountpoint = cli.mountpoint.clone();
 
-    if cli.backend_layout == BackendLayout::V2 {
-        anyhow::bail!(
-            "backend-layout=v2 is not implemented yet. See refine-fs-plan.md for roadmap."
-        );
-    }
-
     let config = Config::open_backend(cli.backend, cli.sync_data, cli.collision_protect)
         .map_err(std::io::Error::from)
         .map_err(anyhow::Error::from)?;
-
-    namefile::set_relaxed_namefile_mode(cli.unsafe_namefile_writes);
 
     let cache_ttl = if cli.no_dir_cache || cli.dir_cache_ttl_ms == 0 {
         None
@@ -101,13 +99,32 @@ async fn main() -> anyhow::Result<()> {
         Some(Duration::from_millis(cli.dir_cache_ttl_ms))
     };
 
-    let fs = LongNameFs::new(config, cache_ttl, cli.max_write_kb);
-
     let mut mount_opts = MountOptions::default();
     mount_opts.fs_name("longnamefs-rs");
     mount_opts.allow_other(cli.allow_other);
     mount_opts.nonempty(cli.nonempty);
 
+    match cli.backend_layout {
+        BackendLayout::V1 => {
+            namefile::set_relaxed_namefile_mode(cli.unsafe_namefile_writes);
+            let fs = LongNameFs::new(config, cache_ttl, cli.max_write_kb);
+            run_mount(fs, mountpoint, mount_opts).await
+        }
+        BackendLayout::V2 => {
+            let fs = LongNameFsV2::new(config, cli.max_name_len, cache_ttl, cli.max_write_kb)?;
+            run_mount(fs, mountpoint, mount_opts).await
+        }
+    }
+}
+
+async fn run_mount<F>(
+    fs: F,
+    mountpoint: PathBuf,
+    mount_opts: MountOptions,
+) -> anyhow::Result<()>
+where
+    F: PathFilesystem + Send + Sync + 'static,
+{
     let session = Session::new(mount_opts);
     let handle = session.mount(fs, mountpoint.clone()).await?;
 
