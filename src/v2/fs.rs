@@ -1236,36 +1236,6 @@ impl LongNameFsV2 {
         self.handles.clear_dir_attr_cache(key);
     }
 
-    fn lock_two_dir_indexes<'a>(
-        &'a self,
-        src: &'a RenameTarget,
-        dst: &'a RenameTarget,
-    ) -> Result<
-        (
-            RwLockWriteGuard<'a, IndexState>,
-            Option<RwLockWriteGuard<'a, IndexState>>,
-        ),
-        fuse3::Errno,
-    > {
-        // IndexState is shared per directory; when both targets share parent_key we must only
-        // take a single lock to avoid self-deadlock.
-        if src.path.parent_key == dst.path.parent_key {
-            let guard = src.ctx.state.index.write().unwrap();
-            return Ok((guard, None));
-        }
-        let src_key = (src.path.parent_key.dev, src.path.parent_key.ino);
-        let dst_key = (dst.path.parent_key.dev, dst.path.parent_key.ino);
-        if src_key < dst_key {
-            let src_guard = src.ctx.state.index.write().unwrap();
-            let dst_guard = dst.ctx.state.index.write().unwrap();
-            Ok((src_guard, Some(dst_guard)))
-        } else {
-            let dst_guard = dst.ctx.state.index.write().unwrap();
-            let src_guard = src.ctx.state.index.write().unwrap();
-            Ok((src_guard, Some(dst_guard)))
-        }
-    }
-
     fn cached_root_fd(&self) -> Result<Arc<OwnedFd>, fuse3::Errno> {
         let key =
             dir_cache_key(self.config.backend_fd()).ok_or_else(fuse3::Errno::new_not_exist)?;
@@ -1577,16 +1547,16 @@ impl LongNameFsV2 {
             .as_ref()
             .ok_or_else(fuse3::Errno::new_not_exist)?;
         let dst_backend = BackendName::Short(dst.path.logical_name.clone());
+        self.do_backend_rename(
+            src.ctx.dir_fd.as_fd(),
+            src_backend,
+            dst.ctx.dir_fd.as_fd(),
+            &dst_backend,
+            flags,
+        )?;
+        let backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
         {
             let mut src_guard = src.ctx.state.index.write().unwrap();
-            self.do_backend_rename(
-                src.ctx.dir_fd.as_fd(),
-                src_backend,
-                dst.ctx.dir_fd.as_fd(),
-                &dst_backend,
-                flags,
-            )?;
-            let backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
             if src_guard.index.remove(&backend_name).is_some() {
                 src_guard.pending = src_guard.pending.saturating_add(1);
             }
