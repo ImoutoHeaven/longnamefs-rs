@@ -2248,7 +2248,7 @@ impl PathFilesystem for LongNameFsV2 {
         }
 
         if let Some(path) = path
-            && path != "/"
+            && path != OsStr::new("/")
             && let Ok(mapped) = self.resolve_path(path)
         {
             self.invalidate_dir(mapped.dir_fd.as_fd());
@@ -2503,11 +2503,10 @@ impl PathFilesystem for LongNameFsV2 {
         fh: u64,
         _lock_owner: u64,
     ) -> Result<(), fuse3::Errno> {
-        let handle = self
-            .handles
-            .get_file(fh)
-            .ok_or_else(|| fuse3::Errno::from(libc::EBADF))?;
-        fsync(handle.as_fd()).map_err(errno_from_nix)
+        if self.handles.get_file(fh).is_none() {
+            return Err(fuse3::Errno::from(libc::EBADF));
+        }
+        Ok(())
     }
 
     async fn access(&self, _req: Request, path: &OsStr, mask: u32) -> Result<(), fuse3::Errno> {

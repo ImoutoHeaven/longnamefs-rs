@@ -81,7 +81,7 @@ Behavior
 --------
 
 - Read/write, create, rename, link, symlink, mkdir/mknod, truncate, chmod/chown, utimens, and statfs mirror the C implementation when using `--backend-layout v1`.
-- FUSE writeback cache is requested by default; when the kernel honors it, writes may be buffered/merged in the page cache, so durability still relies on `fsync`/`fdatasync`/close.
+- FUSE writeback cache is requested by default; when the kernel honors it, writes may be buffered/merged in the page cache, so durability relies on explicit `fsync`/`fdatasync` (close does not force a sync) and the kernel's asynchronous flushes.
 - Directory listings reconstruct original names and cache entries per-directory for the configured TTL (default 1s) and invalidate on mutations to cut repeated backend I/O. In v2 the same TTL controls an LRU of directory FDs to reduce open/close churn when resolving deep paths.
 - Operations on `/` interact directly with the backend directory (chmod/chown/utimens supported; truncate disallowed).
 - Extended attributes (get/set/list/remove) are forwarded to backend objects; `position` must be zero on Linux.
