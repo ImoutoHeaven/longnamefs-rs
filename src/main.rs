@@ -96,6 +96,10 @@ struct Cli {
     #[arg(long, default_value_t = 1024)]
     max_name_len: usize,
 
+    /// TTL for attr/entry replies in milliseconds (v2 only). Set to 0 to disable kernel caching.
+    #[arg(long)]
+    attr_ttl_ms: Option<u64>,
+
     /// v2 index flush strategy: always sync, batch by time/ops, or off (no flush).
     #[arg(long, value_enum, default_value_t = IndexSyncCli::Batch)]
     index_sync: IndexSyncCli,
@@ -148,6 +152,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some(Duration::from_millis(cli.dir_cache_ttl_ms))
     };
+    let attr_ttl = cli
+        .attr_ttl_ms
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(1));
 
     let mut mount_opts = MountOptions::default();
     mount_opts.fs_name("longnamefs-rs");
@@ -170,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
                 cache_ttl,
                 cli.max_write_kb,
                 cli.index_sync.into(),
+                attr_ttl,
             )?;
             run_mount(fs, mountpoint, mount_opts).await
         }

@@ -60,6 +60,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--nonempty`: allow mounting on a non-empty mountpoint.
 - `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000); also drives the directory FD cache used by the v2 path resolver.
 - `--no-dir-cache`: disable directory cache (useful for debugging).
+- `--attr-ttl-ms`: attr/entry TTL for FUSE replies (default 1000); set to 0 to disable kernel caching (recommended for v2 if you need strict visibility of newly created long names until invalidation is added).
 - `--max-write-kb`: maximum write size advertised to FUSE in KiB (default 1024; kernel may clamp).
 - `--sync-data`: fdatasync after writes for stronger durability (at the cost of throughput).
 - The process attempts to raise `RLIMIT_NOFILE` on Unix to reduce `EMFILE` risk when many directory FDs are cached; set a generous `ulimit -n` (e.g. 65536) in production.

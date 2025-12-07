@@ -39,7 +39,6 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-const ATTR_TTL: Duration = Duration::from_secs(1);
 const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const JOURNAL_NAME: &str = ".ln2_journal";
 const PARALLEL_REBUILD_THRESHOLD: usize = 64;
@@ -1197,6 +1196,7 @@ pub struct LongNameFsV2 {
     max_name_len: usize,
     index_sync: IndexSync,
     supports_renameat2: bool,
+    attr_ttl: Duration,
 }
 
 impl LongNameFsV2 {
@@ -1206,6 +1206,7 @@ impl LongNameFsV2 {
         dir_cache_ttl: Option<Duration>,
         max_write_kb: u32,
         index_sync: IndexSync,
+        attr_ttl: Duration,
     ) -> Result<Self, fuse3::Errno> {
         verify_backend_supports_xattr(config.backend_fd())?;
         let supports_renameat2 = probe_renameat2(config.backend_fd())?;
@@ -1221,6 +1222,7 @@ impl LongNameFsV2 {
             max_name_len,
             index_sync,
             supports_renameat2,
+            attr_ttl,
         })
     }
 
@@ -1754,7 +1756,7 @@ impl PathFilesystem for LongNameFsV2 {
             file_attr_from_stat(&stat)
         };
         Ok(ReplyEntry {
-            ttl: ATTR_TTL,
+            ttl: self.attr_ttl,
             attr,
         })
     }
@@ -1770,7 +1772,7 @@ impl PathFilesystem for LongNameFsV2 {
             let stat = fstat(handle.as_fd()).map_err(errno_from_nix)?;
             let attr = file_attr_from_stat(&stat);
             return Ok(ReplyAttr {
-                ttl: ATTR_TTL,
+                ttl: self.attr_ttl,
                 attr,
             });
         }
@@ -1778,7 +1780,7 @@ impl PathFilesystem for LongNameFsV2 {
         let path = path.ok_or_else(fuse3::Errno::new_not_exist)?;
         let attr = self.stat_path(path)?;
         Ok(ReplyAttr {
-            ttl: ATTR_TTL,
+            ttl: self.attr_ttl,
             attr,
         })
     }
@@ -1875,7 +1877,7 @@ impl PathFilesystem for LongNameFsV2 {
         self.invalidate_dir(mapped.dir_fd.as_fd());
         let attr = self.stat_path(path)?;
         Ok(ReplyAttr {
-            ttl: ATTR_TTL,
+            ttl: self.attr_ttl,
             attr,
         })
     }
@@ -1922,7 +1924,7 @@ impl PathFilesystem for LongNameFsV2 {
         self.invalidate_dir(ctx.dir_fd.as_fd());
         let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
         Ok(ReplyEntry {
-            ttl: ATTR_TTL,
+            ttl: self.attr_ttl,
             attr,
         })
     }
@@ -1965,7 +1967,7 @@ impl PathFilesystem for LongNameFsV2 {
         self.invalidate_dir(ctx.dir_fd.as_fd());
         let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
         Ok(ReplyEntry {
-            ttl: ATTR_TTL,
+            ttl: self.attr_ttl,
             attr,
         })
     }
@@ -2020,7 +2022,7 @@ impl PathFilesystem for LongNameFsV2 {
         self.invalidate_dir(ctx.dir_fd.as_fd());
         let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
         Ok(ReplyEntry {
-            ttl: ATTR_TTL,
+            ttl: self.attr_ttl,
             attr,
         })
     }
@@ -2175,7 +2177,7 @@ impl PathFilesystem for LongNameFsV2 {
         self.invalidate_dir(ctx.dir_fd.as_fd());
         let attr = self.stat_path(&crate::v2::path::make_child_path(new_parent, new_name))?;
         Ok(ReplyEntry {
-            ttl: ATTR_TTL,
+            ttl: self.attr_ttl,
             attr,
         })
     }
@@ -2561,7 +2563,7 @@ impl PathFilesystem for LongNameFsV2 {
                     let fh = self.handles.insert_file(fd);
                     let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
                     return Ok(ReplyCreated {
-                        ttl: ATTR_TTL,
+                        ttl: self.attr_ttl,
                         attr,
                         generation: 0,
                         fh,
@@ -2698,8 +2700,8 @@ impl PathFilesystem for LongNameFsV2 {
             name: OsString::from("."),
             offset: idx + 1,
             attr: dir_attr,
-            entry_ttl: ATTR_TTL,
-            attr_ttl: ATTR_TTL,
+            entry_ttl: self.attr_ttl,
+            attr_ttl: self.attr_ttl,
         }));
         idx += 1;
         entries.push(Ok(DirectoryEntryPlus {
@@ -2707,8 +2709,8 @@ impl PathFilesystem for LongNameFsV2 {
             name: OsString::from(".."),
             offset: idx + 1,
             attr: dir_attr,
-            entry_ttl: ATTR_TTL,
-            attr_ttl: ATTR_TTL,
+            entry_ttl: self.attr_ttl,
+            attr_ttl: self.attr_ttl,
         }));
         idx += 1;
 
@@ -2741,8 +2743,8 @@ impl PathFilesystem for LongNameFsV2 {
                 name: entry.name.clone(),
                 offset: idx,
                 attr,
-                entry_ttl: ATTR_TTL,
-                attr_ttl: ATTR_TTL,
+                entry_ttl: self.attr_ttl,
+                attr_ttl: self.attr_ttl,
             }));
         }
 
