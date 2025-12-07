@@ -1481,13 +1481,23 @@ impl LongNameFsV2 {
         };
 
         let src_c = src_backend.as_cstring()?;
-        let src_fd = nix::fcntl::openat(
+        let src_fd = match nix::fcntl::openat(
             src.ctx.dir_fd.as_fd(),
             src_c.as_c_str(),
-            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
-        )
-        .map_err(errno_from_nix)?;
+        ) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::EISDIR) => nix::fcntl::openat(
+                src.ctx.dir_fd.as_fd(),
+                src_c.as_c_str(),
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY,
+                Mode::empty(),
+            )
+            .map_err(errno_from_nix)?,
+            Err(nix::errno::Errno::ELOOP) => return Err(fuse3::Errno::from(libc::ELOOP)),
+            Err(err) => return Err(errno_from_nix(err)),
+        };
         set_internal_rawname(src_fd.as_fd(), &dst.path.logical_name)?;
 
         let mut attempt = 0;
@@ -1979,13 +1989,23 @@ impl PathFilesystem for LongNameFsV2 {
         )
         .map_err(errno_from_nix)?;
         if matches!(kind, SegmentKind::Long) {
-            let fd = nix::fcntl::openat(
+            let fd = match nix::fcntl::openat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY,
+                OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
-            )
-            .map_err(errno_from_nix)?;
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::EISDIR) => nix::fcntl::openat(
+                    ctx.dir_fd.as_fd(),
+                    fname.as_c_str(),
+                    OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(errno_from_nix)?,
+                Err(nix::errno::Errno::ELOOP) => return Err(fuse3::Errno::from(libc::ELOOP)),
+                Err(err) => return Err(errno_from_nix(err)),
+            };
             set_internal_rawname(fd.as_fd(), &raw)?;
             {
                 let mut guard = ctx.state.index.write().unwrap();
