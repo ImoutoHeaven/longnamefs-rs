@@ -695,7 +695,7 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> Result<DirIndex, fu
             let fd = match nix::fcntl::openat(
                 dir_fd,
                 c_name.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
@@ -743,7 +743,7 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> Result<DirIndex, fu
                     let fd = match nix::fcntl::openat(
                         dup_fd.as_fd(),
                         c_name.as_c_str(),
-                        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                         Mode::empty(),
                     ) {
                         Ok(fd) => fd,
@@ -878,7 +878,7 @@ fn list_logical_entries(
                 let fd = match nix::fcntl::openat(
                     dir_fd,
                     c_name.as_c_str(),
-                    OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                    OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                     Mode::empty(),
                 ) {
                     Ok(fd) => fd,
@@ -990,7 +990,7 @@ fn map_long_for_lookup(
                 let fd = nix::fcntl::openat(
                     dir_fd,
                     c_name.as_c_str(),
-                    OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                    OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                     Mode::empty(),
                 )
                 .map_err(errno_from_nix)?;
@@ -1120,7 +1120,7 @@ fn handle_backend_eexist_index_missing(
     let fd = nix::fcntl::openat(
         dir_fd,
         c_name.as_c_str(),
-        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
     )
     .map_err(errno_from_nix)?;
@@ -1149,7 +1149,7 @@ fn refresh_dir_index_from_backend(
     let fd = nix::fcntl::openat(
         dir_fd,
         c_name.as_c_str(),
-        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
     )
     .map_err(errno_from_nix)?;
@@ -1484,7 +1484,7 @@ impl LongNameFsV2 {
         let src_fd = nix::fcntl::openat(
             src.ctx.dir_fd.as_fd(),
             src_c.as_c_str(),
-            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
         )
         .map_err(errno_from_nix)?;
@@ -1620,7 +1620,7 @@ impl LongNameFsV2 {
         let dst_fd = nix::fcntl::openat(
             dst.ctx.dir_fd.as_fd(),
             dst_c.as_c_str(),
-            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
         )
         .map_err(errno_from_nix)?;
@@ -1894,7 +1894,7 @@ impl PathFilesystem for LongNameFsV2 {
             let fd = nix::fcntl::openat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
             )
             .map_err(errno_from_nix)?;
@@ -1937,7 +1937,7 @@ impl PathFilesystem for LongNameFsV2 {
             let fd = nix::fcntl::openat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
             )
             .map_err(errno_from_nix)?;
@@ -1982,7 +1982,7 @@ impl PathFilesystem for LongNameFsV2 {
             let fd = nix::fcntl::openat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY,
                 Mode::empty(),
             )
             .map_err(errno_from_nix)?;
@@ -2306,7 +2306,7 @@ impl PathFilesystem for LongNameFsV2 {
         let fd = nix::fcntl::openat(
             mapped.dir_fd.as_fd(),
             fname.as_c_str(),
-            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
         )
         .map_err(errno_from_nix)?;
@@ -2345,7 +2345,7 @@ impl PathFilesystem for LongNameFsV2 {
             let fd = nix::fcntl::openat(
                 mapped.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
             )
             .map_err(errno_from_nix)?;
@@ -2392,7 +2392,7 @@ impl PathFilesystem for LongNameFsV2 {
             let fd = nix::fcntl::openat(
                 mapped.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
             )
             .map_err(errno_from_nix)?;
@@ -2455,7 +2455,7 @@ impl PathFilesystem for LongNameFsV2 {
             let fd = nix::fcntl::openat(
                 mapped.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
             )
             .map_err(errno_from_nix)?;
