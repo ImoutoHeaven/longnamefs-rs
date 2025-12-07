@@ -717,7 +717,7 @@ impl PathFilesystem for LongNameFs {
     async fn fsync(
         &self,
         _req: Request,
-        _path: Option<&OsStr>,
+        path: Option<&OsStr>,
         fh: u64,
         datasync: bool,
     ) -> Result<(), fuse3::Errno> {
@@ -730,6 +730,12 @@ impl PathFilesystem for LongNameFs {
             fdatasync(handle.as_fd()).map_err(errno_from_nix)?;
         } else {
             fsync(handle.as_fd()).map_err(errno_from_nix)?;
+        }
+        if let Some(path) = path
+            && path != "/"
+            && let Ok(mapped) = open_path(&self.config, path)
+        {
+            self.invalidate_dir(mapped.dir_fd.as_fd());
         }
         Ok(())
     }
@@ -1080,6 +1086,7 @@ impl PathFilesystem for LongNameFs {
         } else {
             fsync(handle.as_fd()).map_err(errno_from_nix)?;
         }
+        self.invalidate_dir(handle.as_fd());
         Ok(())
     }
 

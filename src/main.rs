@@ -161,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
     mount_opts.fs_name("longnamefs-rs");
     mount_opts.allow_other(cli.allow_other);
     mount_opts.nonempty(cli.nonempty);
+    mount_opts.write_back(true);
 
     match cli.backend_layout {
         BackendLayout::V1 => {
