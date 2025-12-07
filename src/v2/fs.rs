@@ -1505,56 +1505,58 @@ impl LongNameFsV2 {
             .backend_name
             .as_ref()
             .ok_or_else(fuse3::Errno::new_not_exist)?;
-        {
-            let (mut src_guard, mut dst_guard_opt) = self.lock_two_dir_indexes(src, dst)?;
-            let target_guard = dst_guard_opt.as_mut().unwrap_or(&mut src_guard);
-            let mut dst_internal =
-                select_backend_for_long_name(&mut target_guard.index, &dst.path.logical_name)?;
+        let mut dst_internal = {
+            let mut guard = dst.ctx.state.index.write().unwrap();
+            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
+        };
 
-            let src_c = src_backend.as_cstring()?;
-            let src_fd = nix::fcntl::openat(
+        let src_c = src_backend.as_cstring()?;
+        let src_fd = nix::fcntl::openat(
+            src.ctx.dir_fd.as_fd(),
+            src_c.as_c_str(),
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(errno_from_nix)?;
+        set_internal_rawname(src_fd.as_fd(), &dst.path.logical_name)?;
+
+        let mut attempt = 0;
+        loop {
+            let rename_res = self.do_backend_rename(
                 src.ctx.dir_fd.as_fd(),
-                src_c.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(errno_from_nix)?;
-            set_internal_rawname(src_fd.as_fd(), &dst.path.logical_name)?;
-
-            let mut attempt = 0;
-            loop {
-                let rename_res = self.do_backend_rename(
-                    src.ctx.dir_fd.as_fd(),
-                    src_backend,
-                    dst.ctx.dir_fd.as_fd(),
-                    &BackendName::Internal(dst_internal.clone()),
-                    flags,
-                );
-                match rename_res {
-                    Ok(()) => break,
-                    Err(err) if err == fuse3::Errno::from(libc::EEXIST) => {
-                        if attempt > 0 {
-                            return Err(err);
-                        }
+                src_backend,
+                dst.ctx.dir_fd.as_fd(),
+                &BackendName::Internal(dst_internal.clone()),
+                flags,
+            );
+            match rename_res {
+                Ok(()) => break,
+                Err(err) if err == fuse3::Errno::from(libc::EEXIST) => {
+                    if attempt > 0 {
+                        return Err(err);
+                    }
+                    {
+                        let mut guard = dst.ctx.state.index.write().unwrap();
                         refresh_dir_index_from_backend(
                             dst.ctx.dir_fd.as_fd(),
-                            target_guard,
+                            &mut guard,
                             &dst_internal,
                         )?;
-                        dst_internal = select_backend_for_long_name(
-                            &mut target_guard.index,
-                            &dst.path.logical_name,
-                        )?;
-                        attempt += 1;
+                        dst_internal =
+                            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
                     }
-                    Err(err) => return Err(err),
+                    attempt += 1;
                 }
+                Err(err) => return Err(err),
             }
+        }
 
-            target_guard
+        {
+            let mut guard = dst.ctx.state.index.write().unwrap();
+            guard
                 .index
                 .upsert(dst_internal.clone(), dst.path.logical_name.clone());
-            target_guard.pending = target_guard.pending.saturating_add(1);
+            guard.pending = guard.pending.saturating_add(1);
         }
         dst.ctx.state.attr_cache.clear();
         maybe_flush_index(dst.ctx.dir_fd.as_fd(), &mut dst.ctx.state, self.index_sync)?;
@@ -1607,110 +1609,86 @@ impl LongNameFsV2 {
             .backend_name
             .as_ref()
             .ok_or_else(fuse3::Errno::new_not_exist)?;
-        {
-            let (mut src_guard, mut dst_guard_opt) = self.lock_two_dir_indexes(src, dst)?;
-            if let Some(target_guard) = dst_guard_opt.as_mut() {
-                let mut dst_internal =
-                    select_backend_for_long_name(&mut target_guard.index, &dst.path.logical_name)?;
-                let mut attempt = 0;
-                loop {
-                    let res = self.do_backend_rename(
-                        src.ctx.dir_fd.as_fd(),
-                        src_backend,
-                        dst.ctx.dir_fd.as_fd(),
-                        &BackendName::Internal(dst_internal.clone()),
-                        flags,
-                    );
-                    match res {
-                        Ok(()) => break,
-                        Err(err) if err == fuse3::Errno::from(libc::EEXIST) => {
-                            if attempt > 0 {
-                                return Err(err);
-                            }
-                            refresh_dir_index_from_backend(
-                                dst.ctx.dir_fd.as_fd(),
-                                target_guard,
-                                &dst_internal,
-                            )?;
-                            dst_internal = select_backend_for_long_name(
-                                &mut target_guard.index,
-                                &dst.path.logical_name,
-                            )?;
-                            attempt += 1;
-                        }
-                        Err(err) => return Err(err),
+        let same_dir = src.path.parent_key == dst.path.parent_key;
+        let mut dst_internal = {
+            let mut guard = dst.ctx.state.index.write().unwrap();
+            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
+        };
+
+        let mut attempt = 0;
+        loop {
+            let res = self.do_backend_rename(
+                src.ctx.dir_fd.as_fd(),
+                src_backend,
+                dst.ctx.dir_fd.as_fd(),
+                &BackendName::Internal(dst_internal.clone()),
+                flags,
+            );
+            match res {
+                Ok(()) => break,
+                Err(err) if err == fuse3::Errno::from(libc::EEXIST) => {
+                    if attempt > 0 {
+                        return Err(err);
                     }
+                    {
+                        let mut guard = dst.ctx.state.index.write().unwrap();
+                        refresh_dir_index_from_backend(
+                            dst.ctx.dir_fd.as_fd(),
+                            &mut guard,
+                            &dst_internal,
+                        )?;
+                        dst_internal =
+                            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
+                    }
+                    attempt += 1;
                 }
+                Err(err) => return Err(err),
+            }
+        }
 
-                let dst_c = BackendName::Internal(dst_internal.clone()).as_cstring()?;
-                let dst_fd = nix::fcntl::openat(
-                    dst.ctx.dir_fd.as_fd(),
-                    dst_c.as_c_str(),
-                    OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                    Mode::empty(),
-                )
-                .map_err(errno_from_nix)?;
-                set_internal_rawname(dst_fd.as_fd(), &dst.path.logical_name)?;
+        let dst_c = BackendName::Internal(dst_internal.clone()).as_cstring()?;
+        let dst_fd = nix::fcntl::openat(
+            dst.ctx.dir_fd.as_fd(),
+            dst_c.as_c_str(),
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(errno_from_nix)?;
+        set_internal_rawname(dst_fd.as_fd(), &dst.path.logical_name)?;
 
-                let src_backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
+        let src_backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
+        if same_dir {
+            let mut guard = dst.ctx.state.index.write().unwrap();
+            if guard.index.remove(&src_backend_name).is_some() {
+                guard.pending = guard.pending.saturating_add(1);
+            }
+            guard
+                .index
+                .upsert(dst_internal.clone(), dst.path.logical_name.clone());
+            guard.pending = guard.pending.saturating_add(1);
+        } else {
+            let src_key = (src.path.parent_key.dev, src.path.parent_key.ino);
+            let dst_key = (dst.path.parent_key.dev, dst.path.parent_key.ino);
+            if src_key < dst_key {
+                let mut src_guard = src.ctx.state.index.write().unwrap();
+                let mut dst_guard = dst.ctx.state.index.write().unwrap();
                 if src_guard.index.remove(&src_backend_name).is_some() {
                     src_guard.pending = src_guard.pending.saturating_add(1);
                 }
-                target_guard
+                dst_guard
                     .index
                     .upsert(dst_internal.clone(), dst.path.logical_name.clone());
-                target_guard.pending = target_guard.pending.saturating_add(1);
+                dst_guard.pending = dst_guard.pending.saturating_add(1);
             } else {
-                let mut dst_internal =
-                    select_backend_for_long_name(&mut src_guard.index, &dst.path.logical_name)?;
-                let mut attempt = 0;
-                loop {
-                    let res = self.do_backend_rename(
-                        src.ctx.dir_fd.as_fd(),
-                        src_backend,
-                        dst.ctx.dir_fd.as_fd(),
-                        &BackendName::Internal(dst_internal.clone()),
-                        flags,
-                    );
-                    match res {
-                        Ok(()) => break,
-                        Err(err) if err == fuse3::Errno::from(libc::EEXIST) => {
-                            if attempt > 0 {
-                                return Err(err);
-                            }
-                            refresh_dir_index_from_backend(
-                                dst.ctx.dir_fd.as_fd(),
-                                &mut src_guard,
-                                &dst_internal,
-                            )?;
-                            dst_internal = select_backend_for_long_name(
-                                &mut src_guard.index,
-                                &dst.path.logical_name,
-                            )?;
-                            attempt += 1;
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
-
-                let dst_c = BackendName::Internal(dst_internal.clone()).as_cstring()?;
-                let dst_fd = nix::fcntl::openat(
-                    dst.ctx.dir_fd.as_fd(),
-                    dst_c.as_c_str(),
-                    OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                    Mode::empty(),
-                )
-                .map_err(errno_from_nix)?;
-                set_internal_rawname(dst_fd.as_fd(), &dst.path.logical_name)?;
-
-                let src_backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
+                let mut dst_guard = dst.ctx.state.index.write().unwrap();
+                let mut src_guard = src.ctx.state.index.write().unwrap();
                 if src_guard.index.remove(&src_backend_name).is_some() {
                     src_guard.pending = src_guard.pending.saturating_add(1);
                 }
-                src_guard
+                dst_guard
                     .index
                     .upsert(dst_internal.clone(), dst.path.logical_name.clone());
-                src_guard.pending = src_guard.pending.saturating_add(1);
+                dst_guard.pending = dst_guard.pending.saturating_add(1);
             }
         }
         src.ctx.state.attr_cache.clear();
