@@ -562,7 +562,6 @@ struct ResolvedPath {
     logical_name: Vec<u8>,
     kind: SegmentKind,
     exists: bool,
-    is_internal_prefix: bool,
 }
 
 #[derive(Debug)]
@@ -1248,6 +1247,8 @@ impl LongNameFsV2 {
         ),
         fuse3::Errno,
     > {
+        // IndexState is shared per directory; when both targets share parent_key we must only
+        // take a single lock to avoid self-deadlock.
         if src.path.parent_key == dst.path.parent_key {
             let guard = src.ctx.state.index.write().unwrap();
             return Ok((guard, None));
@@ -1418,12 +1419,9 @@ impl LongNameFsV2 {
             self.max_name_len,
         );
         maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
-        let (backend_name, exists, is_internal_prefix) = match map_res {
-            Ok((backend, _)) => {
-                let is_internal_prefix = backend.is_internal();
-                (Some(backend), true, is_internal_prefix)
-            }
-            Err(err) if err.is_not_exist() => (None, false, false),
+        let (backend_name, exists) = match map_res {
+            Ok((backend, _)) => (Some(backend), true),
+            Err(err) if err.is_not_exist() => (None, false),
             Err(err) => return Err(err),
         };
 
@@ -1437,7 +1435,6 @@ impl LongNameFsV2 {
                 logical_name,
                 kind,
                 exists,
-                is_internal_prefix,
             },
         })
     }
@@ -1748,6 +1745,9 @@ impl LongNameFsV2 {
         }
         let mut dst = self.resolve_path_for_rename(parent, name)?;
 
+        // Overwrite vs non-overwrite semantics are delegated to backend rename/renameat2. dst.exists
+        // only influences whether we run upgrade/downgrade or same-kind paths; it is not used to
+        // simulate coverage rules in user space.
         match (src.path.kind, dst.path.kind) {
             (SegmentKind::Short, SegmentKind::Short) => {
                 self.rename_short_to_short(&src, &dst, flags)
