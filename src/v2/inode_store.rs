@@ -117,9 +117,7 @@ impl InodeStore {
         if let Some(&ino) = inner.backend.get(&backend) {
             let entry = inner.entries.get_mut(&ino).expect("inode map out of sync");
             entry.lookup_count = entry.lookup_count.saturating_add(lookup_inc);
-            if entry.path.is_empty() {
-                entry.path = path.clone();
-            }
+            entry.path = path.clone();
             if let Some(parent) = parent {
                 Self::push_parent(entry, parent);
             }
@@ -193,6 +191,13 @@ impl InodeStore {
         let mut inner = self.inner.write();
         let entry = inner.entries.get_mut(&ino)?;
         entry.parents.retain(|p| p != parent);
+        Some(entry.clone())
+    }
+
+    pub fn update_path(&self, ino: InodeId, path: OsString) -> Option<InodeEntry> {
+        let mut inner = self.inner.write();
+        let entry = inner.entries.get_mut(&ino)?;
+        entry.path = path;
         Some(entry.clone())
     }
 

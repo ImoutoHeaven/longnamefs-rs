@@ -19,10 +19,12 @@ use fuse3::path::reply::{DirectoryEntryPlus, ReplyPoll, ReplyXAttr};
 use fuse3::{FileType, SetAttr};
 use fuser::{
     FileAttr as FuserFileAttr, FileType as FuserFileType, Filesystem as FuserFilesystem,
-    KernelConfig, ReplyAttr as FuserReplyAttr, ReplyData as FuserReplyData,
-    ReplyDirectory as FuserReplyDirectory, ReplyEmpty as FuserReplyEmpty,
-    ReplyEntry as FuserReplyEntry, ReplyOpen as FuserReplyOpen, ReplyWrite as FuserReplyWrite,
-    Request as FuserRequest,
+    KernelConfig, ReplyAttr as FuserReplyAttr, ReplyCreate as FuserReplyCreate,
+    ReplyData as FuserReplyData, ReplyDirectory as FuserReplyDirectory,
+    ReplyDirectoryPlus as FuserReplyDirectoryPlus, ReplyEmpty as FuserReplyEmpty,
+    ReplyEntry as FuserReplyEntry, ReplyOpen as FuserReplyOpen, ReplyStatfs as FuserReplyStatfs,
+    ReplyWrite as FuserReplyWrite, ReplyXattr as FuserReplyXattr, Request as FuserRequest,
+    TimeOrNow,
 };
 use nix::dir::Dir;
 use nix::fcntl::{AtFlags, OFlag, RenameFlags, readlinkat, renameat, renameat2};
@@ -44,6 +46,7 @@ use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{
     Arc,
@@ -470,6 +473,20 @@ fn backend_key_from_stat(stat: &nix::sys::stat::FileStat) -> BackendKey {
     BackendKey {
         dev: stat.st_dev,
         ino: stat.st_ino,
+    }
+}
+
+fn timespec_from_time_or_now(value: Option<TimeOrNow>) -> TimeSpec {
+    match value {
+        Some(TimeOrNow::Now) => TimeSpec::UTIME_NOW,
+        Some(TimeOrNow::SpecificTime(t)) => match t.duration_since(UNIX_EPOCH) {
+            Ok(dur) => TimeSpec::from_duration(dur),
+            Err(err) => {
+                let dur = err.duration();
+                -TimeSpec::from_duration(dur)
+            }
+        },
+        None => TimeSpec::UTIME_OMIT,
     }
 }
 
@@ -3142,6 +3159,20 @@ impl LongNameFsV2Fuser {
         })
     }
 
+    fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
+        if let Some(key) = dir_cache_key(dir_fd) {
+            self.invalidate_dir_by_key(key);
+        } else {
+            self.core.invalidate_dir(dir_fd);
+            self.handles.clear_all_dir_attr_cache();
+        }
+    }
+
+    fn invalidate_dir_by_key(&self, key: DirCacheKey) {
+        self.core.invalidate_dir_by_key(key);
+        self.handles.clear_dir_attr_cache(key);
+    }
+
     fn attr_for_entry(&self, entry: &InodeEntry) -> CoreResult<FuserFileAttr> {
         let attr = self.core.stat_path(&entry.path)?;
         Ok(fuser_attr_from_core(attr, entry.ino))
@@ -3196,6 +3227,287 @@ impl LongNameFsV2Fuser {
             }),
             lookup_inc,
         )
+    }
+
+    fn rename_short_to_short(
+        &self,
+        src: &RenameTarget,
+        dst: &RenameTarget,
+        flags: u32,
+    ) -> CoreResult<()> {
+        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
+        let dst_backend = BackendName::Short(dst.path.logical_name.clone());
+        self.core.do_backend_rename(
+            src.ctx.dir_fd.as_fd(),
+            src_backend,
+            dst.ctx.dir_fd.as_fd(),
+            &dst_backend,
+            flags,
+        )?;
+        self.invalidate_dir_by_key(src.path.parent_key);
+        if src.path.parent_key != dst.path.parent_key {
+            self.invalidate_dir_by_key(dst.path.parent_key);
+        }
+        Ok(())
+    }
+
+    fn rename_upgrade(
+        &self,
+        src: &mut RenameTarget,
+        dst: &mut RenameTarget,
+        flags: u32,
+    ) -> CoreResult<()> {
+        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
+        let mut dst_internal = {
+            let mut guard = dst.ctx.state.index.write();
+            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
+        };
+
+        let src_c = src_backend.as_cstring()?;
+        let src_fd = match nix::fcntl::openat(
+            src.ctx.dir_fd.as_fd(),
+            src_c.as_c_str(),
+            OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::EISDIR) => nix::fcntl::openat(
+                src.ctx.dir_fd.as_fd(),
+                src_c.as_c_str(),
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY,
+                Mode::empty(),
+            )
+            .map_err(core_errno_from_nix)?,
+            Err(nix::errno::Errno::ELOOP) => return Err(CoreError::from_errno(libc::ELOOP)),
+            Err(err) => return Err(core_errno_from_nix(err)),
+        };
+        set_internal_rawname(src_fd.as_fd(), &dst.path.logical_name)?;
+
+        let mut attempt = 0;
+        loop {
+            let rename_res = self.core.do_backend_rename(
+                src.ctx.dir_fd.as_fd(),
+                src_backend,
+                dst.ctx.dir_fd.as_fd(),
+                &BackendName::Internal(dst_internal.clone()),
+                flags,
+            );
+            match rename_res {
+                Ok(()) => break,
+                Err(err @ CoreError::AlreadyExists) => {
+                    if attempt > 0 {
+                        return Err(err);
+                    }
+                    let raw =
+                        refresh_dir_index_from_backend(dst.ctx.dir_fd.as_fd(), &dst_internal)?;
+                    {
+                        let mut guard = dst.ctx.state.index.write();
+                        guard.index.upsert(dst_internal.clone(), raw);
+                        guard.pending = guard.pending.saturating_add(1);
+                        dst_internal =
+                            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
+                    }
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        {
+            let mut guard = dst.ctx.state.index.write();
+            guard
+                .index
+                .upsert(dst_internal.clone(), dst.path.logical_name.clone());
+            guard.pending = guard.pending.saturating_add(1);
+        }
+        dst.ctx.state.attr_cache.clear();
+        maybe_flush_index(
+            dst.ctx.dir_fd.as_fd(),
+            &mut dst.ctx.state,
+            self.core.index_sync,
+        )?;
+        self.invalidate_dir_by_key(src.path.parent_key);
+        self.invalidate_dir_by_key(dst.path.parent_key);
+        Ok(())
+    }
+
+    fn rename_downgrade(
+        &self,
+        src: &mut RenameTarget,
+        dst: &mut RenameTarget,
+        flags: u32,
+    ) -> CoreResult<()> {
+        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
+        let dst_backend = BackendName::Short(dst.path.logical_name.clone());
+        self.core.do_backend_rename(
+            src.ctx.dir_fd.as_fd(),
+            src_backend,
+            dst.ctx.dir_fd.as_fd(),
+            &dst_backend,
+            flags,
+        )?;
+        let backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
+        {
+            let mut src_guard = src.ctx.state.index.write();
+            if src_guard.index.remove(&backend_name).is_some() {
+                src_guard.pending = src_guard.pending.saturating_add(1);
+            }
+        }
+        src.ctx.state.attr_cache.clear();
+        maybe_flush_index(
+            src.ctx.dir_fd.as_fd(),
+            &mut src.ctx.state,
+            self.core.index_sync,
+        )?;
+        self.invalidate_dir_by_key(src.path.parent_key);
+        self.invalidate_dir_by_key(dst.path.parent_key);
+        Ok(())
+    }
+
+    fn rename_long_to_long(
+        &self,
+        src: &mut RenameTarget,
+        dst: &mut RenameTarget,
+        flags: u32,
+    ) -> CoreResult<()> {
+        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
+        let same_dir = src.path.parent_key == dst.path.parent_key;
+        let mut dst_internal = {
+            let mut guard = dst.ctx.state.index.write();
+            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
+        };
+
+        let mut attempt = 0;
+        loop {
+            let res = self.core.do_backend_rename(
+                src.ctx.dir_fd.as_fd(),
+                src_backend,
+                dst.ctx.dir_fd.as_fd(),
+                &BackendName::Internal(dst_internal.clone()),
+                flags,
+            );
+            match res {
+                Ok(()) => break,
+                Err(err @ CoreError::AlreadyExists) => {
+                    if attempt > 0 {
+                        return Err(err);
+                    }
+                    let raw =
+                        refresh_dir_index_from_backend(dst.ctx.dir_fd.as_fd(), &dst_internal)?;
+                    {
+                        let mut guard = dst.ctx.state.index.write();
+                        guard.index.upsert(dst_internal.clone(), raw);
+                        guard.pending = guard.pending.saturating_add(1);
+                        dst_internal =
+                            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
+                    }
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        let dst_c = BackendName::Internal(dst_internal.clone()).as_cstring()?;
+        let dst_fd = nix::fcntl::openat(
+            dst.ctx.dir_fd.as_fd(),
+            dst_c.as_c_str(),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(core_errno_from_nix)?;
+        set_internal_rawname(dst_fd.as_fd(), &dst.path.logical_name)?;
+
+        let src_backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
+        if same_dir {
+            let mut guard = dst.ctx.state.index.write();
+            if guard.index.remove(&src_backend_name).is_some() {
+                guard.pending = guard.pending.saturating_add(1);
+            }
+            guard
+                .index
+                .upsert(dst_internal.clone(), dst.path.logical_name.clone());
+            guard.pending = guard.pending.saturating_add(1);
+        } else {
+            let src_key = (src.path.parent_key.dev, src.path.parent_key.ino);
+            let dst_key = (dst.path.parent_key.dev, dst.path.parent_key.ino);
+            if src_key < dst_key {
+                let mut src_guard = src.ctx.state.index.write();
+                let mut dst_guard = dst.ctx.state.index.write();
+                if src_guard.index.remove(&src_backend_name).is_some() {
+                    src_guard.pending = src_guard.pending.saturating_add(1);
+                }
+                dst_guard
+                    .index
+                    .upsert(dst_internal.clone(), dst.path.logical_name.clone());
+                dst_guard.pending = dst_guard.pending.saturating_add(1);
+            } else {
+                let mut dst_guard = dst.ctx.state.index.write();
+                let mut src_guard = src.ctx.state.index.write();
+                if src_guard.index.remove(&src_backend_name).is_some() {
+                    src_guard.pending = src_guard.pending.saturating_add(1);
+                }
+                dst_guard
+                    .index
+                    .upsert(dst_internal.clone(), dst.path.logical_name.clone());
+                dst_guard.pending = dst_guard.pending.saturating_add(1);
+            }
+        }
+        src.ctx.state.attr_cache.clear();
+        dst.ctx.state.attr_cache.clear();
+        maybe_flush_index(
+            src.ctx.dir_fd.as_fd(),
+            &mut src.ctx.state,
+            self.core.index_sync,
+        )?;
+        if src.path.parent_key != dst.path.parent_key {
+            maybe_flush_index(
+                dst.ctx.dir_fd.as_fd(),
+                &mut dst.ctx.state,
+                self.core.index_sync,
+            )?;
+        }
+        self.invalidate_dir_by_key(src.path.parent_key);
+        self.invalidate_dir_by_key(dst.path.parent_key);
+        Ok(())
+    }
+
+    fn rename_with_flags(
+        &self,
+        origin_parent: &OsStr,
+        origin_name: &OsStr,
+        parent: &OsStr,
+        name: &OsStr,
+        flags: u32,
+    ) -> CoreResult<()> {
+        if flags != 0 && flags != libc::RENAME_NOREPLACE {
+            return Err(CoreError::Unsupported);
+        }
+        if flags != 0 && !self.core.supports_renameat2 {
+            return Err(CoreError::Unsupported);
+        }
+
+        let mut src = self
+            .core
+            .resolve_path_for_rename(origin_parent, origin_name)?;
+        if !src.path.exists {
+            return Err(CoreError::NotFound);
+        }
+        let mut dst = self.core.resolve_path_for_rename(parent, name)?;
+
+        match (src.path.kind, dst.path.kind) {
+            (SegmentKind::Short, SegmentKind::Short) => {
+                self.rename_short_to_short(&src, &dst, flags)
+            }
+            (SegmentKind::Long, SegmentKind::Long) => {
+                self.rename_long_to_long(&mut src, &mut dst, flags)
+            }
+            (SegmentKind::Short, SegmentKind::Long) => {
+                self.rename_upgrade(&mut src, &mut dst, flags)
+            }
+            (SegmentKind::Long, SegmentKind::Short) => {
+                self.rename_downgrade(&mut src, &mut dst, flags)
+            }
+        }
     }
 
     fn open_backend_file(&self, entry: &InodeEntry, flags: u32) -> CoreResult<OwnedFd> {
@@ -3292,6 +3604,956 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         }
     }
 
+    fn setattr(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        flags: Option<u32>,
+        reply: FuserReplyAttr,
+    ) {
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        if flags.unwrap_or(0) != 0 {
+            reply.error(libc::EOPNOTSUPP);
+            return;
+        }
+        if entry.path == OsStr::new("/") {
+            if let Some(mode) = mode
+                && let Err(err) = nix::sys::stat::fchmod(
+                    self.core.config.backend_fd(),
+                    Mode::from_bits_truncate(mode),
+                )
+            {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+            if (uid.is_some() || gid.is_some())
+                && let Err(err) = nix::unistd::fchown(
+                    self.core.config.backend_fd(),
+                    uid.map(Uid::from_raw),
+                    gid.map(Gid::from_raw),
+                )
+            {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+            if size.is_some() {
+                reply.error(libc::EFAULT);
+                return;
+            }
+            if atime.is_some() || mtime.is_some() {
+                let at = timespec_from_time_or_now(atime);
+                let mt = timespec_from_time_or_now(mtime);
+                let times = [*at.as_ref(), *mt.as_ref()];
+                let res = unsafe {
+                    libc::futimens(self.core.config.backend_fd().as_raw_fd(), times.as_ptr())
+                };
+                if res < 0 {
+                    reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+                    return;
+                }
+            }
+            match self.attr_for_entry(&entry) {
+                Ok(attr) => reply.attr(&self.attr_ttl, &attr),
+                Err(err) => reply.error(core_err_to_errno(&err)),
+            }
+            return;
+        }
+
+        let mapped = match self.core.resolve_path(&entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fname = match mapped.backend_name.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        if let Some(mode) = mode
+            && let Err(err) = fchmodat(
+                mapped.dir_fd.as_fd(),
+                fname.as_c_str(),
+                Mode::from_bits_truncate(mode),
+                FchmodatFlags::FollowSymlink,
+            )
+        {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        if (uid.is_some() || gid.is_some())
+            && let Err(err) = fchownat(
+                mapped.dir_fd.as_fd(),
+                fname.as_c_str(),
+                uid.map(Uid::from_raw),
+                gid.map(Gid::from_raw),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+        {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        if let Some(size) = size {
+            if let Some(fh) = fh {
+                if let Some(fd) = self.handles.get_file(fh)
+                    && let Err(err) = nix::unistd::ftruncate(fd.as_fd(), size as i64)
+                {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            } else {
+                let file = match nix::fcntl::openat(
+                    mapped.dir_fd.as_fd(),
+                    fname.as_c_str(),
+                    OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => fd,
+                    Err(err) => {
+                        reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                        return;
+                    }
+                };
+                if let Err(err) = nix::unistd::ftruncate(&file, size as i64) {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+        }
+        if atime.is_some() || mtime.is_some() {
+            let at = timespec_from_time_or_now(atime);
+            let mt = timespec_from_time_or_now(mtime);
+            if let Err(err) = utimensat(
+                mapped.dir_fd.as_fd(),
+                fname.as_c_str(),
+                &at,
+                &mt,
+                UtimensatFlags::NoFollowSymlink,
+            ) {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        }
+
+        self.invalidate_dir(mapped.dir_fd.as_fd());
+        match self.attr_for_entry(&entry) {
+            Ok(attr) => reply.attr(&self.attr_ttl, &attr),
+            Err(err) => reply.error(core_err_to_errno(&err)),
+        }
+    }
+
+    fn readlink(&mut self, _req: &FuserRequest<'_>, ino: u64, reply: FuserReplyData) {
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let mapped = match self.core.resolve_path(&entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fname = match mapped.backend_name.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        match readlinkat(mapped.dir_fd.as_fd(), fname.as_c_str()) {
+            Ok(target) => reply.data(&target.into_vec()),
+            Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
+        }
+    }
+
+    fn mknod(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        rdev: u32,
+        reply: FuserReplyEntry,
+    ) {
+        let Some(parent_entry) = self.inode_store.get(parent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let raw = normalize_osstr(name);
+        let (backend, kind) = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len)
+        {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fname = match backend.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let sflag = nix::sys::stat::SFlag::from_bits_truncate(mode);
+        let perm = Mode::from_bits_truncate(mode);
+        if let Err(err) = mknodat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            sflag,
+            perm,
+            rdev as u64,
+        ) {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        if matches!(kind, SegmentKind::Long) {
+            let fd = match nix::fcntl::openat(
+                ctx.dir_fd.as_fd(),
+                fname.as_c_str(),
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            };
+            if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+            {
+                let mut guard = ctx.state.index.write();
+                guard.index.upsert(
+                    String::from_utf8(backend.display_bytes()).unwrap(),
+                    raw.clone(),
+                );
+                guard.pending = guard.pending.saturating_add(1);
+            }
+            ctx.state.attr_cache.clear();
+            let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
+        }
+        self.invalidate_dir(ctx.dir_fd.as_fd());
+        let stat = match fstatat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(st) => st,
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        };
+        let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 1);
+        let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+        reply.entry(&self.entry_ttl, &attr, 0);
+    }
+
+    fn create(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: FuserReplyCreate,
+    ) {
+        let Some(parent_entry) = self.inode_store.get(parent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let raw = normalize_osstr(name);
+        let mut backend = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+
+        let mut attempt = 0;
+        loop {
+            let fname = match backend.0.as_cstring() {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            match nix::fcntl::openat(
+                ctx.dir_fd.as_fd(),
+                fname.as_c_str(),
+                oflag_from_bits(flags as u32) | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_EXCL,
+                Mode::from_bits_truncate(mode & 0o777),
+            ) {
+                Ok(fd) => {
+                    if matches!(backend.1, SegmentKind::Long) {
+                        if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+                            reply.error(core_err_to_errno(&err));
+                            return;
+                        }
+                        {
+                            let mut guard = ctx.state.index.write();
+                            guard.index.upsert(
+                                String::from_utf8(backend.0.display_bytes()).unwrap(),
+                                raw.clone(),
+                            );
+                            guard.pending = guard.pending.saturating_add(1);
+                        }
+                        ctx.state.attr_cache.clear();
+                        let _ = maybe_flush_index(
+                            ctx.dir_fd.as_fd(),
+                            &mut ctx.state,
+                            self.core.index_sync,
+                        );
+                    }
+                    self.invalidate_dir(ctx.dir_fd.as_fd());
+                    let stat = match fstat(fd.as_fd()) {
+                        Ok(st) => st,
+                        Err(err) => {
+                            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                            return;
+                        }
+                    };
+                    let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 1);
+                    let fh = self.handles.insert_file(fd);
+                    let _ = self.inode_store.inc_open(child.ino);
+                    let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+                    reply.created(&self.entry_ttl, &attr, 0, fh, 0);
+                    return;
+                }
+                Err(nix::errno::Errno::EEXIST) => {
+                    if matches!(backend.1, SegmentKind::Short) || attempt > MAX_COLLISION_SUFFIX {
+                        reply.error(libc::EEXIST);
+                        return;
+                    }
+                    let decision = match handle_backend_eexist_index_missing(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        &String::from_utf8(backend.0.display_bytes()).unwrap(),
+                        &raw,
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            reply.error(core_err_to_errno(&err));
+                            return;
+                        }
+                    };
+                    let _ =
+                        maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
+                    match decision {
+                        CreateDecision::AlreadyExistsSameName => {
+                            reply.error(libc::EEXIST);
+                            return;
+                        }
+                        CreateDecision::NeedNewSuffix => {
+                            backend = match map_segment_for_create(
+                                &ctx.state,
+                                &raw,
+                                self.core.max_name_len,
+                            ) {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    reply.error(core_err_to_errno(&err));
+                                    return;
+                                }
+                            };
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+                }
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+        reply: FuserReplyEmpty,
+    ) {
+        let Some(src_parent_entry) = self.inode_store.get(parent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let Some(dst_parent_entry) = self.inode_store.get(newparent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        if let Err(err) = self.rename_with_flags(
+            &src_parent_entry.path,
+            name,
+            &dst_parent_entry.path,
+            newname,
+            flags,
+        ) {
+            reply.error(core_err_to_errno(&err));
+            return;
+        }
+
+        let mut dst_ctx = match self.core.resolve_dir(&dst_parent_entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let raw_new = normalize_osstr(newname);
+        let (backend, _) = match map_segment_for_lookup(
+            dst_ctx.dir_fd.as_fd(),
+            &mut dst_ctx.state,
+            &raw_new,
+            self.core.max_name_len,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let _ = maybe_flush_index(
+            dst_ctx.dir_fd.as_fd(),
+            &mut dst_ctx.state,
+            self.core.index_sync,
+        );
+        let fname = match backend.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        if let Ok(stat) = fstatat(
+            dst_ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            let child =
+                self.ensure_child_entry(newparent, &dst_parent_entry.path, newname, stat, 0);
+            let new_path = crate::v2::path::make_child_path(&dst_parent_entry.path, newname);
+            let _ = self.inode_store.update_path(child.ino, new_path);
+            let _ = self.inode_store.remove_parent_name(
+                child.ino,
+                &ParentName {
+                    parent,
+                    name: name.to_os_string(),
+                },
+            );
+            let _ = self.inode_store.add_parent_name(
+                child.ino,
+                ParentName {
+                    parent: newparent,
+                    name: newname.to_os_string(),
+                },
+            );
+        }
+        reply.ok();
+    }
+
+    fn link(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: FuserReplyEntry,
+    ) {
+        let Some(target_entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let target = match self.core.resolve_path(&target_entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        if target.backend_name.is_internal() {
+            reply.error(libc::EOPNOTSUPP);
+            return;
+        }
+        let Some(parent_entry) = self.inode_store.get(newparent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let ctx = match self.core.resolve_dir(&parent_entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let raw_new = normalize_osstr(newname);
+        let (dest_backend, dest_kind) =
+            match map_segment_for_create(&ctx.state, &raw_new, self.core.max_name_len) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+        if matches!(dest_kind, SegmentKind::Long) {
+            reply.error(libc::EOPNOTSUPP);
+            return;
+        }
+        let from_c = match target.backend_name.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let to_c = match dest_backend.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        if let Err(err) = linkat(
+            target.dir_fd.as_fd(),
+            from_c.as_c_str(),
+            ctx.dir_fd.as_fd(),
+            to_c.as_c_str(),
+            LinkatFlags::empty(),
+        ) {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        self.invalidate_dir(ctx.dir_fd.as_fd());
+        let stat = match fstatat(
+            ctx.dir_fd.as_fd(),
+            to_c.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(st) => st,
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        };
+        let child = self.ensure_child_entry(newparent, &parent_entry.path, newname, stat, 1);
+        let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+        reply.entry(&self.entry_ttl, &attr, 0);
+    }
+
+    fn unlink(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        parent: u64,
+        name: &OsStr,
+        reply: FuserReplyEmpty,
+    ) {
+        let Some(parent_entry) = self.inode_store.get(parent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let raw = normalize_osstr(name);
+        let (backend, kind) = match map_segment_for_lookup(
+            ctx.dir_fd.as_fd(),
+            &mut ctx.state,
+            &raw,
+            self.core.max_name_len,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fname = match backend.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let existing_stat = match fstatat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(st) => st,
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        };
+        if let Err(err) = unlinkat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            UnlinkatFlags::NoRemoveDir,
+        ) {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        if matches!(kind, SegmentKind::Long) {
+            {
+                let mut guard = ctx.state.index.write();
+                if guard
+                    .index
+                    .remove(&String::from_utf8(backend.display_bytes()).unwrap())
+                    .is_some()
+                {
+                    guard.pending = guard.pending.saturating_add(1);
+                }
+            }
+            ctx.state.attr_cache.clear();
+        }
+        let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
+        self.invalidate_dir(ctx.dir_fd.as_fd());
+        let child = self.ensure_child_entry(parent, &parent_entry.path, name, existing_stat, 0);
+        let _ = self.inode_store.remove_parent_name(
+            child.ino,
+            &ParentName {
+                parent,
+                name: name.to_os_string(),
+            },
+        );
+        reply.ok();
+    }
+
+    fn rmdir(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        parent: u64,
+        name: &OsStr,
+        reply: FuserReplyEmpty,
+    ) {
+        let Some(parent_entry) = self.inode_store.get(parent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let raw = normalize_osstr(name);
+        let (backend, kind) = match map_segment_for_lookup(
+            ctx.dir_fd.as_fd(),
+            &mut ctx.state,
+            &raw,
+            self.core.max_name_len,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fname = match backend.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let existing_stat = fstatat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .ok();
+        match unlinkat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            UnlinkatFlags::RemoveDir,
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ENOTEMPTY) => {
+                if let Ok(target_dir_fd) = nix::fcntl::openat(
+                    ctx.dir_fd.as_fd(),
+                    fname.as_c_str(),
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    if let Ok(index_cstr) = string_to_cstring(INDEX_NAME) {
+                        let _ = unlinkat(
+                            target_dir_fd.as_fd(),
+                            index_cstr.as_c_str(),
+                            UnlinkatFlags::NoRemoveDir,
+                        );
+                    }
+                    if let Ok(journal_cstr) = string_to_cstring(JOURNAL_NAME) {
+                        let _ = unlinkat(
+                            target_dir_fd.as_fd(),
+                            journal_cstr.as_c_str(),
+                            UnlinkatFlags::NoRemoveDir,
+                        );
+                    }
+                }
+                if let Err(err) = unlinkat(
+                    ctx.dir_fd.as_fd(),
+                    fname.as_c_str(),
+                    UnlinkatFlags::RemoveDir,
+                ) {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        }
+        if matches!(kind, SegmentKind::Long) {
+            {
+                let mut guard = ctx.state.index.write();
+                if guard
+                    .index
+                    .remove(&String::from_utf8(backend.display_bytes()).unwrap())
+                    .is_some()
+                {
+                    guard.pending = guard.pending.saturating_add(1);
+                }
+            }
+            ctx.state.attr_cache.clear();
+        }
+        let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
+        self.invalidate_dir(ctx.dir_fd.as_fd());
+        if let Some(stat) = existing_stat {
+            let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 0);
+            let _ = self.inode_store.remove_parent_name(
+                child.ino,
+                &ParentName {
+                    parent,
+                    name: name.to_os_string(),
+                },
+            );
+        }
+        reply.ok();
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        parent: u64,
+        link_name: &OsStr,
+        target: &Path,
+        reply: FuserReplyEntry,
+    ) {
+        let Some(parent_entry) = self.inode_store.get(parent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let raw = normalize_osstr(link_name);
+        let (backend, kind) = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len)
+        {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fname = match backend.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        if let Err(err) = symlinkat(target.as_os_str(), ctx.dir_fd.as_fd(), fname.as_c_str()) {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        if matches!(kind, SegmentKind::Long) {
+            let fd = match nix::fcntl::openat(
+                ctx.dir_fd.as_fd(),
+                fname.as_c_str(),
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            };
+            if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+            {
+                let mut guard = ctx.state.index.write();
+                guard.index.upsert(
+                    String::from_utf8(backend.display_bytes()).unwrap(),
+                    raw.clone(),
+                );
+                guard.pending = guard.pending.saturating_add(1);
+            }
+            ctx.state.attr_cache.clear();
+            let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
+        }
+        self.invalidate_dir(ctx.dir_fd.as_fd());
+        let stat = match fstatat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(st) => st,
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        };
+        let child = self.ensure_child_entry(parent, &parent_entry.path, link_name, stat, 1);
+        let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+        reply.entry(&self.entry_ttl, &attr, 0);
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: FuserReplyEntry,
+    ) {
+        let Some(parent_entry) = self.inode_store.get(parent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let raw = normalize_osstr(name);
+        let (backend, kind) = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len)
+        {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fname = match backend.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        if let Err(err) = mkdirat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            Mode::from_bits_truncate(mode),
+        ) {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        if matches!(kind, SegmentKind::Long) {
+            let fd = match nix::fcntl::openat(
+                ctx.dir_fd.as_fd(),
+                fname.as_c_str(),
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            };
+            if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+            {
+                let mut guard = ctx.state.index.write();
+                guard.index.upsert(
+                    String::from_utf8(backend.display_bytes()).unwrap(),
+                    raw.clone(),
+                );
+                guard.pending = guard.pending.saturating_add(1);
+            }
+            ctx.state.attr_cache.clear();
+            let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
+        }
+        self.invalidate_dir(ctx.dir_fd.as_fd());
+        let stat = match fstatat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(st) => st,
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        };
+        let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 1);
+        let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+        reply.entry(&self.entry_ttl, &attr, 0);
+    }
+
     fn opendir(&mut self, _req: &FuserRequest<'_>, ino: u64, flags: i32, reply: FuserReplyOpen) {
         let Some(entry) = self.inode_store.get(ino) else {
             reply.error(libc::ESTALE);
@@ -3361,7 +4623,76 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         while index < entries.len() {
             let (child_ino, kind, name) = &entries[index];
             let next = (index + 1) as i64;
-            if !reply.add(*child_ino, next, *kind, name) {
+            if reply.add(*child_ino, next, *kind, name) {
+                break;
+            }
+            index += 1;
+        }
+        reply.ok();
+    }
+
+    fn readdirplus(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        mut reply: FuserReplyDirectoryPlus,
+    ) {
+        let Some(dir_entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let Some(handle) = self.handles.get_dir(fh) else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        let dir_attr = match fstat(handle.as_fd()) {
+            Ok(stat) => fuser_attr_from_core(core_attr_from_stat(&stat), ino),
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        };
+
+        let mut entries: Vec<(InodeId, OsString, FuserFileAttr)> = Vec::new();
+        entries.push((ino, OsString::from("."), dir_attr));
+        let parent_attr = self
+            .inode_store
+            .get(self.parent_ino_for(&dir_entry))
+            .and_then(|p| self.attr_for_entry(&p).ok())
+            .unwrap_or(dir_attr);
+        entries.push((
+            self.parent_ino_for(&dir_entry),
+            OsString::from(".."),
+            parent_attr,
+        ));
+
+        let dir_listing = self.core.load_dir_entries(&handle, true);
+        for info in dir_listing.iter() {
+            let c_name = match CString::new(info.backend_name.clone()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let stat = match fstatat(
+                handle.as_fd(),
+                c_name.as_c_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(st) => st,
+                Err(_) => continue,
+            };
+            let core_attr = core_attr_from_stat(&stat);
+            let child_entry = self.ensure_child_entry(ino, &dir_entry.path, &info.name, stat, 0);
+            let attr = fuser_attr_from_core(core_attr, child_entry.ino);
+            entries.push((child_entry.ino, info.name.clone(), attr));
+        }
+
+        let mut index = offset.max(0) as usize;
+        while index < entries.len() {
+            let (child_ino, name, attr) = &entries[index];
+            let next = (index + 1) as i64;
+            if reply.add(*child_ino, next, name, &self.entry_ttl, attr, 0) {
                 break;
             }
             index += 1;
@@ -3436,6 +4767,386 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         }
     }
 
+    fn fsync(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        fh: u64,
+        datasync: bool,
+        reply: FuserReplyEmpty,
+    ) {
+        let Some(handle) = self.handles.get_file(fh) else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        let sync_res = if datasync {
+            fdatasync(handle.as_fd())
+        } else {
+            fsync(handle.as_fd())
+        };
+        if let Err(err) = sync_res {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        if let Some(entry) = self.inode_store.get(ino)
+            && entry.path != OsStr::new("/")
+            && let Ok(mapped) = self.core.resolve_path(&entry.path)
+        {
+            self.invalidate_dir(mapped.dir_fd.as_fd());
+        }
+        reply.ok();
+    }
+
+    fn flush(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        _ino: u64,
+        fh: u64,
+        _lock_owner: u64,
+        reply: FuserReplyEmpty,
+    ) {
+        if self.handles.get_file(fh).is_none() {
+            reply.error(libc::EBADF);
+            return;
+        }
+        reply.ok();
+    }
+
+    fn access(&mut self, _req: &FuserRequest<'_>, ino: u64, mask: i32, reply: FuserReplyEmpty) {
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let flags = access_mask_from_bits(mask as u32);
+        if entry.path == OsStr::new("/") {
+            if let Err(err) = faccessat(self.core.config.backend_fd(), ".", flags, AtFlags::empty())
+            {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+            reply.ok();
+            return;
+        }
+        let mapped = match self.core.resolve_path(&entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fname = match mapped.backend_name.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        if let Err(err) = faccessat(
+            mapped.dir_fd.as_fd(),
+            fname.as_c_str(),
+            flags,
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        reply.ok();
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: FuserReplyEmpty,
+    ) {
+        if position != 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        if name.as_bytes().starts_with(b"user.ln2.") {
+            reply.error(libc::EPERM);
+            return;
+        }
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let cname = match cstring_from_bytes(name.as_bytes()) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fd_raw = if entry.path == OsStr::new("/") {
+            self.core.config.backend_fd().as_raw_fd()
+        } else {
+            let mapped = match self.core.resolve_path(&entry.path) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            let fname = match mapped.backend_name.as_cstring() {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            match nix::fcntl::openat(
+                mapped.dir_fd.as_fd(),
+                fname.as_c_str(),
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd.as_raw_fd(),
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+        };
+        let res = unsafe {
+            libc::fsetxattr(
+                fd_raw,
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                flags as libc::c_int,
+            )
+        };
+        if res < 0 {
+            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+            return;
+        }
+        reply.ok();
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: FuserReplyXattr,
+    ) {
+        if name.as_bytes().starts_with(b"user.ln2.") {
+            reply.error(libc::EPERM);
+            return;
+        }
+        let cname = match cstring_from_bytes(name.as_bytes()) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let fd_raw = if entry.path == OsStr::new("/") {
+            self.core.config.backend_fd().as_raw_fd()
+        } else {
+            let mapped = match self.core.resolve_path(&entry.path) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            let fname = match mapped.backend_name.as_cstring() {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            match nix::fcntl::openat(
+                mapped.dir_fd.as_fd(),
+                fname.as_c_str(),
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd.as_raw_fd(),
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+        };
+        if size == 0 {
+            let res = unsafe { libc::fgetxattr(fd_raw, cname.as_ptr(), std::ptr::null_mut(), 0) };
+            if res < 0 {
+                reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+                return;
+            }
+            reply.size(res as u32);
+            return;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let res = unsafe {
+            libc::fgetxattr(
+                fd_raw,
+                cname.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                size as usize,
+            )
+        };
+        if res < 0 {
+            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+            return;
+        }
+        let read_len = res as usize;
+        if read_len > size as usize {
+            reply.error(libc::ERANGE);
+            return;
+        }
+        buf.truncate(read_len);
+        reply.data(&buf);
+    }
+
+    fn listxattr(&mut self, _req: &FuserRequest<'_>, ino: u64, size: u32, reply: FuserReplyXattr) {
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let fd_raw = if entry.path == OsStr::new("/") {
+            self.core.config.backend_fd().as_raw_fd()
+        } else {
+            let mapped = match self.core.resolve_path(&entry.path) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            let fname = match mapped.backend_name.as_cstring() {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            match nix::fcntl::openat(
+                mapped.dir_fd.as_fd(),
+                fname.as_c_str(),
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd.as_raw_fd(),
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+        };
+        let initial = unsafe { libc::flistxattr(fd_raw, std::ptr::null_mut(), 0) };
+        if initial < 0 {
+            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+            return;
+        }
+        let mut buf = vec![0u8; initial as usize];
+        let res = unsafe {
+            libc::flistxattr(
+                fd_raw,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len() as libc::size_t,
+            )
+        };
+        if res < 0 {
+            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+            return;
+        }
+        let list_len = res as usize;
+        buf.truncate(list_len);
+        let mut filtered = Vec::new();
+        let mut start = 0usize;
+        for i in 0..buf.len() {
+            if buf[i] == 0 {
+                let key = &buf[start..i];
+                if !key.starts_with(b"user.ln2.") {
+                    filtered.extend_from_slice(key);
+                    filtered.push(0);
+                }
+                start = i + 1;
+            }
+        }
+        if size == 0 {
+            reply.size(filtered.len() as u32);
+        } else if filtered.len() > size as usize {
+            reply.error(libc::ERANGE);
+        } else {
+            reply.data(&filtered);
+        }
+    }
+
+    fn removexattr(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        name: &OsStr,
+        reply: FuserReplyEmpty,
+    ) {
+        if name.as_bytes().starts_with(b"user.ln2.") {
+            reply.error(libc::EPERM);
+            return;
+        }
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let cname = match cstring_from_bytes(name.as_bytes()) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fd_raw = if entry.path == OsStr::new("/") {
+            self.core.config.backend_fd().as_raw_fd()
+        } else {
+            let mapped = match self.core.resolve_path(&entry.path) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            let fname = match mapped.backend_name.as_cstring() {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            match nix::fcntl::openat(
+                mapped.dir_fd.as_fd(),
+                fname.as_c_str(),
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd.as_raw_fd(),
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+        };
+        let res = unsafe { libc::fremovexattr(fd_raw, cname.as_ptr()) };
+        if res < 0 {
+            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+            return;
+        }
+        reply.ok();
+    }
+
     fn release(
         &mut self,
         _req: &FuserRequest<'_>,
@@ -3464,7 +5175,54 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         reply.ok();
     }
 
+    fn fsyncdir(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        fh: u64,
+        datasync: bool,
+        reply: FuserReplyEmpty,
+    ) {
+        let Some(handle) = self.handles.get_dir(fh) else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        let sync_res = if datasync {
+            fdatasync(handle.as_fd())
+        } else {
+            fsync(handle.as_fd())
+        };
+        if let Err(err) = sync_res {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        if let Some(dir_entry) = self.inode_store.get(ino) {
+            if dir_entry.path == OsStr::new("/") {
+                self.invalidate_dir(handle.as_fd());
+            } else if let Ok(ctx) = self.core.resolve_dir(&dir_entry.path) {
+                self.invalidate_dir(ctx.dir_fd.as_fd());
+            }
+        }
+        reply.ok();
+    }
+
     fn forget(&mut self, _req: &FuserRequest<'_>, ino: u64, nlookup: u64) {
         let _ = self.inode_store.dec_lookup(ino, nlookup);
+    }
+
+    fn statfs(&mut self, _req: &FuserRequest<'_>, _ino: u64, reply: FuserReplyStatfs) {
+        match fstatvfs(self.core.config.backend_fd()) {
+            Ok(stats) => reply.statfs(
+                stats.blocks(),
+                stats.blocks_free(),
+                stats.blocks_available(),
+                stats.files(),
+                stats.files_free(),
+                stats.block_size() as u32,
+                stats.name_max() as u32,
+                stats.fragment_size() as u32,
+            ),
+            Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
+        }
     }
 }
