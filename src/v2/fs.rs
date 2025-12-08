@@ -26,7 +26,7 @@ use nix::unistd::{
     Gid, LinkatFlags, Uid, UnlinkatFlags, faccessat, fchownat, fdatasync, fsync, linkat, symlinkat,
     unlinkat,
 };
-use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
@@ -895,21 +895,34 @@ fn maybe_flush_index(
     state: &mut DirState,
     strategy: IndexSync,
 ) -> CoreResult<()> {
-    let mut guard = state.index.write();
-    let should_flush = match strategy {
-        IndexSync::Always => guard.index.is_dirty(),
-        IndexSync::Batch {
-            max_pending,
-            max_age,
-        } => {
-            guard.index.is_dirty()
-                && (guard.pending >= max_pending || guard.last_flush.elapsed() >= max_age)
+    let plan = {
+        let guard = state.index.write();
+        let should_flush = match strategy {
+            IndexSync::Always => guard.index.is_dirty(),
+            IndexSync::Batch {
+                max_pending,
+                max_age,
+            } => {
+                guard.index.is_dirty()
+                    && (guard.pending >= max_pending || guard.last_flush.elapsed() >= max_age)
+            }
+            IndexSync::Off => false,
+        };
+
+        if should_flush {
+            Some((guard.index.clone(), guard.pending))
+        } else {
+            None
         }
-        IndexSync::Off => false,
     };
 
-    if should_flush {
-        write_dir_index(dir_fd, &guard.index)?;
+    let Some((snapshot, pending_before)) = plan else {
+        return Ok(());
+    };
+
+    write_dir_index(dir_fd, &snapshot)?;
+    let mut guard = state.index.write();
+    if guard.pending == pending_before {
         guard.index.clear_dirty();
         guard.pending = 0;
         guard.last_flush = Instant::now();
@@ -932,10 +945,24 @@ fn list_logical_entries(
     )
     .map_err(core_errno_from_nix)?;
 
-    let mut state = handle.state.write();
-    let mut entries = Vec::new();
-    let mut seen_backend = HashSet::new();
+    #[derive(Debug)]
+    struct ScanEntry {
+        backend_name: Vec<u8>,
+        kind_hint: Option<CoreFileType>,
+        is_internal: bool,
+    }
 
+    #[derive(Debug)]
+    struct PendingEntry {
+        backend_name: Vec<u8>,
+        backend_str: Option<String>,
+        is_internal: bool,
+        kind: Option<CoreFileType>,
+        attr: Option<CoreFileAttr>,
+        raw_name: Option<Vec<u8>>,
+    }
+
+    let mut scanned = Vec::new();
     for entry in dir.iter() {
         let entry = match entry {
             Ok(v) => v,
@@ -950,109 +977,147 @@ fn list_logical_entries(
         {
             continue;
         }
+        let is_internal = name_bytes.starts_with(INTERNAL_PREFIX.as_bytes());
+        let kind_hint = map_dirent_type(&entry);
+        scanned.push(ScanEntry {
+            backend_name: name_bytes,
+            kind_hint,
+            is_internal,
+        });
+    }
 
-        let mut kind = map_dirent_type(&entry);
-        let mut attr = state.attr_cache.get(&name_bytes).cloned();
-        if kind.is_none()
-            && let Some(cached) = attr.as_ref()
-        {
-            kind = Some(cached.kind);
-        }
+    let mut pending = Vec::new();
+    let mut attr_miss = Vec::new();
+    let mut repair_candidates = Vec::new();
+    {
+        let state = handle.state.read();
+        let index = state.index.read();
+        for entry in &scanned {
+            let attr = state.attr_cache.get(&entry.backend_name).cloned();
+            let kind = entry.kind_hint.or_else(|| attr.as_ref().map(|a| a.kind));
+            let mut backend_str = None;
 
-        if name_bytes.starts_with(INTERNAL_PREFIX.as_bytes()) {
-            let backend_name = match std::str::from_utf8(&name_bytes) {
-                Ok(s) => s.to_owned(),
-                Err(_) => continue,
-            };
-            let has_entry = {
-                let guard = state.index.read();
-                guard.index.contains_key(&backend_name)
-            };
-            if !has_entry {
-                // 孤儿条目，尝试修复索引
-                let c_name = match cstring_from_bytes(&name_bytes) {
-                    Ok(v) => v,
+            let raw_name = if entry.is_internal {
+                let name_str = match std::str::from_utf8(&entry.backend_name) {
+                    Ok(v) => v.to_owned(),
                     Err(_) => continue,
                 };
-                let fd = match nix::fcntl::openat(
-                    dir_fd,
-                    c_name.as_c_str(),
-                    OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                    Mode::empty(),
-                ) {
-                    Ok(fd) => fd,
-                    Err(_) => continue,
-                };
-                if let Ok(raw_name) = get_internal_rawname(fd.as_fd())
-                    && raw_name.len() <= max_name_len
-                {
-                    {
-                        let mut guard = state.index.write();
-                        guard.index.upsert(backend_name.clone(), raw_name);
-                        guard.pending = guard.pending.saturating_add(1);
-                    }
-                    state.attr_cache.clear();
+                backend_str = Some(name_str.clone());
+                let existing = index.index.get(&name_str).map(|e| e.raw_name.clone());
+                if existing.is_none() {
+                    repair_candidates.push(name_str);
                 }
+                existing
+            } else {
+                Some(entry.backend_name.clone())
+            };
+
+            let needs_attr = (need_attr && attr.is_none()) || kind.is_none();
+            if needs_attr {
+                attr_miss.push(entry.backend_name.clone());
             }
-            let raw_name = {
-                let guard = state.index.read();
-                match guard.index.get(&backend_name) {
-                    Some(entry) => entry.raw_name.clone(),
-                    None => continue,
-                }
-            };
-            if (need_attr && attr.is_none()) || kind.is_none() {
-                let c_name = match cstring_from_bytes(&name_bytes) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let stat = match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-                    Ok(st) => st,
-                    Err(_) => continue,
-                };
-                let file_attr = core_attr_from_stat(&stat);
-                state.attr_cache.insert(name_bytes.clone(), file_attr);
-                if kind.is_none() {
-                    kind = Some(core_file_type_from_mode(stat.st_mode));
-                }
-                attr = Some(file_attr);
-            }
-            entries.push(DirEntryInfo {
-                name: OsString::from_vec(raw_name),
-                kind: kind.unwrap_or(CoreFileType::RegularFile),
+
+            pending.push(PendingEntry {
+                backend_name: entry.backend_name.clone(),
+                backend_str,
+                is_internal: entry.is_internal,
+                kind,
                 attr,
-                backend_name: name_bytes.clone(),
+                raw_name,
             });
-            seen_backend.insert(name_bytes);
-        } else {
-            if (need_attr && attr.is_none()) || kind.is_none() {
-                let c_name = match cstring_from_bytes(&name_bytes) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let stat = match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-                    Ok(st) => st,
-                    Err(_) => continue,
-                };
-                let file_attr = core_attr_from_stat(&stat);
-                state.attr_cache.insert(name_bytes.clone(), file_attr);
-                if kind.is_none() {
-                    kind = Some(core_file_type_from_mode(stat.st_mode));
-                }
-                attr = Some(file_attr);
-            }
-            entries.push(DirEntryInfo {
-                name: OsString::from_vec(name_bytes.clone()),
-                kind: kind.unwrap_or(CoreFileType::RegularFile),
-                attr,
-                backend_name: name_bytes.clone(),
-            });
-            seen_backend.insert(name_bytes);
         }
     }
 
-    state.attr_cache.retain(|k, _| seen_backend.contains(k));
-    maybe_flush_index(dir_fd, &mut state, index_sync)?;
+    let mut repairs: HashMap<String, Vec<u8>> = HashMap::new();
+    for backend_name in &repair_candidates {
+        let c_name = match core_string_to_cstring(backend_name) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let fd = match nix::fcntl::openat(
+            dir_fd,
+            c_name.as_c_str(),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => continue,
+        };
+        if let Ok(raw_name) = get_internal_rawname(fd.as_fd())
+            && raw_name.len() <= max_name_len
+        {
+            repairs.insert(backend_name.clone(), raw_name);
+        }
+    }
+
+    let mut fetched_attrs: HashMap<Vec<u8>, CoreFileAttr> = HashMap::new();
+    for name_bytes in &attr_miss {
+        let c_name = match cstring_from_bytes(name_bytes) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let stat = match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
+            Err(_) => continue,
+        };
+        fetched_attrs.insert(name_bytes.clone(), core_attr_from_stat(&stat));
+    }
+
+    for entry in &mut pending {
+        if entry.raw_name.is_none()
+            && entry.is_internal
+            && let Some(name) = entry.backend_str.as_ref()
+            && let Some(raw) = repairs.get(name)
+        {
+            entry.raw_name = Some(raw.clone());
+        }
+        if entry.attr.is_none()
+            && let Some(attr) = fetched_attrs.get(&entry.backend_name)
+        {
+            entry.attr = Some(*attr);
+            if entry.kind.is_none() {
+                entry.kind = Some(attr.kind);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    for entry in pending {
+        let raw_name = match entry.raw_name {
+            Some(v) => v,
+            None => continue,
+        };
+        entries.push(DirEntryInfo {
+            name: OsString::from_vec(raw_name),
+            kind: entry.kind.unwrap_or(CoreFileType::RegularFile),
+            attr: entry.attr,
+            backend_name: entry.backend_name.clone(),
+        });
+    }
+
+    let seen_backend: HashSet<Vec<u8>> = entries.iter().map(|e| e.backend_name.clone()).collect();
+
+    {
+        let mut state = handle.state.write();
+        if !repairs.is_empty() {
+            {
+                let mut guard = state.index.write();
+                for (backend, raw_name) in &repairs {
+                    guard.index.upsert(backend.clone(), raw_name.clone());
+                    guard.pending = guard.pending.saturating_add(1);
+                }
+            }
+            state.attr_cache.clear();
+        }
+        for (backend_name, attr) in fetched_attrs {
+            if seen_backend.contains(&backend_name) {
+                state.attr_cache.insert(backend_name, attr);
+            }
+        }
+        state.attr_cache.retain(|k, _| seen_backend.contains(k));
+        maybe_flush_index(dir_fd, &mut state, index_sync)?;
+    }
+
     Ok(entries)
 }
 
@@ -1241,7 +1306,6 @@ fn handle_backend_eexist_index_missing(
 
 fn refresh_dir_index_from_backend(
     dir_fd: BorrowedFd<'_>,
-    guard: &mut RwLockWriteGuard<'_, IndexState>,
     backend_name: &str,
 ) -> CoreResult<Vec<u8>> {
     let c_name = core_string_to_cstring(backend_name)?;
@@ -1253,8 +1317,6 @@ fn refresh_dir_index_from_backend(
     )
     .map_err(core_errno_from_nix)?;
     let raw = get_internal_rawname(fd.as_fd())?;
-    guard.index.upsert(backend_name.to_owned(), raw.clone());
-    guard.pending = guard.pending.saturating_add(1);
     Ok(raw)
 }
 
@@ -1651,13 +1713,12 @@ impl LongNameFsV2 {
                     if attempt > 0 {
                         return Err(err);
                     }
+                    let raw =
+                        refresh_dir_index_from_backend(dst.ctx.dir_fd.as_fd(), &dst_internal)?;
                     {
                         let mut guard = dst.ctx.state.index.write();
-                        refresh_dir_index_from_backend(
-                            dst.ctx.dir_fd.as_fd(),
-                            &mut guard,
-                            &dst_internal,
-                        )?;
+                        guard.index.upsert(dst_internal.clone(), raw);
+                        guard.pending = guard.pending.saturating_add(1);
                         dst_internal =
                             select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
                     }
@@ -1738,13 +1799,12 @@ impl LongNameFsV2 {
                     if attempt > 0 {
                         return Err(err);
                     }
+                    let raw =
+                        refresh_dir_index_from_backend(dst.ctx.dir_fd.as_fd(), &dst_internal)?;
                     {
                         let mut guard = dst.ctx.state.index.write();
-                        refresh_dir_index_from_backend(
-                            dst.ctx.dir_fd.as_fd(),
-                            &mut guard,
-                            &dst_internal,
-                        )?;
+                        guard.index.upsert(dst_internal.clone(), raw);
+                        guard.pending = guard.pending.saturating_add(1);
                         dst_internal =
                             select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
                     }
