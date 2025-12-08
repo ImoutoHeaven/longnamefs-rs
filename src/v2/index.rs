@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use crate::util::{begin_temp_file, errno_from_nix, retry_eintr, sync_and_commit};
+use crate::util::{begin_temp_file, retry_eintr, string_to_cstring, sync_and_commit};
+use crate::v2::error::{CoreError, CoreResult, core_error_from_fuse};
 use nix::unistd::write;
 use std::collections::HashMap;
 use std::io::Read;
@@ -91,8 +92,8 @@ impl DirIndex {
     }
 }
 
-fn read_index_bytes(dir_fd: BorrowedFd<'_>) -> Result<Option<Vec<u8>>, fuse3::Errno> {
-    let name = crate::util::string_to_cstring(INDEX_NAME)?;
+fn read_index_bytes(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<Vec<u8>>> {
+    let name = string_to_cstring(INDEX_NAME).map_err(core_error_from_fuse)?;
     let fd = match nix::fcntl::openat(
         dir_fd,
         name.as_c_str(),
@@ -101,13 +102,12 @@ fn read_index_bytes(dir_fd: BorrowedFd<'_>) -> Result<Option<Vec<u8>>, fuse3::Er
     ) {
         Ok(fd) => fd,
         Err(nix::errno::Errno::ENOENT) => return Ok(None),
-        Err(err) => return Err(errno_from_nix(err)),
+        Err(err) => return Err(CoreError::from(err)),
     };
 
     let mut file = std::fs::File::from(fd);
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)
-        .map_err(|e| fuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+    file.read_to_end(&mut buf).map_err(CoreError::from)?;
     if buf.len() > MAX_INDEX_BYTES {
         return Ok(None);
     }
@@ -174,7 +174,7 @@ fn decode_index_bytes(bytes: &[u8]) -> Option<DirIndex> {
     Some(index)
 }
 
-pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> Result<Option<DirIndex>, fuse3::Errno> {
+pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<DirIndex>> {
     match read_index_bytes(dir_fd)? {
         None => Ok(None),
         Some(bytes) => Ok(decode_index_bytes(&bytes)),
@@ -199,14 +199,15 @@ fn encode_index(index: &DirIndex) -> Vec<u8> {
     buf
 }
 
-pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> Result<(), fuse3::Errno> {
+pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> CoreResult<()> {
     let data = encode_index(index);
-    let final_name = crate::util::string_to_cstring(INDEX_NAME)?;
-    let tmp = begin_temp_file(dir_fd, final_name.as_c_str(), "idx")?;
+    let final_name = string_to_cstring(INDEX_NAME).map_err(core_error_from_fuse)?;
+    let tmp =
+        begin_temp_file(dir_fd, final_name.as_c_str(), "idx").map_err(core_error_from_fuse)?;
     let mut written = 0;
     while written < data.len() {
-        let n = retry_eintr(|| write(tmp.fd.as_fd(), &data[written..])).map_err(errno_from_nix)?;
+        let n = retry_eintr(|| write(tmp.fd.as_fd(), &data[written..])).map_err(CoreError::from)?;
         written += n;
     }
-    sync_and_commit(dir_fd, tmp, final_name.as_c_str())
+    sync_and_commit(dir_fd, tmp, final_name.as_c_str()).map_err(core_error_from_fuse)
 }

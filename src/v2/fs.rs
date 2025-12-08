@@ -25,6 +25,7 @@ use nix::unistd::{
     Gid, LinkatFlags, Uid, UnlinkatFlags, faccessat, fchownat, fdatasync, fsync, linkat, symlinkat,
     unlinkat,
 };
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
@@ -33,7 +34,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::mpsc;
 use std::sync::{
-    Arc, Mutex, RwLock, RwLockWriteGuard,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::thread;
@@ -105,7 +106,7 @@ impl DirCache {
             return None;
         }
         let now = Instant::now();
-        let mut guard = self.entries.write().ok()?;
+        let mut guard = self.entries.write();
         if let Some(entry) = guard.get_mut(&key) {
             if entry.expires_at > now {
                 entry.expires_at = now + self.ttl;
@@ -131,7 +132,7 @@ impl DirCache {
         }
         let expires_at = Instant::now() + self.ttl;
         let entries = Arc::new(items);
-        let mut guard = self.entries.write().unwrap();
+        let mut guard = self.entries.write();
         if guard.len() >= DIR_CACHE_MAX_DIRS {
             guard.clear();
         }
@@ -150,9 +151,8 @@ impl DirCache {
         if !self.enabled {
             return;
         }
-        if let Ok(mut guard) = self.entries.write() {
-            guard.remove(&key);
-        }
+        let mut guard = self.entries.write();
+        guard.remove(&key);
     }
 }
 
@@ -203,14 +203,13 @@ impl DirFdCache {
         if !self.enabled {
             return;
         }
-        if let Ok(mut lru) = self.lru.lock() {
-            if let Some(pos) = lru.iter().position(|k| *k == key) {
-                lru.remove(pos);
-            }
-            lru.push_back(key);
-            while lru.len() > DIR_FD_CACHE_MAX_DIRS {
-                lru.pop_front();
-            }
+        let mut lru = self.lru.lock();
+        if let Some(pos) = lru.iter().position(|k| *k == key) {
+            lru.remove(pos);
+        }
+        lru.push_back(key);
+        while lru.len() > DIR_FD_CACHE_MAX_DIRS {
+            lru.pop_front();
         }
     }
 
@@ -218,14 +217,8 @@ impl DirFdCache {
         if !self.enabled {
             return;
         }
-        let mut entries = match self.entries.lock() {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let mut lru = match self.lru.lock() {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+        let mut entries = self.entries.lock();
+        let mut lru = self.lru.lock();
         while entries.len() > DIR_FD_CACHE_MAX_DIRS {
             if let Some(old) = lru.pop_front() {
                 entries.remove(&old);
@@ -240,7 +233,7 @@ impl DirFdCache {
             return None;
         }
         let now = Instant::now();
-        let mut entries = self.entries.lock().ok()?;
+        let mut entries = self.entries.lock();
         if let Some(entry) = entries.get(&key)
             && entry.expires_at > now
         {
@@ -259,15 +252,14 @@ impl DirFdCache {
             return fd;
         }
         let expires_at = Instant::now() + self.ttl;
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.insert(
-                key,
-                DirFdCacheEntry {
-                    expires_at,
-                    fd: fd.clone(),
-                },
-            );
-        }
+        let mut entries = self.entries.lock();
+        entries.insert(
+            key,
+            DirFdCacheEntry {
+                expires_at,
+                fd: fd.clone(),
+            },
+        );
         self.touch_lru(key);
         self.evict_if_needed();
         fd
@@ -277,12 +269,10 @@ impl DirFdCache {
         if !self.enabled {
             return;
         }
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(&key);
-        }
-        if let Ok(mut lru) = self.lru.lock()
-            && let Some(pos) = lru.iter().position(|k| *k == key)
-        {
+        let mut entries = self.entries.lock();
+        entries.remove(&key);
+        let mut lru = self.lru.lock();
+        if let Some(pos) = lru.iter().position(|k| *k == key) {
             lru.remove(pos);
         }
     }
@@ -326,26 +316,19 @@ impl IndexCache {
     }
 
     fn touch_lru(&self, key: DirCacheKey) {
-        if let Ok(mut lru) = self.lru.lock() {
-            if let Some(pos) = lru.iter().position(|k| *k == key) {
-                lru.remove(pos);
-            }
-            lru.push_back(key);
-            while lru.len() > INDEX_CACHE_MAX_DIRS {
-                lru.pop_front();
-            }
+        let mut lru = self.lru.lock();
+        if let Some(pos) = lru.iter().position(|k| *k == key) {
+            lru.remove(pos);
+        }
+        lru.push_back(key);
+        while lru.len() > INDEX_CACHE_MAX_DIRS {
+            lru.pop_front();
         }
     }
 
     fn evict_if_needed(&self) {
-        let mut lru = match self.lru.lock() {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let mut entries = match self.entries.lock() {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+        let mut lru = self.lru.lock();
+        let mut entries = self.entries.lock();
         while entries.len() > INDEX_CACHE_MAX_DIRS {
             if let Some(old) = lru.pop_front() {
                 let can_drop = entries
@@ -366,13 +349,14 @@ impl IndexCache {
 
     fn get_or_load(&self, dir_fd: BorrowedFd<'_>) -> Result<Arc<RwLock<IndexState>>, fuse3::Errno> {
         let key = dir_cache_key(dir_fd).ok_or_else(fuse3::Errno::new_not_exist)?;
-        if let Ok(entries) = self.entries.lock()
-            && let Some(entry) = entries.get(&key)
         {
-            let value = entry.value.clone();
-            drop(entries);
-            self.touch_lru(key);
-            return Ok(value);
+            let entries = self.entries.lock();
+            if let Some(entry) = entries.get(&key) {
+                let value = entry.value.clone();
+                drop(entries);
+                self.touch_lru(key);
+                return Ok(value);
+            }
         }
 
         let index = match read_dir_index(dir_fd)? {
@@ -385,18 +369,15 @@ impl IndexCache {
             last_flush: Instant::now(),
         }));
 
-        if let Ok(mut entries) = self.entries.lock() {
-            let existing = entries.entry(key).or_insert_with(|| IndexCacheEntry {
-                value: state.clone(),
-            });
-            let value = existing.value.clone();
-            drop(entries);
-            self.touch_lru(key);
-            self.evict_if_needed();
-            return Ok(value);
-        }
-
-        Ok(state)
+        let mut entries = self.entries.lock();
+        let existing = entries.entry(key).or_insert_with(|| IndexCacheEntry {
+            value: state.clone(),
+        });
+        let value = existing.value.clone();
+        drop(entries);
+        self.touch_lru(key);
+        self.evict_if_needed();
+        Ok(value)
     }
 }
 
@@ -428,9 +409,7 @@ impl DirHandle {
     }
 
     fn clear_cached_attrs(&self) {
-        if let Ok(mut state) = self.state.write() {
-            state.attr_cache.clear();
-        }
+        self.state.write().attr_cache.clear();
     }
 }
 
@@ -462,10 +441,7 @@ impl V2HandleTable {
 
     fn insert_file(&self, fd: OwnedFd) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.entries
-            .write()
-            .unwrap()
-            .insert(id, Handle::File(Arc::new(fd)));
+        self.entries.write().insert(id, Handle::File(Arc::new(fd)));
         id
     }
 
@@ -473,13 +449,12 @@ impl V2HandleTable {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.entries
             .write()
-            .unwrap()
             .insert(id, Handle::Dir(Arc::new(handle)));
         id
     }
 
     fn get_file(&self, id: u64) -> Option<Arc<OwnedFd>> {
-        let guard = self.entries.read().unwrap();
+        let guard = self.entries.read();
         match guard.get(&id)? {
             Handle::File(fd) => Some(fd.clone()),
             _ => None,
@@ -487,7 +462,7 @@ impl V2HandleTable {
     }
 
     fn get_dir(&self, id: u64) -> Option<Arc<DirHandle>> {
-        let guard = self.entries.read().unwrap();
+        let guard = self.entries.read();
         match guard.get(&id)? {
             Handle::Dir(dir) => Some(dir.clone()),
             _ => None,
@@ -495,17 +470,16 @@ impl V2HandleTable {
     }
 
     fn remove(&self, id: u64) -> Option<Handle> {
-        self.entries.write().unwrap().remove(&id)
+        self.entries.write().remove(&id)
     }
 
     fn clear_dir_attr_cache(&self, key: DirCacheKey) {
-        if let Ok(guard) = self.entries.read() {
-            for handle in guard.values() {
-                if let Handle::Dir(dir) = handle
-                    && dir.cache_key == Some(key)
-                {
-                    dir.clear_cached_attrs();
-                }
+        let guard = self.entries.read();
+        for handle in guard.values() {
+            if let Handle::Dir(dir) = handle
+                && dir.cache_key == Some(key)
+            {
+                dir.clear_cached_attrs();
             }
         }
     }
@@ -729,7 +703,7 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> Result<DirIndex, fu
             scope.spawn(move || {
                 loop {
                     let name_bytes = {
-                        let guard = rx.lock().unwrap();
+                        let guard = rx.lock();
                         match guard.recv() {
                             Ok(v) => v,
                             Err(_) => break,
@@ -784,10 +758,9 @@ fn load_dir_state(cache: &IndexCache, dir_fd: BorrowedFd<'_>) -> Result<DirState
 
 fn mark_dirty(state: &mut DirState) {
     state.attr_cache.clear();
-    if let Ok(mut guard) = state.index.write() {
-        guard.index.mark_dirty();
-        guard.pending = guard.pending.saturating_add(1);
-    }
+    let mut guard = state.index.write();
+    guard.index.mark_dirty();
+    guard.pending = guard.pending.saturating_add(1);
 }
 
 fn maybe_flush_index(
@@ -795,7 +768,7 @@ fn maybe_flush_index(
     state: &mut DirState,
     strategy: IndexSync,
 ) -> Result<(), fuse3::Errno> {
-    let mut guard = state.index.write().unwrap();
+    let mut guard = state.index.write();
     let should_flush = match strategy {
         IndexSync::Always => guard.index.is_dirty(),
         IndexSync::Batch {
@@ -832,7 +805,7 @@ fn list_logical_entries(
     )
     .map_err(errno_from_nix)?;
 
-    let mut state = handle.state.write().unwrap();
+    let mut state = handle.state.write();
     let mut entries = Vec::new();
     let mut seen_backend = HashSet::new();
 
@@ -865,7 +838,7 @@ fn list_logical_entries(
                 Err(_) => continue,
             };
             let has_entry = {
-                let guard = state.index.read().unwrap();
+                let guard = state.index.read();
                 guard.index.contains_key(&backend_name)
             };
             if !has_entry {
@@ -887,7 +860,7 @@ fn list_logical_entries(
                     && raw_name.len() <= max_name_len
                 {
                     {
-                        let mut guard = state.index.write().unwrap();
+                        let mut guard = state.index.write();
                         guard.index.upsert(backend_name.clone(), raw_name);
                         guard.pending = guard.pending.saturating_add(1);
                     }
@@ -895,7 +868,7 @@ fn list_logical_entries(
                 }
             }
             let raw_name = {
-                let guard = state.index.read().unwrap();
+                let guard = state.index.read();
                 match guard.index.get(&backend_name) {
                     Some(entry) => entry.raw_name.clone(),
                     None => continue,
@@ -962,7 +935,7 @@ fn map_long_for_lookup(
     raw: &[u8],
 ) -> Result<String, fuse3::Errno> {
     if let Some(entry) = {
-        let guard = state.index.read().unwrap();
+        let guard = state.index.read();
         guard.index.backend_for_raw(raw).cloned()
     } {
         let c_name = string_to_cstring(&entry)?;
@@ -970,7 +943,7 @@ fn map_long_for_lookup(
             Ok(_) => return Ok(entry),
             Err(nix::errno::Errno::ENOENT) => {
                 {
-                    let mut guard = state.index.write().unwrap();
+                    let mut guard = state.index.write();
                     guard.index.remove(&entry);
                     guard.pending = guard.pending.saturating_add(1);
                 }
@@ -997,7 +970,7 @@ fn map_long_for_lookup(
                     && raw_name == raw
                 {
                     {
-                        let mut guard = state.index.write().unwrap();
+                        let mut guard = state.index.write();
                         guard.index.upsert(candidate.clone(), raw_name);
                         guard.pending = guard.pending.saturating_add(1);
                     }
@@ -1050,14 +1023,14 @@ fn map_segment_for_create(
             let hash = encode_long_name(raw);
             let base = backend_basename_from_hash(&hash, None);
             if let Some(entry_raw) = {
-                let guard = state.index.read().unwrap();
+                let guard = state.index.read();
                 guard.index.get(&base).map(|e| e.raw_name.clone())
             } && entry_raw == raw
             {
                 return Err(fuse3::Errno::from(libc::EEXIST));
             }
             let has_base = {
-                let guard = state.index.read().unwrap();
+                let guard = state.index.read();
                 guard.index.contains_key(&base)
             };
             if !has_base {
@@ -1066,7 +1039,7 @@ fn map_segment_for_create(
             for suffix in 1..=MAX_COLLISION_SUFFIX {
                 let candidate = backend_basename_from_hash(&hash, Some(suffix));
                 let entry_raw = {
-                    let guard = state.index.read().unwrap();
+                    let guard = state.index.read();
                     guard.index.get(&candidate).map(|e| e.raw_name.clone())
                 };
                 match entry_raw {
@@ -1125,7 +1098,7 @@ fn handle_backend_eexist_index_missing(
     .map_err(errno_from_nix)?;
     let existing_raw = get_internal_rawname(fd.as_fd())?;
     {
-        let mut guard = state.index.write().unwrap();
+        let mut guard = state.index.write();
         guard
             .index
             .upsert(backend_name.to_owned(), existing_raw.clone());
@@ -1478,7 +1451,7 @@ impl LongNameFsV2 {
             .as_ref()
             .ok_or_else(fuse3::Errno::new_not_exist)?;
         let mut dst_internal = {
-            let mut guard = dst.ctx.state.index.write().unwrap();
+            let mut guard = dst.ctx.state.index.write();
             select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
         };
 
@@ -1518,7 +1491,7 @@ impl LongNameFsV2 {
                         return Err(err);
                     }
                     {
-                        let mut guard = dst.ctx.state.index.write().unwrap();
+                        let mut guard = dst.ctx.state.index.write();
                         refresh_dir_index_from_backend(
                             dst.ctx.dir_fd.as_fd(),
                             &mut guard,
@@ -1534,7 +1507,7 @@ impl LongNameFsV2 {
         }
 
         {
-            let mut guard = dst.ctx.state.index.write().unwrap();
+            let mut guard = dst.ctx.state.index.write();
             guard
                 .index
                 .upsert(dst_internal.clone(), dst.path.logical_name.clone());
@@ -1568,7 +1541,7 @@ impl LongNameFsV2 {
         )?;
         let backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
         {
-            let mut src_guard = src.ctx.state.index.write().unwrap();
+            let mut src_guard = src.ctx.state.index.write();
             if src_guard.index.remove(&backend_name).is_some() {
                 src_guard.pending = src_guard.pending.saturating_add(1);
             }
@@ -1593,7 +1566,7 @@ impl LongNameFsV2 {
             .ok_or_else(fuse3::Errno::new_not_exist)?;
         let same_dir = src.path.parent_key == dst.path.parent_key;
         let mut dst_internal = {
-            let mut guard = dst.ctx.state.index.write().unwrap();
+            let mut guard = dst.ctx.state.index.write();
             select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
         };
 
@@ -1613,7 +1586,7 @@ impl LongNameFsV2 {
                         return Err(err);
                     }
                     {
-                        let mut guard = dst.ctx.state.index.write().unwrap();
+                        let mut guard = dst.ctx.state.index.write();
                         refresh_dir_index_from_backend(
                             dst.ctx.dir_fd.as_fd(),
                             &mut guard,
@@ -1640,7 +1613,7 @@ impl LongNameFsV2 {
 
         let src_backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
         if same_dir {
-            let mut guard = dst.ctx.state.index.write().unwrap();
+            let mut guard = dst.ctx.state.index.write();
             if guard.index.remove(&src_backend_name).is_some() {
                 guard.pending = guard.pending.saturating_add(1);
             }
@@ -1652,8 +1625,8 @@ impl LongNameFsV2 {
             let src_key = (src.path.parent_key.dev, src.path.parent_key.ino);
             let dst_key = (dst.path.parent_key.dev, dst.path.parent_key.ino);
             if src_key < dst_key {
-                let mut src_guard = src.ctx.state.index.write().unwrap();
-                let mut dst_guard = dst.ctx.state.index.write().unwrap();
+                let mut src_guard = src.ctx.state.index.write();
+                let mut dst_guard = dst.ctx.state.index.write();
                 if src_guard.index.remove(&src_backend_name).is_some() {
                     src_guard.pending = src_guard.pending.saturating_add(1);
                 }
@@ -1662,8 +1635,8 @@ impl LongNameFsV2 {
                     .upsert(dst_internal.clone(), dst.path.logical_name.clone());
                 dst_guard.pending = dst_guard.pending.saturating_add(1);
             } else {
-                let mut dst_guard = dst.ctx.state.index.write().unwrap();
-                let mut src_guard = src.ctx.state.index.write().unwrap();
+                let mut dst_guard = dst.ctx.state.index.write();
+                let mut src_guard = src.ctx.state.index.write();
                 if src_guard.index.remove(&src_backend_name).is_some() {
                     src_guard.pending = src_guard.pending.saturating_add(1);
                 }
@@ -1912,7 +1885,7 @@ impl PathFilesystem for LongNameFsV2 {
             .map_err(errno_from_nix)?;
             set_internal_rawname(fd.as_fd(), &raw)?;
             {
-                let mut guard = ctx.state.index.write().unwrap();
+                let mut guard = ctx.state.index.write();
                 guard
                     .index
                     .upsert(String::from_utf8(backend.display_bytes()).unwrap(), raw);
@@ -1955,7 +1928,7 @@ impl PathFilesystem for LongNameFsV2 {
             .map_err(errno_from_nix)?;
             set_internal_rawname(fd.as_fd(), &raw)?;
             {
-                let mut guard = ctx.state.index.write().unwrap();
+                let mut guard = ctx.state.index.write();
                 guard
                     .index
                     .upsert(String::from_utf8(backend.display_bytes()).unwrap(), raw);
@@ -2010,7 +1983,7 @@ impl PathFilesystem for LongNameFsV2 {
             };
             set_internal_rawname(fd.as_fd(), &raw)?;
             {
-                let mut guard = ctx.state.index.write().unwrap();
+                let mut guard = ctx.state.index.write();
                 guard
                     .index
                     .upsert(String::from_utf8(backend.display_bytes()).unwrap(), raw);
@@ -2046,7 +2019,7 @@ impl PathFilesystem for LongNameFsV2 {
         .map_err(errno_from_nix)?;
         if matches!(kind, SegmentKind::Long) {
             {
-                let mut guard = ctx.state.index.write().unwrap();
+                let mut guard = ctx.state.index.write();
                 if guard
                     .index
                     .remove(&String::from_utf8(backend.display_bytes()).unwrap())
@@ -2107,7 +2080,7 @@ impl PathFilesystem for LongNameFsV2 {
         }
         if matches!(kind, SegmentKind::Long) {
             {
-                let mut guard = ctx.state.index.write().unwrap();
+                let mut guard = ctx.state.index.write();
                 if guard
                     .index
                     .remove(&String::from_utf8(backend.display_bytes()).unwrap())
@@ -2554,7 +2527,7 @@ impl PathFilesystem for LongNameFsV2 {
                     if matches!(backend.1, SegmentKind::Long) {
                         set_internal_rawname(fd.as_fd(), &raw)?;
                         {
-                            let mut guard = ctx.state.index.write().unwrap();
+                            let mut guard = ctx.state.index.write();
                             guard.index.upsert(
                                 String::from_utf8(backend.0.display_bytes()).unwrap(),
                                 raw.clone(),
