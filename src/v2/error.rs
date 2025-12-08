@@ -45,6 +45,8 @@ impl From<io::Error> for CoreError {
 
 impl From<nix::Error> for CoreError {
     fn from(value: nix::Error) -> Self {
+        // nix::Error is currently a type alias of Errno; if upstream reintroduces
+        // structured errors we should expand this mapping.
         CoreError::from_errno(value as i32)
     }
 }

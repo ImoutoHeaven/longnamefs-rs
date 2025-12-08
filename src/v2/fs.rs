@@ -79,7 +79,7 @@ fn core_errno_from_nix(err: nix::Error) -> CoreError {
 }
 
 fn core_string_to_cstring(value: &str) -> CoreResult<CString> {
-    string_to_cstring(value).map_err(|e| CoreError::from_errno(e.into()))
+    CString::new(value.as_bytes()).map_err(|_| CoreError::from_errno(libc::EINVAL))
 }
 
 fn fuse_err(err: CoreError) -> fuse3::Errno {
