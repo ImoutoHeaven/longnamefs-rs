@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::util::{
-    access_mask_from_bits, begin_temp_file, errno_from_nix, oflag_from_bits, retry_eintr,
+    access_mask_from_bits, core_begin_temp_file, errno_from_nix, oflag_from_bits, retry_eintr,
     string_to_cstring,
 };
 use crate::v2::error::{CoreError, CoreResult, core_err_to_errno};
@@ -734,8 +734,7 @@ fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
 
 fn probe_renameat2(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
     let final_name = core_string_to_cstring(".__ln2_renameat2_probe")?;
-    let temp = begin_temp_file(dir_fd, final_name.as_c_str(), "rn2")
-        .map_err(|e| CoreError::from_errno(e.into()))?;
+    let temp = core_begin_temp_file(dir_fd, final_name.as_c_str(), "rn2")?;
     let mut dst_bytes = temp.name.as_bytes().to_vec();
     dst_bytes.extend_from_slice(b".dst");
     let dst_name = CString::new(dst_bytes).map_err(|_| CoreError::from_errno(libc::EINVAL))?;

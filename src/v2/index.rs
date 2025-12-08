@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
-use crate::util::{begin_temp_file, retry_eintr, sync_and_commit};
+use crate::util::{core_begin_temp_file, core_sync_and_commit, retry_eintr};
 use crate::v2::error::{CoreError, CoreResult};
 use nix::unistd::write;
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::CStr;
 use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd};
 
@@ -13,6 +13,8 @@ const VERSION: u32 = 1;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024; // 简单上限防止损坏文件拖垮内存
 
 pub const INDEX_NAME: &str = ".ln2_index";
+#[allow(clippy::manual_c_str_literals)]
+const INDEX_NAME_CSTR: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b".ln2_index\0") };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirIndexEntry {
@@ -94,11 +96,9 @@ impl DirIndex {
 }
 
 fn read_index_bytes(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<Vec<u8>>> {
-    let name =
-        CString::new(INDEX_NAME.as_bytes()).map_err(|_| CoreError::from_errno(libc::EINVAL))?;
     let fd = match nix::fcntl::openat(
         dir_fd,
-        name.as_c_str(),
+        INDEX_NAME_CSTR,
         nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     ) {
@@ -203,14 +203,11 @@ fn encode_index(index: &DirIndex) -> Vec<u8> {
 
 pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> CoreResult<()> {
     let data = encode_index(index);
-    let final_name =
-        CString::new(INDEX_NAME.as_bytes()).map_err(|_| CoreError::from_errno(libc::EINVAL))?;
-    let tmp = begin_temp_file(dir_fd, final_name.as_c_str(), "idx")
-        .map_err(|e| CoreError::from_errno(e.into()))?;
+    let tmp = core_begin_temp_file(dir_fd, INDEX_NAME_CSTR, "idx").map_err(CoreError::from)?;
     let mut written = 0;
     while written < data.len() {
         let n = retry_eintr(|| write(tmp.fd.as_fd(), &data[written..])).map_err(CoreError::from)?;
         written += n;
     }
-    sync_and_commit(dir_fd, tmp, final_name.as_c_str()).map_err(|e| CoreError::from_errno(e.into()))
+    core_sync_and_commit(dir_fd, tmp, INDEX_NAME_CSTR).map_err(CoreError::from)
 }
