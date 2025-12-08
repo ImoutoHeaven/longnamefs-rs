@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::util::{begin_temp_file, retry_eintr, string_to_cstring, sync_and_commit};
-use crate::v2::error::{CoreError, CoreResult, core_error_from_fuse};
+use crate::v2::error::{CoreError, CoreResult};
 use nix::unistd::write;
 use std::collections::HashMap;
 use std::io::Read;
@@ -93,7 +93,7 @@ impl DirIndex {
 }
 
 fn read_index_bytes(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<Vec<u8>>> {
-    let name = string_to_cstring(INDEX_NAME).map_err(core_error_from_fuse)?;
+    let name = string_to_cstring(INDEX_NAME).map_err(|e| CoreError::from_errno(e.into()))?;
     let fd = match nix::fcntl::openat(
         dir_fd,
         name.as_c_str(),
@@ -201,13 +201,13 @@ fn encode_index(index: &DirIndex) -> Vec<u8> {
 
 pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> CoreResult<()> {
     let data = encode_index(index);
-    let final_name = string_to_cstring(INDEX_NAME).map_err(core_error_from_fuse)?;
-    let tmp =
-        begin_temp_file(dir_fd, final_name.as_c_str(), "idx").map_err(core_error_from_fuse)?;
+    let final_name = string_to_cstring(INDEX_NAME).map_err(|e| CoreError::from_errno(e.into()))?;
+    let tmp = begin_temp_file(dir_fd, final_name.as_c_str(), "idx")
+        .map_err(|e| CoreError::from_errno(e.into()))?;
     let mut written = 0;
     while written < data.len() {
         let n = retry_eintr(|| write(tmp.fd.as_fd(), &data[written..])).map_err(CoreError::from)?;
         written += n;
     }
-    sync_and_commit(dir_fd, tmp, final_name.as_c_str()).map_err(core_error_from_fuse)
+    sync_and_commit(dir_fd, tmp, final_name.as_c_str()).map_err(|e| CoreError::from_errno(e.into()))
 }

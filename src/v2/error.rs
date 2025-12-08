@@ -18,22 +18,38 @@ pub enum CoreError {
 
 impl CoreError {
     pub fn from_errno(errno: i32) -> Self {
-        CoreError::Io(io::Error::from_raw_os_error(errno))
+        match errno {
+            libc::ENAMETOOLONG => CoreError::NameTooLong,
+            libc::ENOENT => CoreError::NotFound,
+            libc::EEXIST => CoreError::AlreadyExists,
+            libc::ENOSPC => CoreError::NoSpace,
+            libc::ENOTDIR => CoreError::NotDir,
+            libc::EISDIR => CoreError::IsDir,
+            libc::EMLINK => CoreError::TooManyLinks,
+            libc::ESTALE => CoreError::StaleInode,
+            libc::EOPNOTSUPP => CoreError::Unsupported,
+            _ => CoreError::Io(io::Error::from_raw_os_error(errno)),
+        }
     }
 }
 
 impl From<io::Error> for CoreError {
     fn from(value: io::Error) -> Self {
-        CoreError::Io(value)
+        if let Some(errno) = value.raw_os_error() {
+            CoreError::from_errno(errno)
+        } else {
+            CoreError::Io(value)
+        }
     }
 }
 
 impl From<nix::Error> for CoreError {
     fn from(value: nix::Error) -> Self {
-        CoreError::Io(io::Error::from_raw_os_error(value as i32))
+        CoreError::from_errno(value as i32)
     }
 }
 
+#[allow(dead_code)]
 pub fn core_err_to_errno(err: &CoreError) -> i32 {
     match err {
         CoreError::Io(ioe) => ioe.raw_os_error().unwrap_or(libc::EIO),
@@ -51,13 +67,3 @@ pub fn core_err_to_errno(err: &CoreError) -> i32 {
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
-
-pub fn core_error_from_fuse(err: fuse3::Errno) -> CoreError {
-    CoreError::from_errno(err.into())
-}
-
-impl From<CoreError> for fuse3::Errno {
-    fn from(value: CoreError) -> Self {
-        fuse3::Errno::from(core_err_to_errno(&value))
-    }
-}

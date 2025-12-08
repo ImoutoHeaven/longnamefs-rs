@@ -1,9 +1,9 @@
 use crate::config::Config;
 use crate::util::{
-    access_mask_from_bits, begin_temp_file, errno_from_nix, file_attr_from_stat,
-    file_type_from_mode, oflag_from_bits, retry_eintr, string_to_cstring,
+    access_mask_from_bits, begin_temp_file, errno_from_nix, oflag_from_bits, retry_eintr,
+    string_to_cstring,
 };
-use crate::v2::error::{CoreError, CoreResult, core_err_to_errno, core_error_from_fuse};
+use crate::v2::error::{CoreError, CoreResult, core_err_to_errno};
 use crate::v2::index::{DirIndex, INDEX_NAME, read_dir_index, write_dir_index};
 use crate::v2::path::{
     INTERNAL_PREFIX, MAX_COLLISION_SUFFIX, SegmentKind, backend_basename_from_hash,
@@ -40,19 +40,56 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const JOURNAL_NAME: &str = ".ln2_journal";
 const PARALLEL_REBUILD_THRESHOLD: usize = 64;
 const PARALLEL_REBUILD_WORKERS: usize = 4;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreFileType {
+    Directory,
+    Symlink,
+    RegularFile,
+    BlockDevice,
+    CharDevice,
+    NamedPipe,
+    Socket,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoreFileAttr {
+    pub size: u64,
+    pub blocks: u64,
+    pub atime: SystemTime,
+    pub mtime: SystemTime,
+    pub ctime: SystemTime,
+    pub kind: CoreFileType,
+    pub perm: u16,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u32,
+    pub blksize: u32,
+}
+
 fn core_errno_from_nix(err: nix::Error) -> CoreError {
-    core_error_from_fuse(errno_from_nix(err))
+    CoreError::from(err)
 }
 
 fn core_string_to_cstring(value: &str) -> CoreResult<CString> {
-    string_to_cstring(value).map_err(core_error_from_fuse)
+    string_to_cstring(value).map_err(|e| CoreError::from_errno(e.into()))
+}
+
+fn fuse_err(err: CoreError) -> fuse3::Errno {
+    fuse3::Errno::from(core_err_to_errno(&err))
+}
+
+impl From<CoreError> for fuse3::Errno {
+    fn from(err: CoreError) -> Self {
+        fuse_err(err)
+    }
 }
 
 fn is_internal_meta(raw: &[u8]) -> bool {
@@ -176,8 +213,8 @@ fn dir_cache_key(fd: BorrowedFd<'_>) -> Option<DirCacheKey> {
 #[derive(Debug, Clone)]
 pub(crate) struct DirEntryInfo {
     name: OsString,
-    kind: FileType,
-    attr: Option<fuse3::path::reply::FileAttr>,
+    kind: CoreFileType,
+    attr: Option<CoreFileAttr>,
     backend_name: Vec<u8>,
 }
 
@@ -288,15 +325,86 @@ impl DirFdCache {
     }
 }
 
-fn map_dirent_type(entry: &nix::dir::Entry) -> Option<FileType> {
+fn core_file_type_from_mode(mode: libc::mode_t) -> CoreFileType {
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => CoreFileType::Directory,
+        libc::S_IFLNK => CoreFileType::Symlink,
+        libc::S_IFCHR => CoreFileType::CharDevice,
+        libc::S_IFBLK => CoreFileType::BlockDevice,
+        libc::S_IFIFO => CoreFileType::NamedPipe,
+        libc::S_IFSOCK => CoreFileType::Socket,
+        _ => CoreFileType::RegularFile,
+    }
+}
+
+fn core_file_type_to_fuse(kind: CoreFileType) -> FileType {
+    match kind {
+        CoreFileType::Directory => FileType::Directory,
+        CoreFileType::Symlink => FileType::Symlink,
+        CoreFileType::RegularFile => FileType::RegularFile,
+        CoreFileType::BlockDevice => FileType::BlockDevice,
+        CoreFileType::CharDevice => FileType::CharDevice,
+        CoreFileType::NamedPipe => FileType::NamedPipe,
+        CoreFileType::Socket => FileType::Socket,
+    }
+}
+
+fn system_time_from_raw(sec: i64, nsec: i64) -> SystemTime {
+    if sec < 0 {
+        return UNIX_EPOCH;
+    }
+    let nanos = if nsec < 0 { 0 } else { nsec as u32 };
+    UNIX_EPOCH + Duration::new(sec as u64, nanos)
+}
+
+fn core_attr_from_stat(stat: &nix::sys::stat::FileStat) -> CoreFileAttr {
+    let kind = core_file_type_from_mode(stat.st_mode);
+    CoreFileAttr {
+        size: stat.st_size as u64,
+        blocks: stat.st_blocks as u64,
+        atime: system_time_from_raw(stat.st_atime, stat.st_atime_nsec),
+        mtime: system_time_from_raw(stat.st_mtime, stat.st_mtime_nsec),
+        ctime: system_time_from_raw(stat.st_ctime, stat.st_ctime_nsec),
+        kind,
+        perm: (stat.st_mode & 0o7777) as u16,
+        nlink: stat.st_nlink as u32,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        rdev: stat.st_rdev as u32,
+        blksize: stat.st_blksize as u32,
+    }
+}
+
+fn fuse_attr_from_core(attr: CoreFileAttr) -> fuse3::path::reply::FileAttr {
+    fuse3::path::reply::FileAttr {
+        size: attr.size,
+        blocks: attr.blocks,
+        atime: attr.atime,
+        mtime: attr.mtime,
+        ctime: attr.ctime,
+        kind: core_file_type_to_fuse(attr.kind),
+        perm: attr.perm,
+        nlink: attr.nlink,
+        uid: attr.uid,
+        gid: attr.gid,
+        rdev: attr.rdev,
+        blksize: attr.blksize,
+        #[cfg(target_os = "macos")]
+        crtime: UNIX_EPOCH,
+        #[cfg(target_os = "macos")]
+        flags: 0,
+    }
+}
+
+fn map_dirent_type(entry: &nix::dir::Entry) -> Option<CoreFileType> {
     entry.file_type().map(|dt| match dt {
-        nix::dir::Type::Directory => FileType::Directory,
-        nix::dir::Type::Symlink => FileType::Symlink,
-        nix::dir::Type::File => FileType::RegularFile,
-        nix::dir::Type::BlockDevice => FileType::BlockDevice,
-        nix::dir::Type::CharacterDevice => FileType::CharDevice,
-        nix::dir::Type::Fifo => FileType::NamedPipe,
-        nix::dir::Type::Socket => FileType::Socket,
+        nix::dir::Type::Directory => CoreFileType::Directory,
+        nix::dir::Type::Symlink => CoreFileType::Symlink,
+        nix::dir::Type::File => CoreFileType::RegularFile,
+        nix::dir::Type::BlockDevice => CoreFileType::BlockDevice,
+        nix::dir::Type::CharacterDevice => CoreFileType::CharDevice,
+        nix::dir::Type::Fifo => CoreFileType::NamedPipe,
+        nix::dir::Type::Socket => CoreFileType::Socket,
     })
 }
 
@@ -394,7 +502,7 @@ impl IndexCache {
 #[derive(Debug)]
 struct DirState {
     index: Arc<RwLock<IndexState>>,
-    attr_cache: HashMap<Vec<u8>, fuse3::path::reply::FileAttr>,
+    attr_cache: HashMap<Vec<u8>, CoreFileAttr>,
 }
 
 #[derive(Debug)]
@@ -489,6 +597,15 @@ impl V2HandleTable {
             if let Handle::Dir(dir) = handle
                 && dir.cache_key == Some(key)
             {
+                dir.clear_cached_attrs();
+            }
+        }
+    }
+
+    fn clear_all_dir_attr_cache(&self) {
+        let guard = self.entries.read();
+        for handle in guard.values() {
+            if let Handle::Dir(dir) = handle {
                 dir.clear_cached_attrs();
             }
         }
@@ -617,8 +734,8 @@ fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
 
 fn probe_renameat2(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
     let final_name = core_string_to_cstring(".__ln2_renameat2_probe")?;
-    let temp =
-        begin_temp_file(dir_fd, final_name.as_c_str(), "rn2").map_err(core_error_from_fuse)?;
+    let temp = begin_temp_file(dir_fd, final_name.as_c_str(), "rn2")
+        .map_err(|e| CoreError::from_errno(e.into()))?;
     let mut dst_bytes = temp.name.as_bytes().to_vec();
     dst_bytes.extend_from_slice(b".dst");
     let dst_name = CString::new(dst_bytes).map_err(|_| CoreError::from_errno(libc::EINVAL))?;
@@ -894,16 +1011,16 @@ fn list_logical_entries(
                     Ok(st) => st,
                     Err(_) => continue,
                 };
-                let file_attr = file_attr_from_stat(&stat);
+                let file_attr = core_attr_from_stat(&stat);
                 state.attr_cache.insert(name_bytes.clone(), file_attr);
                 if kind.is_none() {
-                    kind = Some(file_type_from_mode(stat.st_mode));
+                    kind = Some(core_file_type_from_mode(stat.st_mode));
                 }
                 attr = Some(file_attr);
             }
             entries.push(DirEntryInfo {
                 name: OsString::from_vec(raw_name),
-                kind: kind.unwrap_or(FileType::RegularFile),
+                kind: kind.unwrap_or(CoreFileType::RegularFile),
                 attr,
                 backend_name: name_bytes.clone(),
             });
@@ -918,16 +1035,16 @@ fn list_logical_entries(
                     Ok(st) => st,
                     Err(_) => continue,
                 };
-                let file_attr = file_attr_from_stat(&stat);
+                let file_attr = core_attr_from_stat(&stat);
                 state.attr_cache.insert(name_bytes.clone(), file_attr);
                 if kind.is_none() {
-                    kind = Some(file_type_from_mode(stat.st_mode));
+                    kind = Some(core_file_type_from_mode(stat.st_mode));
                 }
                 attr = Some(file_attr);
             }
             entries.push(DirEntryInfo {
                 name: OsString::from_vec(name_bytes.clone()),
-                kind: kind.unwrap_or(FileType::RegularFile),
+                kind: kind.unwrap_or(CoreFileType::RegularFile),
                 attr,
                 backend_name: name_bytes.clone(),
             });
@@ -1284,7 +1401,7 @@ impl LongNameFsCore {
         Arc::new(logical)
     }
 
-    pub(crate) fn stat_path(&self, path: &OsStr) -> CoreResult<fuse3::path::reply::FileAttr> {
+    pub(crate) fn stat_path(&self, path: &OsStr) -> CoreResult<CoreFileAttr> {
         if path == OsStr::new("/") {
             let stat = fstatat(
                 self.config.backend_fd(),
@@ -1292,7 +1409,7 @@ impl LongNameFsCore {
                 AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW,
             )
             .map_err(core_errno_from_nix)?;
-            return Ok(file_attr_from_stat(&stat));
+            return Ok(core_attr_from_stat(&stat));
         }
         let mapped = self.resolve_path(path)?;
         let fname = mapped.backend_name.as_cstring()?;
@@ -1302,7 +1419,7 @@ impl LongNameFsCore {
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )
         .map_err(core_errno_from_nix)?;
-        Ok(file_attr_from_stat(&stat))
+        Ok(core_attr_from_stat(&stat))
     }
 
     pub(crate) fn resolve_dir(&self, path: &OsStr) -> CoreResult<ParentCtx> {
@@ -1457,6 +1574,7 @@ impl LongNameFsV2 {
             self.invalidate_dir_by_key(key);
         } else {
             self.core.invalidate_dir(dir_fd);
+            self.handles.clear_all_dir_attr_cache();
         }
     }
 
@@ -1530,7 +1648,7 @@ impl LongNameFsV2 {
             );
             match rename_res {
                 Ok(()) => break,
-                Err(err) if core_err_to_errno(&err) == libc::EEXIST => {
+                Err(err @ CoreError::AlreadyExists) => {
                     if attempt > 0 {
                         return Err(err);
                     }
@@ -1617,7 +1735,7 @@ impl LongNameFsV2 {
             );
             match res {
                 Ok(()) => break,
-                Err(err) if core_err_to_errno(&err) == libc::EEXIST => {
+                Err(err @ CoreError::AlreadyExists) => {
                     if attempt > 0 {
                         return Err(err);
                     }
@@ -1762,7 +1880,7 @@ impl PathFilesystem for LongNameFsV2 {
                 AtFlags::AT_SYMLINK_NOFOLLOW,
             )
             .map_err(errno_from_nix)?;
-            file_attr_from_stat(&stat)
+            fuse_attr_from_core(core_attr_from_stat(&stat))
         };
         Ok(ReplyEntry {
             ttl: self.attr_ttl,
@@ -1779,7 +1897,7 @@ impl PathFilesystem for LongNameFsV2 {
     ) -> Result<ReplyAttr, fuse3::Errno> {
         if let Some(handle) = fh.and_then(|id| self.handles.get_file(id)) {
             let stat = fstat(handle.as_fd()).map_err(errno_from_nix)?;
-            let attr = file_attr_from_stat(&stat);
+            let attr = fuse_attr_from_core(core_attr_from_stat(&stat));
             return Ok(ReplyAttr {
                 ttl: self.attr_ttl,
                 attr,
@@ -1787,7 +1905,7 @@ impl PathFilesystem for LongNameFsV2 {
         }
 
         let path = path.ok_or_else(fuse3::Errno::new_not_exist)?;
-        let attr = self.stat_path(path)?;
+        let attr = self.stat_path(path).map(fuse_attr_from_core)?;
         Ok(ReplyAttr {
             ttl: self.attr_ttl,
             attr,
@@ -1884,7 +2002,7 @@ impl PathFilesystem for LongNameFsV2 {
             .map_err(errno_from_nix)?;
         }
         self.invalidate_dir(mapped.dir_fd.as_fd());
-        let attr = self.stat_path(path)?;
+        let attr = self.stat_path(path).map(fuse_attr_from_core)?;
         Ok(ReplyAttr {
             ttl: self.attr_ttl,
             attr,
@@ -1931,7 +2049,9 @@ impl PathFilesystem for LongNameFsV2 {
             maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         }
         self.invalidate_dir(ctx.dir_fd.as_fd());
-        let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
+        let attr = self
+            .stat_path(&crate::v2::path::make_child_path(parent, name))
+            .map(fuse_attr_from_core)?;
         Ok(ReplyEntry {
             ttl: self.attr_ttl,
             attr,
@@ -1974,7 +2094,9 @@ impl PathFilesystem for LongNameFsV2 {
             maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         }
         self.invalidate_dir(ctx.dir_fd.as_fd());
-        let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
+        let attr = self
+            .stat_path(&crate::v2::path::make_child_path(parent, name))
+            .map(fuse_attr_from_core)?;
         Ok(ReplyEntry {
             ttl: self.attr_ttl,
             attr,
@@ -2029,7 +2151,9 @@ impl PathFilesystem for LongNameFsV2 {
             maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         }
         self.invalidate_dir(ctx.dir_fd.as_fd());
-        let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
+        let attr = self
+            .stat_path(&crate::v2::path::make_child_path(parent, name))
+            .map(fuse_attr_from_core)?;
         Ok(ReplyEntry {
             ttl: self.attr_ttl,
             attr,
@@ -2188,7 +2312,9 @@ impl PathFilesystem for LongNameFsV2 {
         )
         .map_err(errno_from_nix)?;
         self.invalidate_dir(ctx.dir_fd.as_fd());
-        let attr = self.stat_path(&crate::v2::path::make_child_path(new_parent, new_name))?;
+        let attr = self
+            .stat_path(&crate::v2::path::make_child_path(new_parent, new_name))
+            .map(fuse_attr_from_core)?;
         Ok(ReplyEntry {
             ttl: self.attr_ttl,
             attr,
@@ -2579,7 +2705,9 @@ impl PathFilesystem for LongNameFsV2 {
                     }
                     self.invalidate_dir(ctx.dir_fd.as_fd());
                     let fh = self.handles.insert_file(fd);
-                    let attr = self.stat_path(&crate::v2::path::make_child_path(parent, name))?;
+                    let attr = self
+                        .stat_path(&crate::v2::path::make_child_path(parent, name))
+                        .map(fuse_attr_from_core)?;
                     return Ok(ReplyCreated {
                         ttl: self.attr_ttl,
                         attr,
@@ -2681,7 +2809,7 @@ impl PathFilesystem for LongNameFsV2 {
         for entry in logical.iter() {
             idx += 1;
             entries.push(Ok(DirectoryEntry {
-                kind: entry.kind,
+                kind: core_file_type_to_fuse(entry.kind),
                 name: entry.name.clone(),
                 offset: idx,
             }));
@@ -2710,7 +2838,7 @@ impl PathFilesystem for LongNameFsV2 {
             Vec::with_capacity(logical.len() + 2);
         let dir_attr = fstat(handle.as_fd())
             .map_err(errno_from_nix)
-            .map(|stat| file_attr_from_stat(&stat))?;
+            .map(|stat| fuse_attr_from_core(core_attr_from_stat(&stat)))?;
 
         let mut idx: i64 = 0;
         entries.push(Ok(DirectoryEntryPlus {
@@ -2749,7 +2877,7 @@ impl PathFilesystem for LongNameFsV2 {
                     c_name.as_c_str(),
                     AtFlags::AT_SYMLINK_NOFOLLOW,
                 ) {
-                    Ok(st) => file_attr_from_stat(&st),
+                    Ok(st) => core_attr_from_stat(&st),
                     Err(err) => {
                         entries.push(Err(errno_from_nix(err)));
                         continue;
@@ -2757,10 +2885,10 @@ impl PathFilesystem for LongNameFsV2 {
                 }
             };
             entries.push(Ok(DirectoryEntryPlus {
-                kind: entry.kind,
+                kind: core_file_type_to_fuse(entry.kind),
                 name: entry.name.clone(),
                 offset: idx,
-                attr,
+                attr: fuse_attr_from_core(attr),
                 entry_ttl: self.attr_ttl,
                 attr_ttl: self.attr_ttl,
             }));
