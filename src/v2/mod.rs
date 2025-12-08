@@ -8,7 +8,8 @@
 pub mod error;
 pub mod fs;
 pub mod index;
+pub mod inode_store;
 pub mod path;
 
 #[allow(unused_imports)]
-pub use fs::{IndexSync, LongNameFsCore, LongNameFsV2};
+pub use fs::{IndexSync, LongNameFsCore, LongNameFsV2, LongNameFsV2Fuser};

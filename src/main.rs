@@ -6,13 +6,14 @@ mod pathmap;
 mod util;
 mod v2;
 
-use crate::v2::{IndexSync, LongNameFsV2};
+use crate::v2::{IndexSync, LongNameFsV2, LongNameFsV2Fuser};
 use clap::{Parser, ValueEnum};
 use config::Config;
 use fs::LongNameFs;
 use fuse3::MountOptions;
 use fuse3::path::PathFilesystem;
 use fuse3::path::Session;
+use fuser::{MountOption as FuserMountOption, mount2 as fuser_mount2};
 #[cfg(unix)]
 use futures_util::future::poll_fn;
 #[cfg(unix)]
@@ -68,6 +69,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_other: bool,
 
+    /// Select FUSE binding (fuse3 async legacy vs fuser sync, experimental).
+    #[arg(long, value_enum, default_value_t = FuseImpl::Fuse3)]
+    fuse_impl: FuseImpl,
+
     /// Permit mounting on a non-empty directory.
     #[arg(long, default_value_t = false)]
     nonempty: bool,
@@ -113,6 +118,12 @@ struct Cli {
 enum BackendLayout {
     V1,
     V2,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum FuseImpl {
+    Fuse3,
+    Fuser,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -166,6 +177,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.backend_layout {
         BackendLayout::V1 => {
             namefile::set_relaxed_namefile_mode(cli.unsafe_namefile_writes);
+            if cli.fuse_impl != FuseImpl::Fuse3 {
+                anyhow::bail!("fuser adapter is not implemented for backend layout v1");
+            }
             let fs = LongNameFs::new(config, cache_ttl, cli.max_write_kb);
             run_mount(fs, mountpoint, mount_opts).await
         }
@@ -173,15 +187,31 @@ async fn main() -> anyhow::Result<()> {
             eprintln!(
                 "WARNING: backend layout v2 is experimental and incompatible with v1 data; use a dedicated empty backend directory."
             );
-            let fs = LongNameFsV2::new(
-                config,
-                cli.max_name_len,
-                cache_ttl,
-                cli.max_write_kb,
-                cli.index_sync.into(),
-                attr_ttl,
-            )?;
-            run_mount(fs, mountpoint, mount_opts).await
+            match cli.fuse_impl {
+                FuseImpl::Fuse3 => {
+                    let fs = LongNameFsV2::new(
+                        config,
+                        cli.max_name_len,
+                        cache_ttl,
+                        cli.max_write_kb,
+                        cli.index_sync.into(),
+                        attr_ttl,
+                    )?;
+                    run_mount(fs, mountpoint, mount_opts).await
+                }
+                FuseImpl::Fuser => {
+                    let fs = LongNameFsV2Fuser::new(
+                        config,
+                        cli.max_name_len,
+                        cache_ttl,
+                        cli.max_write_kb,
+                        cli.index_sync.into(),
+                        attr_ttl,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    run_mount_fuser(fs, mountpoint, cli.allow_other, cli.nonempty)
+                }
+            }
         }
     }
 }
@@ -267,4 +297,24 @@ where
     }
 
     Ok(())
+}
+
+fn run_mount_fuser(
+    fs: LongNameFsV2Fuser,
+    mountpoint: PathBuf,
+    allow_other: bool,
+    nonempty: bool,
+) -> anyhow::Result<()> {
+    let mut options = vec![
+        FuserMountOption::RW,
+        FuserMountOption::FSName("longnamefs-rs".to_string()),
+        FuserMountOption::Subtype("ln2".to_string()),
+    ];
+    if allow_other {
+        options.push(FuserMountOption::AllowOther);
+    }
+    if nonempty {
+        options.push(FuserMountOption::CUSTOM("nonempty".to_string()));
+    }
+    fuser_mount2(fs, mountpoint, &options).map_err(anyhow::Error::from)
 }

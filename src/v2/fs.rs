@@ -5,6 +5,9 @@ use crate::util::{
 };
 use crate::v2::error::{CoreError, CoreResult, core_err_to_errno};
 use crate::v2::index::{DirIndex, INDEX_NAME, read_dir_index, write_dir_index};
+use crate::v2::inode_store::{
+    BackendKey, InodeEntry, InodeId, InodeKind, InodeStore, ParentName, ROOT_INODE,
+};
 use crate::v2::path::{
     INTERNAL_PREFIX, MAX_COLLISION_SUFFIX, SegmentKind, backend_basename_from_hash,
     classify_segment, encode_long_name, is_reserved_prefix, normalize_osstr,
@@ -14,6 +17,13 @@ use fuse3::notify::Notify;
 use fuse3::path::prelude::*;
 use fuse3::path::reply::{DirectoryEntryPlus, ReplyPoll, ReplyXAttr};
 use fuse3::{FileType, SetAttr};
+use fuser::{
+    FileAttr as FuserFileAttr, FileType as FuserFileType, Filesystem as FuserFilesystem,
+    KernelConfig, ReplyAttr as FuserReplyAttr, ReplyData as FuserReplyData,
+    ReplyDirectory as FuserReplyDirectory, ReplyEmpty as FuserReplyEmpty,
+    ReplyEntry as FuserReplyEntry, ReplyOpen as FuserReplyOpen, ReplyWrite as FuserReplyWrite,
+    Request as FuserRequest,
+};
 use nix::dir::Dir;
 use nix::fcntl::{AtFlags, OFlag, RenameFlags, readlinkat, renameat, renameat2};
 use nix::sys::stat::{
@@ -393,6 +403,73 @@ fn fuse_attr_from_core(attr: CoreFileAttr) -> fuse3::path::reply::FileAttr {
         crtime: UNIX_EPOCH,
         #[cfg(target_os = "macos")]
         flags: 0,
+    }
+}
+
+impl From<CoreFileType> for InodeKind {
+    fn from(value: CoreFileType) -> Self {
+        match value {
+            CoreFileType::Directory => InodeKind::Directory,
+            CoreFileType::Symlink => InodeKind::Symlink,
+            CoreFileType::RegularFile => InodeKind::File,
+            CoreFileType::BlockDevice => InodeKind::BlockDevice,
+            CoreFileType::CharDevice => InodeKind::CharDevice,
+            CoreFileType::NamedPipe => InodeKind::NamedPipe,
+            CoreFileType::Socket => InodeKind::Socket,
+        }
+    }
+}
+
+fn fuser_file_type(kind: CoreFileType) -> FuserFileType {
+    match kind {
+        CoreFileType::Directory => FuserFileType::Directory,
+        CoreFileType::Symlink => FuserFileType::Symlink,
+        CoreFileType::RegularFile => FuserFileType::RegularFile,
+        CoreFileType::BlockDevice => FuserFileType::BlockDevice,
+        CoreFileType::CharDevice => FuserFileType::CharDevice,
+        CoreFileType::NamedPipe => FuserFileType::NamedPipe,
+        CoreFileType::Socket => FuserFileType::Socket,
+    }
+}
+
+impl From<InodeKind> for FuserFileType {
+    fn from(value: InodeKind) -> Self {
+        match value {
+            InodeKind::Directory => FuserFileType::Directory,
+            InodeKind::Symlink => FuserFileType::Symlink,
+            InodeKind::File => FuserFileType::RegularFile,
+            InodeKind::BlockDevice => FuserFileType::BlockDevice,
+            InodeKind::CharDevice => FuserFileType::CharDevice,
+            InodeKind::NamedPipe => FuserFileType::NamedPipe,
+            InodeKind::Socket => FuserFileType::Socket,
+        }
+    }
+}
+
+fn fuser_attr_from_core(attr: CoreFileAttr, ino: InodeId) -> FuserFileAttr {
+    FuserFileAttr {
+        ino,
+        size: attr.size,
+        blocks: attr.blocks,
+        atime: attr.atime,
+        mtime: attr.mtime,
+        ctime: attr.ctime,
+        crtime: UNIX_EPOCH,
+        kind: fuser_file_type(attr.kind),
+        perm: attr.perm,
+        nlink: attr.nlink,
+        uid: attr.uid,
+        gid: attr.gid,
+        rdev: attr.rdev,
+        flags: 0,
+        blksize: attr.blksize,
+    }
+}
+
+fn backend_key_from_stat(stat: &nix::sys::stat::FileStat) -> BackendKey {
+    BackendKey {
+        dev: stat.st_dev,
+        ino: stat.st_ino,
     }
 }
 
@@ -3018,5 +3095,376 @@ impl PathFilesystem for LongNameFsV2 {
             return Err(fuse3::Errno::from(libc::EBADF));
         }
         Ok(ReplyPoll { revents: 0 })
+    }
+}
+
+pub struct LongNameFsV2Fuser {
+    core: Arc<LongNameFsCore>,
+    inode_store: InodeStore,
+    handles: V2HandleTable,
+    max_write: NonZeroU32,
+    attr_ttl: Duration,
+    entry_ttl: Duration,
+}
+
+impl LongNameFsV2Fuser {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        config: Config,
+        max_name_len: usize,
+        dir_cache_ttl: Option<Duration>,
+        max_write_kb: u32,
+        index_sync: IndexSync,
+        attr_ttl: Duration,
+    ) -> CoreResult<Self> {
+        let core = Arc::new(LongNameFsCore::new(
+            config,
+            max_name_len,
+            dir_cache_ttl,
+            index_sync,
+        )?);
+        let bytes = max_write_kb.saturating_mul(1024).max(4096);
+        let max_write = NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
+
+        let inode_store = InodeStore::new();
+        let root_fd = core.cached_root_fd()?;
+        let root_stat = fstat(root_fd.as_fd()).map_err(core_errno_from_nix)?;
+        let root_backend = backend_key_from_stat(&root_stat);
+        inode_store.init_root(root_backend);
+
+        Ok(Self {
+            core,
+            inode_store,
+            handles: V2HandleTable::new(),
+            max_write,
+            attr_ttl,
+            entry_ttl: attr_ttl,
+        })
+    }
+
+    fn attr_for_entry(&self, entry: &InodeEntry) -> CoreResult<FuserFileAttr> {
+        let attr = self.core.stat_path(&entry.path)?;
+        Ok(fuser_attr_from_core(attr, entry.ino))
+    }
+
+    fn parent_ino_for(&self, entry: &InodeEntry) -> InodeId {
+        entry
+            .parents
+            .first()
+            .map(|p| p.parent)
+            .unwrap_or(ROOT_INODE)
+    }
+
+    fn open_dir_handle(&self, entry: &InodeEntry) -> CoreResult<DirHandle> {
+        if entry.path == OsStr::new("/") {
+            let fd = open_backend_root(&self.core.config)?;
+            let index = load_dir_state(&self.core.index_cache, fd.as_fd())?;
+            return Ok(DirHandle::new(fd, index));
+        }
+        let mapped = self.core.resolve_path(&entry.path)?;
+        let fname = mapped.backend_name.as_cstring()?;
+        let fd = nix::fcntl::openat(
+            mapped.dir_fd.as_fd(),
+            fname.as_c_str(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(core_errno_from_nix)?;
+        let index = load_dir_state(&self.core.index_cache, fd.as_fd())?;
+        Ok(DirHandle::new(fd, index))
+    }
+
+    fn ensure_child_entry(
+        &self,
+        parent: InodeId,
+        parent_path: &OsStr,
+        name: &OsStr,
+        stat: nix::sys::stat::FileStat,
+        lookup_inc: u64,
+    ) -> InodeEntry {
+        let backend = backend_key_from_stat(&stat);
+        let attr = core_attr_from_stat(&stat);
+        let kind = InodeKind::from(attr.kind);
+        let path = crate::v2::path::make_child_path(parent_path, name);
+        self.inode_store.get_or_insert(
+            backend,
+            kind,
+            path,
+            Some(ParentName {
+                parent,
+                name: name.to_os_string(),
+            }),
+            lookup_inc,
+        )
+    }
+
+    fn open_backend_file(&self, entry: &InodeEntry, flags: u32) -> CoreResult<OwnedFd> {
+        let mapped = self.core.resolve_path(&entry.path)?;
+        let oflag = oflag_from_bits(flags) | OFlag::O_CLOEXEC;
+        let fname = mapped.backend_name.as_cstring()?;
+        nix::fcntl::openat(
+            mapped.dir_fd.as_fd(),
+            fname.as_c_str(),
+            oflag,
+            Mode::from_bits_truncate(0o666),
+        )
+        .map_err(core_errno_from_nix)
+    }
+}
+
+impl FuserFilesystem for LongNameFsV2Fuser {
+    fn init(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        config: &mut KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        let _ = config.set_max_write(self.max_write.get());
+        Ok(())
+    }
+
+    fn destroy(&mut self) {}
+
+    fn lookup(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        parent: u64,
+        name: &OsStr,
+        reply: FuserReplyEntry,
+    ) {
+        let Some(parent_entry) = self.inode_store.get(parent) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let child_path = crate::v2::path::make_child_path(&parent_entry.path, name);
+        let mapped = match self.core.resolve_path(&child_path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fname = match mapped.backend_name.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let stat = match fstatat(
+            mapped.dir_fd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        };
+        let child_entry = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 1);
+        let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child_entry.ino);
+        reply.entry(&self.entry_ttl, &attr, 0);
+    }
+
+    fn getattr(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        fh: Option<u64>,
+        reply: FuserReplyAttr,
+    ) {
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let result = if let Some(fh) = fh {
+            self.handles
+                .get_file(fh)
+                .and_then(|fd| fstat(fd.as_fd()).ok())
+                .map(|stat| fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino))
+                .ok_or(CoreError::NotFound)
+        } else {
+            self.attr_for_entry(&entry)
+        };
+        match result {
+            Ok(attr) => reply.attr(&self.attr_ttl, &attr),
+            Err(err) => reply.error(core_err_to_errno(&err)),
+        }
+    }
+
+    fn opendir(&mut self, _req: &FuserRequest<'_>, ino: u64, flags: i32, reply: FuserReplyOpen) {
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        if entry.kind != InodeKind::Directory {
+            reply.error(libc::ENOTDIR);
+            return;
+        }
+        match self.open_dir_handle(&entry) {
+            Ok(handle) => {
+                let fh = self.handles.insert_dir(handle);
+                let _ = self.inode_store.inc_open(ino);
+                reply.opened(fh, flags as u32);
+            }
+            Err(err) => reply.error(core_err_to_errno(&err)),
+        }
+    }
+
+    fn readdir(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        mut reply: FuserReplyDirectory,
+    ) {
+        let Some(dir_entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        let Some(handle) = self.handles.get_dir(fh) else {
+            reply.error(libc::EBADF);
+            return;
+        };
+
+        let mut entries: Vec<(InodeId, FuserFileType, OsString)> = Vec::new();
+        entries.push((ino, FuserFileType::Directory, OsString::from(".")));
+        let parent_ino = self.parent_ino_for(&dir_entry);
+        let parent_kind = self
+            .inode_store
+            .get(parent_ino)
+            .map(|p| p.kind.into())
+            .unwrap_or(FuserFileType::Directory);
+        entries.push((parent_ino, parent_kind, OsString::from("..")));
+
+        let dir_listing = self.core.load_dir_entries(&handle, false);
+        for info in dir_listing.iter() {
+            let c_name = match CString::new(info.backend_name.clone()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let stat = match fstatat(
+                handle.as_fd(),
+                c_name.as_c_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let child_entry = self.ensure_child_entry(ino, &dir_entry.path, &info.name, stat, 0);
+            let file_type = FuserFileType::from(child_entry.kind);
+            entries.push((child_entry.ino, file_type, info.name.clone()));
+        }
+
+        let mut index = offset.max(0) as usize;
+        while index < entries.len() {
+            let (child_ino, kind, name) = &entries[index];
+            let next = (index + 1) as i64;
+            if !reply.add(*child_ino, next, *kind, name) {
+                break;
+            }
+            index += 1;
+        }
+        reply.ok();
+    }
+
+    fn open(&mut self, _req: &FuserRequest<'_>, ino: u64, flags: i32, reply: FuserReplyOpen) {
+        let Some(entry) = self.inode_store.get(ino) else {
+            reply.error(libc::ESTALE);
+            return;
+        };
+        match self.open_backend_file(&entry, flags as u32) {
+            Ok(fd) => {
+                let fh = self.handles.insert_file(fd);
+                let _ = self.inode_store.inc_open(ino);
+                reply.opened(fh, 0);
+            }
+            Err(err) => reply.error(core_err_to_errno(&err)),
+        }
+    }
+
+    fn read(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: FuserReplyData,
+    ) {
+        let Some(handle) = self.handles.get_file(fh) else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        let mut buf = vec![0u8; size as usize];
+        match retry_eintr(|| pread(handle.as_fd(), &mut buf, offset)) {
+            Ok(read_len) => {
+                buf.truncate(read_len);
+                reply.data(&buf);
+            }
+            Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: FuserReplyWrite,
+    ) {
+        let Some(handle) = self.handles.get_file(fh) else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        match retry_eintr(|| pwrite(handle.as_fd(), data, offset)) {
+            Ok(written) => {
+                if self.core.config.sync_data() {
+                    let _ = fdatasync(handle.as_fd());
+                }
+                reply.written(written as u32);
+            }
+            Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
+        }
+    }
+
+    fn release(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: FuserReplyEmpty,
+    ) {
+        self.handles.remove(fh);
+        let _ = self.inode_store.dec_open(ino);
+        reply.ok();
+    }
+
+    fn releasedir(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        fh: u64,
+        _flags: i32,
+        reply: FuserReplyEmpty,
+    ) {
+        self.handles.remove(fh);
+        let _ = self.inode_store.dec_open(ino);
+        reply.ok();
+    }
+
+    fn forget(&mut self, _req: &FuserRequest<'_>, ino: u64, nlookup: u64) {
+        let _ = self.inode_store.dec_lookup(ino, nlookup);
     }
 }
