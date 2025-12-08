@@ -9,3 +9,6 @@ pub mod error;
 pub mod fs;
 pub mod index;
 pub mod path;
+
+#[allow(unused_imports)]
+pub use fs::{IndexSync, LongNameFsCore, LongNameFsV2};

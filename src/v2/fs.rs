@@ -3,6 +3,7 @@ use crate::util::{
     access_mask_from_bits, begin_temp_file, errno_from_nix, file_attr_from_stat,
     file_type_from_mode, oflag_from_bits, retry_eintr, string_to_cstring,
 };
+use crate::v2::error::{CoreError, CoreResult, core_err_to_errno, core_error_from_fuse};
 use crate::v2::index::{DirIndex, INDEX_NAME, read_dir_index, write_dir_index};
 use crate::v2::path::{
     INTERNAL_PREFIX, MAX_COLLISION_SUFFIX, SegmentKind, backend_basename_from_hash,
@@ -30,6 +31,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::num::NonZeroU32;
+use std::ops::Deref;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::mpsc;
@@ -44,6 +46,14 @@ const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const JOURNAL_NAME: &str = ".ln2_journal";
 const PARALLEL_REBUILD_THRESHOLD: usize = 64;
 const PARALLEL_REBUILD_WORKERS: usize = 4;
+
+fn core_errno_from_nix(err: nix::Error) -> CoreError {
+    core_error_from_fuse(errno_from_nix(err))
+}
+
+fn core_string_to_cstring(value: &str) -> CoreResult<CString> {
+    string_to_cstring(value).map_err(core_error_from_fuse)
+}
 
 fn is_internal_meta(raw: &[u8]) -> bool {
     raw == INDEX_NAME.as_bytes() || raw == JOURNAL_NAME.as_bytes()
@@ -60,7 +70,7 @@ pub enum IndexSync {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-struct DirCacheKey {
+pub(crate) struct DirCacheKey {
     dev: u64,
     ino: u64,
 }
@@ -164,7 +174,7 @@ fn dir_cache_key(fd: BorrowedFd<'_>) -> Option<DirCacheKey> {
 }
 
 #[derive(Debug, Clone)]
-struct DirEntryInfo {
+pub(crate) struct DirEntryInfo {
     name: OsString,
     kind: FileType,
     attr: Option<fuse3::path::reply::FileAttr>,
@@ -347,8 +357,8 @@ impl IndexCache {
         }
     }
 
-    fn get_or_load(&self, dir_fd: BorrowedFd<'_>) -> Result<Arc<RwLock<IndexState>>, fuse3::Errno> {
-        let key = dir_cache_key(dir_fd).ok_or_else(fuse3::Errno::new_not_exist)?;
+    fn get_or_load(&self, dir_fd: BorrowedFd<'_>) -> CoreResult<Arc<RwLock<IndexState>>> {
+        let key = dir_cache_key(dir_fd).ok_or(CoreError::NotFound)?;
         {
             let entries = self.entries.lock();
             if let Some(entry) = entries.get(&key) {
@@ -388,7 +398,7 @@ struct DirState {
 }
 
 #[derive(Debug)]
-struct DirHandle {
+pub(crate) struct DirHandle {
     fd: OwnedFd,
     state: RwLock<DirState>,
     cache_key: Option<DirCacheKey>,
@@ -486,18 +496,18 @@ impl V2HandleTable {
 }
 
 #[derive(Debug, Clone)]
-enum BackendName {
+pub(crate) enum BackendName {
     Short(Vec<u8>),
     Internal(String),
 }
 
 impl BackendName {
-    fn as_cstring(&self) -> Result<CString, fuse3::Errno> {
+    fn as_cstring(&self) -> CoreResult<CString> {
         match self {
             BackendName::Short(raw) => {
-                CString::new(raw.clone()).map_err(|_| fuse3::Errno::from(libc::EINVAL))
+                CString::new(raw.clone()).map_err(|_| CoreError::from_errno(libc::EINVAL))
             }
-            BackendName::Internal(name) => string_to_cstring(name),
+            BackendName::Internal(name) => core_string_to_cstring(name),
         }
     }
 
@@ -514,7 +524,7 @@ impl BackendName {
 }
 
 #[derive(Debug)]
-struct Ln2Path {
+pub(crate) struct Ln2Path {
     dir_fd: Arc<OwnedFd>,
     backend_name: BackendName,
     raw_name: Vec<u8>,
@@ -522,7 +532,7 @@ struct Ln2Path {
 }
 
 #[derive(Debug)]
-struct ParentCtx {
+pub(crate) struct ParentCtx {
     dir_fd: Arc<OwnedFd>,
     state: DirState,
 }
@@ -538,16 +548,16 @@ struct ResolvedPath {
 }
 
 #[derive(Debug)]
-struct RenameTarget {
+pub(crate) struct RenameTarget {
     ctx: ParentCtx,
     path: ResolvedPath,
 }
 
-fn cstring_from_bytes(bytes: &[u8]) -> Result<CString, fuse3::Errno> {
-    CString::new(bytes.to_vec()).map_err(|_| fuse3::Errno::from(libc::EINVAL))
+fn cstring_from_bytes(bytes: &[u8]) -> CoreResult<CString> {
+    CString::new(bytes.to_vec()).map_err(|_| CoreError::from_errno(libc::EINVAL))
 }
 
-fn set_internal_rawname(fd: BorrowedFd<'_>, raw: &[u8]) -> Result<(), fuse3::Errno> {
+fn set_internal_rawname(fd: BorrowedFd<'_>, raw: &[u8]) -> CoreResult<()> {
     let name = CString::new(RAWNAME_XATTR.as_bytes()).unwrap();
     let res = unsafe {
         libc::fsetxattr(
@@ -562,14 +572,14 @@ fn set_internal_rawname(fd: BorrowedFd<'_>, raw: &[u8]) -> Result<(), fuse3::Err
         let err = io::Error::last_os_error();
         let raw_err = err.raw_os_error().unwrap_or(libc::EIO);
         if raw_err == libc::ENOSPC || raw_err == libc::E2BIG {
-            return Err(fuse3::Errno::from(libc::ENAMETOOLONG));
+            return Err(CoreError::NameTooLong);
         }
-        return Err(fuse3::Errno::from(raw_err));
+        return Err(CoreError::from_errno(raw_err));
     }
     Ok(())
 }
 
-fn get_internal_rawname(fd: BorrowedFd<'_>) -> Result<Vec<u8>, fuse3::Errno> {
+fn get_internal_rawname(fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
     let name = CString::new(RAWNAME_XATTR.as_bytes()).unwrap();
     let res = unsafe { libc::fgetxattr(fd.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
     if res < 0 {
@@ -591,26 +601,27 @@ fn get_internal_rawname(fd: BorrowedFd<'_>) -> Result<Vec<u8>, fuse3::Errno> {
     Ok(buf)
 }
 
-fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> Result<(), fuse3::Errno> {
-    let fname = string_to_cstring(".ln2_xattr_check.tmp")?;
+fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
+    let fname = core_string_to_cstring(".ln2_xattr_check.tmp")?;
     let fd = nix::fcntl::openat(
         dir_fd,
         fname.as_c_str(),
         OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
         Mode::from_bits_truncate(0o600),
     )
-    .map_err(errno_from_nix)?;
+    .map_err(core_errno_from_nix)?;
     let res = set_internal_rawname(fd.as_fd(), b"probe");
     let _ = unlinkat(dir_fd, fname.as_c_str(), UnlinkatFlags::NoRemoveDir);
     res
 }
 
-fn probe_renameat2(dir_fd: BorrowedFd<'_>) -> Result<bool, fuse3::Errno> {
-    let final_name = string_to_cstring(".__ln2_renameat2_probe")?;
-    let temp = begin_temp_file(dir_fd, final_name.as_c_str(), "rn2")?;
+fn probe_renameat2(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
+    let final_name = core_string_to_cstring(".__ln2_renameat2_probe")?;
+    let temp =
+        begin_temp_file(dir_fd, final_name.as_c_str(), "rn2").map_err(core_error_from_fuse)?;
     let mut dst_bytes = temp.name.as_bytes().to_vec();
     dst_bytes.extend_from_slice(b".dst");
-    let dst_name = CString::new(dst_bytes).map_err(|_| fuse3::Errno::from(libc::EINVAL))?;
+    let dst_name = CString::new(dst_bytes).map_err(|_| CoreError::from_errno(libc::EINVAL))?;
     let res = renameat2(
         dir_fd,
         temp.name.as_c_str(),
@@ -625,18 +636,18 @@ fn probe_renameat2(dir_fd: BorrowedFd<'_>) -> Result<bool, fuse3::Errno> {
         Err(
             nix::errno::Errno::ENOSYS | nix::errno::Errno::EINVAL | nix::errno::Errno::EOPNOTSUPP,
         ) => Ok(false),
-        Err(err) => Err(errno_from_nix(err)),
+        Err(err) => Err(core_errno_from_nix(err)),
     }
 }
 
-fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> Result<DirIndex, fuse3::Errno> {
+fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex> {
     let mut dir = Dir::openat(
         dir_fd,
         ".",
         OFlag::O_RDONLY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
-    .map_err(errno_from_nix)?;
+    .map_err(core_errno_from_nix)?;
 
     let mut internal = Vec::new();
     for entry in dir.iter() {
@@ -748,7 +759,7 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> Result<DirIndex, fu
     Ok(index)
 }
 
-fn load_dir_state(cache: &IndexCache, dir_fd: BorrowedFd<'_>) -> Result<DirState, fuse3::Errno> {
+fn load_dir_state(cache: &IndexCache, dir_fd: BorrowedFd<'_>) -> CoreResult<DirState> {
     let index = cache.get_or_load(dir_fd)?;
     Ok(DirState {
         index,
@@ -767,7 +778,7 @@ fn maybe_flush_index(
     dir_fd: BorrowedFd<'_>,
     state: &mut DirState,
     strategy: IndexSync,
-) -> Result<(), fuse3::Errno> {
+) -> CoreResult<()> {
     let mut guard = state.index.write();
     let should_flush = match strategy {
         IndexSync::Always => guard.index.is_dirty(),
@@ -795,7 +806,7 @@ fn list_logical_entries(
     max_name_len: usize,
     index_sync: IndexSync,
     need_attr: bool,
-) -> Result<Vec<DirEntryInfo>, fuse3::Errno> {
+) -> CoreResult<Vec<DirEntryInfo>> {
     let dir_fd = handle.as_fd();
     let mut dir = Dir::openat(
         dir_fd,
@@ -803,7 +814,7 @@ fn list_logical_entries(
         OFlag::O_RDONLY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
-    .map_err(errno_from_nix)?;
+    .map_err(core_errno_from_nix)?;
 
     let mut state = handle.state.write();
     let mut entries = Vec::new();
@@ -933,12 +944,12 @@ fn map_long_for_lookup(
     dir_fd: BorrowedFd<'_>,
     state: &mut DirState,
     raw: &[u8],
-) -> Result<String, fuse3::Errno> {
+) -> CoreResult<String> {
     if let Some(entry) = {
         let guard = state.index.read();
         guard.index.backend_for_raw(raw).cloned()
     } {
-        let c_name = string_to_cstring(&entry)?;
+        let c_name = core_string_to_cstring(&entry)?;
         match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(_) => return Ok(entry),
             Err(nix::errno::Errno::ENOENT) => {
@@ -949,14 +960,14 @@ fn map_long_for_lookup(
                 }
                 state.attr_cache.clear();
             }
-            Err(err) => return Err(errno_from_nix(err)),
+            Err(err) => return Err(core_errno_from_nix(err)),
         }
     }
 
     let hash = encode_long_name(raw);
     for suffix in 0..=MAX_COLLISION_SUFFIX {
         let candidate = backend_basename_from_hash(&hash, (suffix != 0).then_some(suffix));
-        let c_name = string_to_cstring(&candidate)?;
+        let c_name = core_string_to_cstring(&candidate)?;
         match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(_) => {
                 let fd = nix::fcntl::openat(
@@ -965,7 +976,7 @@ fn map_long_for_lookup(
                     OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                     Mode::empty(),
                 )
-                .map_err(errno_from_nix)?;
+                .map_err(core_errno_from_nix)?;
                 if let Ok(raw_name) = get_internal_rawname(fd.as_fd())
                     && raw_name == raw
                 {
@@ -979,11 +990,11 @@ fn map_long_for_lookup(
                 }
             }
             Err(nix::errno::Errno::ENOENT) => continue,
-            Err(err) => return Err(errno_from_nix(err)),
+            Err(err) => return Err(core_errno_from_nix(err)),
         }
     }
 
-    Err(fuse3::Errno::from(libc::ENOENT))
+    Err(CoreError::NotFound)
 }
 
 fn map_segment_for_lookup(
@@ -991,12 +1002,12 @@ fn map_segment_for_lookup(
     state: &mut DirState,
     raw: &[u8],
     max_name_len: usize,
-) -> Result<(BackendName, SegmentKind), fuse3::Errno> {
+) -> CoreResult<(BackendName, SegmentKind)> {
     if is_internal_meta(raw) {
-        return Err(fuse3::Errno::from(libc::EPERM));
+        return Err(CoreError::InternalMeta);
     }
     if is_reserved_prefix(raw) {
-        return Err(fuse3::Errno::from(libc::EPERM));
+        return Err(CoreError::ReservedPrefix);
     }
     let kind = classify_segment(raw, max_name_len)?;
     match kind {
@@ -1012,9 +1023,9 @@ fn map_segment_for_create(
     state: &DirState,
     raw: &[u8],
     max_name_len: usize,
-) -> Result<(BackendName, SegmentKind), fuse3::Errno> {
+) -> CoreResult<(BackendName, SegmentKind)> {
     if is_internal_meta(raw) {
-        return Err(fuse3::Errno::from(libc::EPERM));
+        return Err(CoreError::InternalMeta);
     }
     let kind = classify_segment(raw, max_name_len)?;
     match kind {
@@ -1027,7 +1038,7 @@ fn map_segment_for_create(
                 guard.index.get(&base).map(|e| e.raw_name.clone())
             } && entry_raw == raw
             {
-                return Err(fuse3::Errno::from(libc::EEXIST));
+                return Err(CoreError::AlreadyExists);
             }
             let has_base = {
                 let guard = state.index.read();
@@ -1045,12 +1056,12 @@ fn map_segment_for_create(
                 match entry_raw {
                     None => return Ok((BackendName::Internal(candidate), kind)),
                     Some(existing) if existing == raw => {
-                        return Err(fuse3::Errno::from(libc::EEXIST));
+                        return Err(CoreError::AlreadyExists);
                     }
                     Some(_) => continue,
                 }
             }
-            Err(fuse3::Errno::from(libc::ENOSPC))
+            Err(CoreError::NoSpace)
         }
     }
 }
@@ -1058,7 +1069,7 @@ fn map_segment_for_create(
 fn select_backend_for_long_name(
     dir_index: &mut DirIndex,
     logical_raw: &[u8],
-) -> Result<String, fuse3::Errno> {
+) -> CoreResult<String> {
     let hash = encode_long_name(logical_raw);
     if let Some(existing) = dir_index.backend_for_raw(logical_raw) {
         return Ok(existing.clone());
@@ -1073,7 +1084,7 @@ fn select_backend_for_long_name(
             return Ok(candidate);
         }
     }
-    Err(fuse3::Errno::from(libc::ENOSPC))
+    Err(CoreError::NoSpace)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1087,15 +1098,15 @@ fn handle_backend_eexist_index_missing(
     state: &mut DirState,
     backend_name: &str,
     desired_raw: &[u8],
-) -> Result<CreateDecision, fuse3::Errno> {
-    let c_name = string_to_cstring(backend_name)?;
+) -> CoreResult<CreateDecision> {
+    let c_name = core_string_to_cstring(backend_name)?;
     let fd = nix::fcntl::openat(
         dir_fd,
         c_name.as_c_str(),
         OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
     )
-    .map_err(errno_from_nix)?;
+    .map_err(core_errno_from_nix)?;
     let existing_raw = get_internal_rawname(fd.as_fd())?;
     {
         let mut guard = state.index.write();
@@ -1116,15 +1127,15 @@ fn refresh_dir_index_from_backend(
     dir_fd: BorrowedFd<'_>,
     guard: &mut RwLockWriteGuard<'_, IndexState>,
     backend_name: &str,
-) -> Result<Vec<u8>, fuse3::Errno> {
-    let c_name = string_to_cstring(backend_name)?;
+) -> CoreResult<Vec<u8>> {
+    let c_name = core_string_to_cstring(backend_name)?;
     let fd = nix::fcntl::openat(
         dir_fd,
         c_name.as_c_str(),
         OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
     )
-    .map_err(errno_from_nix)?;
+    .map_err(core_errno_from_nix)?;
     let raw = get_internal_rawname(fd.as_fd())?;
     guard.index.upsert(backend_name.to_owned(), raw.clone());
     guard.pending = guard.pending.saturating_add(1);
@@ -1149,71 +1160,74 @@ fn path_segments(path: &OsStr) -> Vec<Vec<u8>> {
     out
 }
 
-fn open_backend_root(config: &Config) -> Result<OwnedFd, fuse3::Errno> {
+fn open_backend_root(config: &Config) -> CoreResult<OwnedFd> {
     nix::fcntl::openat(
         config.backend_fd(),
         ".",
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
-    .map_err(errno_from_nix)
+    .map_err(core_errno_from_nix)
 }
 
-pub struct LongNameFsV2 {
+pub struct LongNameFsCore {
     pub config: Arc<Config>,
-    handles: V2HandleTable,
     dir_cache: DirCache,
     dir_fd_cache: DirFdCache,
     index_cache: IndexCache,
-    max_write: NonZeroU32,
     max_name_len: usize,
     index_sync: IndexSync,
     supports_renameat2: bool,
+}
+
+pub struct LongNameFsV2 {
+    pub core: Arc<LongNameFsCore>,
+    handles: V2HandleTable,
+    max_write: NonZeroU32,
     attr_ttl: Duration,
 }
 
-impl LongNameFsV2 {
+impl Deref for LongNameFsV2 {
+    type Target = LongNameFsCore;
+
+    fn deref(&self) -> &Self::Target {
+        self.core.as_ref()
+    }
+}
+
+impl LongNameFsCore {
     pub fn new(
         config: Config,
         max_name_len: usize,
         dir_cache_ttl: Option<Duration>,
-        max_write_kb: u32,
         index_sync: IndexSync,
-        attr_ttl: Duration,
-    ) -> Result<Self, fuse3::Errno> {
+    ) -> CoreResult<Self> {
         verify_backend_supports_xattr(config.backend_fd())?;
         let supports_renameat2 = probe_renameat2(config.backend_fd())?;
-        let bytes = max_write_kb.saturating_mul(1024).max(4096);
-        let max_write = NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
         Ok(Self {
             config: Arc::new(config),
-            handles: V2HandleTable::new(),
             dir_cache: DirCache::new(dir_cache_ttl),
             dir_fd_cache: DirFdCache::new(dir_cache_ttl),
             index_cache: IndexCache::new(),
-            max_write,
             max_name_len,
             index_sync,
             supports_renameat2,
-            attr_ttl,
         })
     }
 
-    fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
+    pub(crate) fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
         if let Some(key) = dir_cache_key(dir_fd) {
             self.invalidate_dir_by_key(key);
         }
     }
 
-    fn invalidate_dir_by_key(&self, key: DirCacheKey) {
+    pub(crate) fn invalidate_dir_by_key(&self, key: DirCacheKey) {
         self.dir_cache.invalidate(key);
         self.dir_fd_cache.invalidate(key);
-        self.handles.clear_dir_attr_cache(key);
     }
 
-    fn cached_root_fd(&self) -> Result<Arc<OwnedFd>, fuse3::Errno> {
-        let key =
-            dir_cache_key(self.config.backend_fd()).ok_or_else(fuse3::Errno::new_not_exist)?;
+    pub(crate) fn cached_root_fd(&self) -> CoreResult<Arc<OwnedFd>> {
+        let key = dir_cache_key(self.config.backend_fd()).ok_or(CoreError::NotFound)?;
         if let Some(fd) = self.dir_fd_cache.get(key) {
             return Ok(fd);
         }
@@ -1221,16 +1235,16 @@ impl LongNameFsV2 {
         Ok(self.dir_fd_cache.insert(key, fd))
     }
 
-    fn open_dir_cached(
+    pub(crate) fn open_dir_cached(
         &self,
         parent_fd: BorrowedFd<'_>,
         backend: &BackendName,
-    ) -> Result<Arc<OwnedFd>, fuse3::Errno> {
+    ) -> CoreResult<Arc<OwnedFd>> {
         let c_name = backend.as_cstring()?;
         let stat = fstatat(parent_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
-            .map_err(errno_from_nix)?;
+            .map_err(core_errno_from_nix)?;
         if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
-            return Err(fuse3::Errno::from(libc::ENOTDIR));
+            return Err(CoreError::NotDir);
         }
         let key = DirCacheKey {
             dev: stat.st_dev,
@@ -1245,11 +1259,15 @@ impl LongNameFsV2 {
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
             Mode::empty(),
         )
-        .map_err(errno_from_nix)?;
+        .map_err(core_errno_from_nix)?;
         Ok(self.dir_fd_cache.insert(key, fd))
     }
 
-    fn load_dir_entries(&self, handle: &Arc<DirHandle>, need_attr: bool) -> Arc<Vec<DirEntryInfo>> {
+    pub(crate) fn load_dir_entries(
+        &self,
+        handle: &Arc<DirHandle>,
+        need_attr: bool,
+    ) -> Arc<Vec<DirEntryInfo>> {
         let key = dir_cache_key(handle.as_fd());
         if let Some(cache_key) = key
             && let Some(hit) = self.dir_cache.get(cache_key)
@@ -1266,14 +1284,14 @@ impl LongNameFsV2 {
         Arc::new(logical)
     }
 
-    fn stat_path(&self, path: &OsStr) -> Result<fuse3::path::reply::FileAttr, fuse3::Errno> {
+    pub(crate) fn stat_path(&self, path: &OsStr) -> CoreResult<fuse3::path::reply::FileAttr> {
         if path == OsStr::new("/") {
             let stat = fstatat(
                 self.config.backend_fd(),
                 "",
                 AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW,
             )
-            .map_err(errno_from_nix)?;
+            .map_err(core_errno_from_nix)?;
             return Ok(file_attr_from_stat(&stat));
         }
         let mapped = self.resolve_path(path)?;
@@ -1283,11 +1301,11 @@ impl LongNameFsV2 {
             fname.as_c_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )
-        .map_err(errno_from_nix)?;
+        .map_err(core_errno_from_nix)?;
         Ok(file_attr_from_stat(&stat))
     }
 
-    fn resolve_dir(&self, path: &OsStr) -> Result<ParentCtx, fuse3::Errno> {
+    pub(crate) fn resolve_dir(&self, path: &OsStr) -> CoreResult<ParentCtx> {
         if path == OsStr::new("/") {
             let dir_fd = self.cached_root_fd()?;
             let state = load_dir_state(&self.index_cache, dir_fd.as_fd())?;
@@ -1295,7 +1313,7 @@ impl LongNameFsV2 {
         }
         let mut segs = path_segments(path);
         if segs.is_empty() {
-            return Err(fuse3::Errno::new_not_exist());
+            return Err(CoreError::NotFound);
         }
 
         let mut dir_fd = self.cached_root_fd()?;
@@ -1311,14 +1329,14 @@ impl LongNameFsV2 {
         Ok(ParentCtx { dir_fd, state })
     }
 
-    fn resolve_path(&self, path: &OsStr) -> Result<Ln2Path, fuse3::Errno> {
+    pub(crate) fn resolve_path(&self, path: &OsStr) -> CoreResult<Ln2Path> {
         if path == OsStr::new("/") {
-            return Err(fuse3::Errno::from(libc::EFAULT));
+            return Err(CoreError::from_errno(libc::EFAULT));
         }
 
         let segments = path_segments(path);
         if segments.is_empty() {
-            return Err(fuse3::Errno::new_not_exist());
+            return Err(CoreError::NotFound);
         }
         let mut dir_fd = self.cached_root_fd()?;
         for seg in segments[..segments.len() - 1].iter() {
@@ -1344,19 +1362,18 @@ impl LongNameFsV2 {
         })
     }
 
-    fn resolve_path_for_rename(
+    pub(crate) fn resolve_path_for_rename(
         &self,
         parent: &OsStr,
         name: &OsStr,
-    ) -> Result<RenameTarget, fuse3::Errno> {
+    ) -> CoreResult<RenameTarget> {
         let mut ctx = self.resolve_dir(parent)?;
         let logical_name = normalize_osstr(name);
         if is_internal_meta(&logical_name) {
-            return Err(fuse3::Errno::from(libc::EPERM));
+            return Err(CoreError::InternalMeta);
         }
         let kind = classify_segment(&logical_name, self.max_name_len)?;
-        let parent_key =
-            dir_cache_key(ctx.dir_fd.as_fd()).ok_or_else(fuse3::Errno::new_not_exist)?;
+        let parent_key = dir_cache_key(ctx.dir_fd.as_fd()).ok_or(CoreError::NotFound)?;
         let map_res = map_segment_for_lookup(
             ctx.dir_fd.as_fd(),
             &mut ctx.state,
@@ -1366,7 +1383,7 @@ impl LongNameFsV2 {
         maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.index_sync)?;
         let (backend_name, exists) = match map_res {
             Ok((backend, _)) => (Some(backend), true),
-            Err(err) if err.is_not_exist() => (None, false),
+            Err(CoreError::NotFound) => (None, false),
             Err(err) => return Err(err),
         };
 
@@ -1384,25 +1401,25 @@ impl LongNameFsV2 {
         })
     }
 
-    fn do_backend_rename(
+    pub(crate) fn do_backend_rename(
         &self,
         src_dir: BorrowedFd<'_>,
         src_backend: &BackendName,
         dst_dir: BorrowedFd<'_>,
         dst_backend: &BackendName,
         flags: u32,
-    ) -> Result<(), fuse3::Errno> {
+    ) -> CoreResult<()> {
         let src_c = src_backend.as_cstring()?;
         let dst_c = dst_backend.as_cstring()?;
         if flags == 0 {
             return renameat(src_dir, src_c.as_c_str(), dst_dir, dst_c.as_c_str())
-                .map_err(errno_from_nix);
+                .map_err(core_errno_from_nix);
         }
         if !self.supports_renameat2 {
-            return Err(fuse3::Errno::from(libc::EOPNOTSUPP));
+            return Err(CoreError::Unsupported);
         }
         let rename_flags =
-            RenameFlags::from_bits(flags).ok_or_else(|| fuse3::Errno::from(libc::EINVAL))?;
+            RenameFlags::from_bits(flags).ok_or_else(|| CoreError::from_errno(libc::EINVAL))?;
         renameat2(
             src_dir,
             src_c.as_c_str(),
@@ -1410,7 +1427,42 @@ impl LongNameFsV2 {
             dst_c.as_c_str(),
             rename_flags,
         )
-        .map_err(errno_from_nix)
+        .map_err(core_errno_from_nix)
+    }
+}
+
+impl LongNameFsV2 {
+    pub fn new(
+        config: Config,
+        max_name_len: usize,
+        dir_cache_ttl: Option<Duration>,
+        max_write_kb: u32,
+        index_sync: IndexSync,
+        attr_ttl: Duration,
+    ) -> Result<Self, fuse3::Errno> {
+        let core = LongNameFsCore::new(config, max_name_len, dir_cache_ttl, index_sync)
+            .map_err(fuse3::Errno::from)?;
+        let bytes = max_write_kb.saturating_mul(1024).max(4096);
+        let max_write = NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
+        Ok(Self {
+            core: Arc::new(core),
+            handles: V2HandleTable::new(),
+            max_write,
+            attr_ttl,
+        })
+    }
+
+    fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
+        if let Some(key) = dir_cache_key(dir_fd) {
+            self.invalidate_dir_by_key(key);
+        } else {
+            self.core.invalidate_dir(dir_fd);
+        }
+    }
+
+    fn invalidate_dir_by_key(&self, key: DirCacheKey) {
+        self.core.invalidate_dir_by_key(key);
+        self.handles.clear_dir_attr_cache(key);
     }
 
     fn rename_short_to_short(
@@ -1418,12 +1470,8 @@ impl LongNameFsV2 {
         src: &RenameTarget,
         dst: &RenameTarget,
         flags: u32,
-    ) -> Result<(), fuse3::Errno> {
-        let src_backend = src
-            .path
-            .backend_name
-            .as_ref()
-            .ok_or_else(fuse3::Errno::new_not_exist)?;
+    ) -> CoreResult<()> {
+        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
         let dst_backend = BackendName::Short(dst.path.logical_name.clone());
         self.do_backend_rename(
             src.ctx.dir_fd.as_fd(),
@@ -1444,12 +1492,8 @@ impl LongNameFsV2 {
         src: &mut RenameTarget,
         dst: &mut RenameTarget,
         flags: u32,
-    ) -> Result<(), fuse3::Errno> {
-        let src_backend = src
-            .path
-            .backend_name
-            .as_ref()
-            .ok_or_else(fuse3::Errno::new_not_exist)?;
+    ) -> CoreResult<()> {
+        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
         let mut dst_internal = {
             let mut guard = dst.ctx.state.index.write();
             select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
@@ -1469,9 +1513,9 @@ impl LongNameFsV2 {
                 OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY,
                 Mode::empty(),
             )
-            .map_err(errno_from_nix)?,
-            Err(nix::errno::Errno::ELOOP) => return Err(fuse3::Errno::from(libc::ELOOP)),
-            Err(err) => return Err(errno_from_nix(err)),
+            .map_err(core_errno_from_nix)?,
+            Err(nix::errno::Errno::ELOOP) => return Err(CoreError::from_errno(libc::ELOOP)),
+            Err(err) => return Err(core_errno_from_nix(err)),
         };
         set_internal_rawname(src_fd.as_fd(), &dst.path.logical_name)?;
 
@@ -1486,7 +1530,7 @@ impl LongNameFsV2 {
             );
             match rename_res {
                 Ok(()) => break,
-                Err(err) if err == fuse3::Errno::from(libc::EEXIST) => {
+                Err(err) if core_err_to_errno(&err) == libc::EEXIST => {
                     if attempt > 0 {
                         return Err(err);
                     }
@@ -1525,12 +1569,8 @@ impl LongNameFsV2 {
         src: &mut RenameTarget,
         dst: &mut RenameTarget,
         flags: u32,
-    ) -> Result<(), fuse3::Errno> {
-        let src_backend = src
-            .path
-            .backend_name
-            .as_ref()
-            .ok_or_else(fuse3::Errno::new_not_exist)?;
+    ) -> CoreResult<()> {
+        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
         let dst_backend = BackendName::Short(dst.path.logical_name.clone());
         self.do_backend_rename(
             src.ctx.dir_fd.as_fd(),
@@ -1558,12 +1598,8 @@ impl LongNameFsV2 {
         src: &mut RenameTarget,
         dst: &mut RenameTarget,
         flags: u32,
-    ) -> Result<(), fuse3::Errno> {
-        let src_backend = src
-            .path
-            .backend_name
-            .as_ref()
-            .ok_or_else(fuse3::Errno::new_not_exist)?;
+    ) -> CoreResult<()> {
+        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
         let same_dir = src.path.parent_key == dst.path.parent_key;
         let mut dst_internal = {
             let mut guard = dst.ctx.state.index.write();
@@ -1581,7 +1617,7 @@ impl LongNameFsV2 {
             );
             match res {
                 Ok(()) => break,
-                Err(err) if err == fuse3::Errno::from(libc::EEXIST) => {
+                Err(err) if core_err_to_errno(&err) == libc::EEXIST => {
                     if attempt > 0 {
                         return Err(err);
                     }
@@ -1608,7 +1644,7 @@ impl LongNameFsV2 {
             OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
         )
-        .map_err(errno_from_nix)?;
+        .map_err(core_errno_from_nix)?;
         set_internal_rawname(dst_fd.as_fd(), &dst.path.logical_name)?;
 
         let src_backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
@@ -1664,17 +1700,17 @@ impl LongNameFsV2 {
         parent: &OsStr,
         name: &OsStr,
         flags: u32,
-    ) -> Result<(), fuse3::Errno> {
+    ) -> CoreResult<()> {
         if flags != 0 && flags != libc::RENAME_NOREPLACE {
-            return Err(fuse3::Errno::from(libc::EOPNOTSUPP));
+            return Err(CoreError::Unsupported);
         }
         if flags != 0 && !self.supports_renameat2 {
-            return Err(fuse3::Errno::from(libc::EOPNOTSUPP));
+            return Err(CoreError::Unsupported);
         }
 
         let mut src = self.resolve_path_for_rename(origin_parent, origin_name)?;
         if !src.path.exists {
-            return Err(fuse3::Errno::new_not_exist());
+            return Err(CoreError::NotFound);
         }
         let mut dst = self.resolve_path_for_rename(parent, name)?;
 
@@ -2105,6 +2141,8 @@ impl PathFilesystem for LongNameFsV2 {
         name: &OsStr,
     ) -> Result<(), fuse3::Errno> {
         self.rename_with_flags(origin_parent, origin_name, parent, name, 0)
+            .map_err(fuse3::Errno::from)?;
+        Ok(())
     }
 
     async fn rename2(
@@ -2117,6 +2155,8 @@ impl PathFilesystem for LongNameFsV2 {
         flags: u32,
     ) -> Result<(), fuse3::Errno> {
         self.rename_with_flags(origin_parent, origin_name, parent, name, flags)
+            .map_err(fuse3::Errno::from)?;
+        Ok(())
     }
 
     async fn link(
@@ -2700,7 +2740,7 @@ impl PathFilesystem for LongNameFsV2 {
                 let c_name = match cstring_from_bytes(&entry.backend_name) {
                     Ok(v) => v,
                     Err(err) => {
-                        entries.push(Err(err));
+                        entries.push(Err(err.into()));
                         continue;
                     }
                 };

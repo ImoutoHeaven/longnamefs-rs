@@ -6,7 +6,7 @@ mod pathmap;
 mod util;
 mod v2;
 
-use crate::v2::fs::{IndexSync, LongNameFsV2};
+use crate::v2::{IndexSync, LongNameFsV2};
 use clap::{Parser, ValueEnum};
 use config::Config;
 use fs::LongNameFs;
