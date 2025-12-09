@@ -19,12 +19,12 @@ use fuse3::path::reply::{DirectoryEntryPlus, ReplyPoll, ReplyXAttr};
 use fuse3::{FileType, SetAttr};
 use fuser::{
     FileAttr as FuserFileAttr, FileType as FuserFileType, Filesystem as FuserFilesystem,
-    KernelConfig, ReplyAttr as FuserReplyAttr, ReplyCreate as FuserReplyCreate,
-    ReplyData as FuserReplyData, ReplyDirectory as FuserReplyDirectory,
-    ReplyDirectoryPlus as FuserReplyDirectoryPlus, ReplyEmpty as FuserReplyEmpty,
-    ReplyEntry as FuserReplyEntry, ReplyOpen as FuserReplyOpen, ReplyStatfs as FuserReplyStatfs,
-    ReplyWrite as FuserReplyWrite, ReplyXattr as FuserReplyXattr, Request as FuserRequest,
-    TimeOrNow,
+    KernelConfig, PollHandle as FuserPollHandle, ReplyAttr as FuserReplyAttr,
+    ReplyCreate as FuserReplyCreate, ReplyData as FuserReplyData,
+    ReplyDirectory as FuserReplyDirectory, ReplyDirectoryPlus as FuserReplyDirectoryPlus,
+    ReplyEmpty as FuserReplyEmpty, ReplyEntry as FuserReplyEntry, ReplyOpen as FuserReplyOpen,
+    ReplyPoll as FuserReplyPoll, ReplyStatfs as FuserReplyStatfs, ReplyWrite as FuserReplyWrite,
+    ReplyXattr as FuserReplyXattr, Request as FuserRequest, TimeOrNow,
 };
 use nix::dir::Dir;
 use nix::fcntl::{AtFlags, OFlag, RenameFlags, readlinkat, renameat, renameat2};
@@ -44,7 +44,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::num::NonZeroU32;
 use std::ops::Deref;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::sync::mpsc;
@@ -1442,6 +1442,23 @@ fn open_backend_root(config: &Config) -> CoreResult<OwnedFd> {
     .map_err(core_errno_from_nix)
 }
 
+fn raw_fd_for_xattr(core: &LongNameFsCore, path: &OsStr) -> CoreResult<(RawFd, Option<OwnedFd>)> {
+    if path == OsStr::new("/") {
+        return Ok((core.config.backend_fd().as_raw_fd(), None));
+    }
+    let mapped = core.resolve_path(path)?;
+    let fname = mapped.backend_name.as_cstring()?;
+    let fd = nix::fcntl::openat(
+        mapped.dir_fd.as_fd(),
+        fname.as_c_str(),
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(core_errno_from_nix)?;
+    let raw = fd.as_raw_fd();
+    Ok((raw, Some(fd)))
+}
+
 pub struct LongNameFsCore {
     pub config: Arc<Config>,
     dir_cache: DirCache,
@@ -2605,35 +2622,13 @@ impl PathFilesystem for LongNameFsV2 {
         if name.as_bytes().starts_with(b"user.ln2.") {
             return Err(fuse3::Errno::from(libc::EPERM));
         }
-        if path == OsStr::new("/") {
-            let cname = cstring_from_bytes(name.as_bytes())?;
-            let res = unsafe {
-                libc::fsetxattr(
-                    self.config.backend_fd().as_raw_fd(),
-                    cname.as_ptr(),
-                    value.as_ptr() as *const libc::c_void,
-                    value.len(),
-                    flags as libc::c_int,
-                )
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            return Ok(());
-        }
-        let mapped = self.resolve_path(path)?;
-        let fname = mapped.backend_name.as_cstring()?;
-        let fd = nix::fcntl::openat(
-            mapped.dir_fd.as_fd(),
-            fname.as_c_str(),
-            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(errno_from_nix)?;
         let cname = cstring_from_bytes(name.as_bytes())?;
+        let (fd_raw, fd_guard) =
+            raw_fd_for_xattr(self.core.as_ref(), path).map_err(fuse3::Errno::from)?;
+        let _fd_guard = fd_guard;
         let res = unsafe {
             libc::fsetxattr(
-                fd.as_raw_fd(),
+                fd_raw,
                 cname.as_ptr(),
                 value.as_ptr() as *const libc::c_void,
                 value.len(),
@@ -2657,20 +2652,9 @@ impl PathFilesystem for LongNameFsV2 {
             return Err(fuse3::Errno::from(libc::EPERM));
         }
         let cname = cstring_from_bytes(name.as_bytes())?;
-        let fd_raw = if path == OsStr::new("/") {
-            self.config.backend_fd().as_raw_fd()
-        } else {
-            let mapped = self.resolve_path(path)?;
-            let fname = mapped.backend_name.as_cstring()?;
-            let fd = nix::fcntl::openat(
-                mapped.dir_fd.as_fd(),
-                fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(errno_from_nix)?;
-            fd.as_raw_fd()
-        };
+        let (fd_raw, fd_guard) =
+            raw_fd_for_xattr(self.core.as_ref(), path).map_err(fuse3::Errno::from)?;
+        let _fd_guard = fd_guard;
         if size == 0 {
             let res = unsafe { libc::fgetxattr(fd_raw, cname.as_ptr(), std::ptr::null_mut(), 0) };
             if res < 0 {
@@ -2704,20 +2688,9 @@ impl PathFilesystem for LongNameFsV2 {
         path: &OsStr,
         size: u32,
     ) -> Result<ReplyXAttr, fuse3::Errno> {
-        let fd_raw = if path == OsStr::new("/") {
-            self.config.backend_fd().as_raw_fd()
-        } else {
-            let mapped = self.resolve_path(path)?;
-            let fname = mapped.backend_name.as_cstring()?;
-            let fd = nix::fcntl::openat(
-                mapped.dir_fd.as_fd(),
-                fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(errno_from_nix)?;
-            fd.as_raw_fd()
-        };
+        let (fd_raw, fd_guard) =
+            raw_fd_for_xattr(self.core.as_ref(), path).map_err(fuse3::Errno::from)?;
+        let _fd_guard = fd_guard;
         let initial = unsafe { libc::flistxattr(fd_raw, std::ptr::null_mut(), 0) };
         if initial < 0 {
             return Err(io::Error::last_os_error().into());
@@ -2767,20 +2740,9 @@ impl PathFilesystem for LongNameFsV2 {
             return Err(fuse3::Errno::from(libc::EPERM));
         }
         let cname = cstring_from_bytes(name.as_bytes())?;
-        let fd_raw = if path == OsStr::new("/") {
-            self.config.backend_fd().as_raw_fd()
-        } else {
-            let mapped = self.resolve_path(path)?;
-            let fname = mapped.backend_name.as_cstring()?;
-            let fd = nix::fcntl::openat(
-                mapped.dir_fd.as_fd(),
-                fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(errno_from_nix)?;
-            fd.as_raw_fd()
-        };
+        let (fd_raw, fd_guard) =
+            raw_fd_for_xattr(self.core.as_ref(), path).map_err(fuse3::Errno::from)?;
+        let _fd_guard = fd_guard;
         let res = unsafe { libc::fremovexattr(fd_raw, cname.as_ptr()) };
         if res < 0 {
             return Err(io::Error::last_os_error().into());
@@ -4747,7 +4709,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
     fn write(
         &mut self,
         _req: &FuserRequest<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
@@ -4764,6 +4726,12 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             Ok(written) => {
                 if self.core.config.sync_data() {
                     let _ = fdatasync(handle.as_fd());
+                }
+                if let Some(entry) = self.inode_store.get(ino)
+                    && entry.path != OsStr::new("/")
+                    && let Ok(mapped) = self.core.resolve_path(&entry.path)
+                {
+                    self.invalidate_dir(mapped.dir_fd.as_fd());
                 }
                 reply.written(written as u32);
             }
@@ -4886,36 +4854,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let fd_raw = if entry.path == OsStr::new("/") {
-            self.core.config.backend_fd().as_raw_fd()
-        } else {
-            let mapped = match self.core.resolve_path(&entry.path) {
-                Ok(v) => v,
-                Err(err) => {
-                    reply.error(core_err_to_errno(&err));
-                    return;
-                }
-            };
-            let fname = match mapped.backend_name.as_cstring() {
-                Ok(v) => v,
-                Err(err) => {
-                    reply.error(core_err_to_errno(&err));
-                    return;
-                }
-            };
-            match nix::fcntl::openat(
-                mapped.dir_fd.as_fd(),
-                fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd.as_raw_fd(),
-                Err(err) => {
-                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                    return;
-                }
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
             }
         };
+        let _fd_guard = fd_guard;
         let res = unsafe {
             libc::fsetxattr(
                 fd_raw,
@@ -4955,36 +4901,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let fd_raw = if entry.path == OsStr::new("/") {
-            self.core.config.backend_fd().as_raw_fd()
-        } else {
-            let mapped = match self.core.resolve_path(&entry.path) {
-                Ok(v) => v,
-                Err(err) => {
-                    reply.error(core_err_to_errno(&err));
-                    return;
-                }
-            };
-            let fname = match mapped.backend_name.as_cstring() {
-                Ok(v) => v,
-                Err(err) => {
-                    reply.error(core_err_to_errno(&err));
-                    return;
-                }
-            };
-            match nix::fcntl::openat(
-                mapped.dir_fd.as_fd(),
-                fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd.as_raw_fd(),
-                Err(err) => {
-                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                    return;
-                }
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
             }
         };
+        let _fd_guard = fd_guard;
         if size == 0 {
             let res = unsafe { libc::fgetxattr(fd_raw, cname.as_ptr(), std::ptr::null_mut(), 0) };
             if res < 0 {
@@ -5021,36 +4945,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let fd_raw = if entry.path == OsStr::new("/") {
-            self.core.config.backend_fd().as_raw_fd()
-        } else {
-            let mapped = match self.core.resolve_path(&entry.path) {
-                Ok(v) => v,
-                Err(err) => {
-                    reply.error(core_err_to_errno(&err));
-                    return;
-                }
-            };
-            let fname = match mapped.backend_name.as_cstring() {
-                Ok(v) => v,
-                Err(err) => {
-                    reply.error(core_err_to_errno(&err));
-                    return;
-                }
-            };
-            match nix::fcntl::openat(
-                mapped.dir_fd.as_fd(),
-                fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd.as_raw_fd(),
-                Err(err) => {
-                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                    return;
-                }
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
             }
         };
+        let _fd_guard = fd_guard;
         let initial = unsafe { libc::flistxattr(fd_raw, std::ptr::null_mut(), 0) };
         if initial < 0 {
             reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
@@ -5113,42 +5015,37 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let fd_raw = if entry.path == OsStr::new("/") {
-            self.core.config.backend_fd().as_raw_fd()
-        } else {
-            let mapped = match self.core.resolve_path(&entry.path) {
-                Ok(v) => v,
-                Err(err) => {
-                    reply.error(core_err_to_errno(&err));
-                    return;
-                }
-            };
-            let fname = match mapped.backend_name.as_cstring() {
-                Ok(v) => v,
-                Err(err) => {
-                    reply.error(core_err_to_errno(&err));
-                    return;
-                }
-            };
-            match nix::fcntl::openat(
-                mapped.dir_fd.as_fd(),
-                fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd.as_raw_fd(),
-                Err(err) => {
-                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                    return;
-                }
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
             }
         };
+        let _fd_guard = fd_guard;
         let res = unsafe { libc::fremovexattr(fd_raw, cname.as_ptr()) };
         if res < 0 {
             reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
             return;
         }
         reply.ok();
+    }
+
+    fn poll(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        _ino: u64,
+        fh: u64,
+        _ph: FuserPollHandle,
+        _events: u32,
+        _flags: u32,
+        reply: FuserReplyPoll,
+    ) {
+        if self.handles.get_file(fh).is_none() {
+            reply.error(libc::EBADF);
+            return;
+        }
+        reply.poll(0);
     }
 
     fn release(
