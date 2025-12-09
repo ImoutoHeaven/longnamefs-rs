@@ -1,6 +1,7 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type InodeId = u64;
@@ -201,10 +202,88 @@ impl InodeStore {
         Some(entry.clone())
     }
 
+    pub fn rename_descendants(&self, old_prefix: &OsStr, new_prefix: &OsStr) {
+        let old_bytes = old_prefix.as_bytes();
+        let new_bytes = new_prefix.as_bytes();
+
+        let mut inner = self.inner.write();
+        for entry in inner.entries.values_mut() {
+            let path_bytes = entry.path.as_bytes();
+            if path_bytes.len() < old_bytes.len() {
+                continue;
+            }
+            if !path_bytes.starts_with(old_bytes) {
+                continue;
+            }
+            if path_bytes.len() > old_bytes.len() && path_bytes.get(old_bytes.len()) != Some(&b'/')
+            {
+                continue;
+            }
+
+            let mut replaced =
+                Vec::with_capacity(new_bytes.len() + path_bytes.len() - old_bytes.len());
+            replaced.extend_from_slice(new_bytes);
+            replaced.extend_from_slice(&path_bytes[old_bytes.len()..]);
+            entry.path = OsString::from_vec(replaced);
+        }
+    }
+
     fn push_parent(entry: &mut InodeEntry, parent: ParentName) {
         if entry.parents.iter().any(|p| p == &parent) {
             return;
         }
         entry.parents.push(parent);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_descendants_updates_subtree_paths() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let dir = store.lookup_or_create(
+            BackendKey { dev: 1, ino: 2 },
+            InodeKind::Directory,
+            OsString::from("/old"),
+            Some(ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("old"),
+            }),
+        );
+        let child = store.lookup_or_create(
+            BackendKey { dev: 1, ino: 3 },
+            InodeKind::File,
+            OsString::from("/old/file"),
+            Some(ParentName {
+                parent: dir.ino,
+                name: OsString::from("file"),
+            }),
+        );
+        let outside = store.lookup_or_create(
+            BackendKey { dev: 1, ino: 4 },
+            InodeKind::File,
+            OsString::from("/oldest/file"),
+            Some(ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("oldest"),
+            }),
+        );
+
+        store.rename_descendants(OsStr::new("/old"), OsStr::new("/new"));
+
+        assert_eq!(store.get(dir.ino).unwrap().path, OsString::from("/new"));
+        assert_eq!(
+            store.get(child.ino).unwrap().path,
+            OsString::from("/new/file")
+        );
+        // Prefix matches must respect path boundaries.
+        assert_eq!(
+            store.get(outside.ino).unwrap().path,
+            OsString::from("/oldest/file")
+        );
     }
 }

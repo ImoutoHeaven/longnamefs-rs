@@ -4026,6 +4026,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
+        let old_path = crate::v2::path::make_child_path(&src_parent_entry.path, name);
         if let Err(err) = self.rename_with_flags(
             &src_parent_entry.path,
             name,
@@ -4077,6 +4078,9 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             let child =
                 self.ensure_child_entry(newparent, &dst_parent_entry.path, newname, stat, 0);
             let new_path = crate::v2::path::make_child_path(&dst_parent_entry.path, newname);
+            if matches!(child.kind, InodeKind::Directory) {
+                self.inode_store.rename_descendants(&old_path, &new_path);
+            }
             let _ = self.inode_store.update_path(child.ino, new_path);
             let _ = self.inode_store.remove_parent_name(
                 child.ino,
