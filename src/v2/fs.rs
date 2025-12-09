@@ -764,6 +764,30 @@ pub(crate) struct RenameTarget {
     path: ResolvedPath,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirInvalidation {
+    pub primary: DirCacheKey,
+    pub secondary: Option<DirCacheKey>,
+}
+
+impl DirInvalidation {
+    fn new(primary: DirCacheKey, secondary: Option<DirCacheKey>) -> Self {
+        let secondary = secondary.filter(|s| *s != primary);
+        Self { primary, secondary }
+    }
+
+    fn for_move(src: DirCacheKey, dst: DirCacheKey) -> Self {
+        Self::new(src, Some(dst))
+    }
+
+    fn apply<F: Fn(DirCacheKey)>(&self, f: F) {
+        f(self.primary);
+        if let Some(key) = self.secondary {
+            f(key);
+        }
+    }
+}
+
 fn cstring_from_bytes(bytes: &[u8]) -> CoreResult<CString> {
     CString::new(bytes.to_vec()).map_err(|_| CoreError::from_errno(libc::EINVAL))
 }
@@ -1718,41 +1742,9 @@ impl LongNameFsCore {
         )
         .map_err(core_errno_from_nix)
     }
-}
 
-impl LongNameFsV2 {
-    pub fn new(
-        config: Config,
-        max_name_len: usize,
-        dir_cache_ttl: Option<Duration>,
-        max_write_kb: u32,
-        index_sync: IndexSync,
-        attr_ttl: Duration,
-    ) -> Result<Self, fuse3::Errno> {
-        let core = LongNameFsCore::new(config, max_name_len, dir_cache_ttl, index_sync)
-            .map_err(fuse3::Errno::from)?;
-        let bytes = max_write_kb.saturating_mul(1024).max(4096);
-        let max_write = NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
-        Ok(Self {
-            core: Arc::new(core),
-            handles: V2HandleTable::new(),
-            max_write,
-            attr_ttl,
-        })
-    }
-
-    fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
-        if let Some(key) = dir_cache_key(dir_fd) {
-            self.invalidate_dir_by_key(key);
-        } else {
-            self.core.invalidate_dir(dir_fd);
-            self.handles.clear_all_dir_attr_cache();
-        }
-    }
-
-    fn invalidate_dir_by_key(&self, key: DirCacheKey) {
-        self.core.invalidate_dir_by_key(key);
-        self.handles.clear_dir_attr_cache(key);
+    fn invalidate_dirs(&self, inv: &DirInvalidation) {
+        inv.apply(|key| self.invalidate_dir_by_key(key));
     }
 
     fn rename_short_to_short(
@@ -1760,7 +1752,7 @@ impl LongNameFsV2 {
         src: &RenameTarget,
         dst: &RenameTarget,
         flags: u32,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<DirInvalidation> {
         let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
         let dst_backend = BackendName::Short(dst.path.logical_name.clone());
         self.do_backend_rename(
@@ -1770,11 +1762,9 @@ impl LongNameFsV2 {
             &dst_backend,
             flags,
         )?;
-        self.invalidate_dir_by_key(src.path.parent_key);
-        if src.path.parent_key != dst.path.parent_key {
-            self.invalidate_dir_by_key(dst.path.parent_key);
-        }
-        Ok(())
+        let inv = DirInvalidation::for_move(src.path.parent_key, dst.path.parent_key);
+        self.invalidate_dirs(&inv);
+        Ok(inv)
     }
 
     fn rename_upgrade(
@@ -1782,7 +1772,7 @@ impl LongNameFsV2 {
         src: &mut RenameTarget,
         dst: &mut RenameTarget,
         flags: u32,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<DirInvalidation> {
         let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
         let mut dst_internal = {
             let mut guard = dst.ctx.state.index.write();
@@ -1848,9 +1838,9 @@ impl LongNameFsV2 {
         }
         dst.ctx.state.attr_cache.clear();
         maybe_flush_index(dst.ctx.dir_fd.as_fd(), &mut dst.ctx.state, self.index_sync)?;
-        self.invalidate_dir_by_key(src.path.parent_key);
-        self.invalidate_dir_by_key(dst.path.parent_key);
-        Ok(())
+        let inv = DirInvalidation::for_move(src.path.parent_key, dst.path.parent_key);
+        self.invalidate_dirs(&inv);
+        Ok(inv)
     }
 
     fn rename_downgrade(
@@ -1858,7 +1848,7 @@ impl LongNameFsV2 {
         src: &mut RenameTarget,
         dst: &mut RenameTarget,
         flags: u32,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<DirInvalidation> {
         let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
         let dst_backend = BackendName::Short(dst.path.logical_name.clone());
         self.do_backend_rename(
@@ -1877,9 +1867,9 @@ impl LongNameFsV2 {
         }
         src.ctx.state.attr_cache.clear();
         maybe_flush_index(src.ctx.dir_fd.as_fd(), &mut src.ctx.state, self.index_sync)?;
-        self.invalidate_dir_by_key(src.path.parent_key);
-        self.invalidate_dir_by_key(dst.path.parent_key);
-        Ok(())
+        let inv = DirInvalidation::for_move(src.path.parent_key, dst.path.parent_key);
+        self.invalidate_dirs(&inv);
+        Ok(inv)
     }
 
     fn rename_long_to_long(
@@ -1887,7 +1877,7 @@ impl LongNameFsV2 {
         src: &mut RenameTarget,
         dst: &mut RenameTarget,
         flags: u32,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<DirInvalidation> {
         let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
         let same_dir = src.path.parent_key == dst.path.parent_key;
         let mut dst_internal = {
@@ -1976,19 +1966,19 @@ impl LongNameFsV2 {
         if src.path.parent_key != dst.path.parent_key {
             maybe_flush_index(dst.ctx.dir_fd.as_fd(), &mut dst.ctx.state, self.index_sync)?;
         }
-        self.invalidate_dir_by_key(src.path.parent_key);
-        self.invalidate_dir_by_key(dst.path.parent_key);
-        Ok(())
+        let inv = DirInvalidation::for_move(src.path.parent_key, dst.path.parent_key);
+        self.invalidate_dirs(&inv);
+        Ok(inv)
     }
 
-    fn rename_with_flags(
+    pub(crate) fn rename_with_flags(
         &self,
         origin_parent: &OsStr,
         origin_name: &OsStr,
         parent: &OsStr,
         name: &OsStr,
         flags: u32,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<DirInvalidation> {
         if flags != 0 && flags != libc::RENAME_NOREPLACE {
             return Err(CoreError::Unsupported);
         }
@@ -2002,9 +1992,6 @@ impl LongNameFsV2 {
         }
         let mut dst = self.resolve_path_for_rename(parent, name)?;
 
-        // Overwrite vs non-overwrite semantics are delegated to backend rename/renameat2. dst.exists
-        // only influences whether we run upgrade/downgrade or same-kind paths; it is not used to
-        // simulate coverage rules in user space.
         match (src.path.kind, dst.path.kind) {
             (SegmentKind::Short, SegmentKind::Short) => {
                 self.rename_short_to_short(&src, &dst, flags)
@@ -2019,6 +2006,46 @@ impl LongNameFsV2 {
                 self.rename_downgrade(&mut src, &mut dst, flags)
             }
         }
+    }
+}
+
+impl LongNameFsV2 {
+    pub fn new(
+        config: Config,
+        max_name_len: usize,
+        dir_cache_ttl: Option<Duration>,
+        max_write_kb: u32,
+        index_sync: IndexSync,
+        attr_ttl: Duration,
+    ) -> Result<Self, fuse3::Errno> {
+        let core = LongNameFsCore::new(config, max_name_len, dir_cache_ttl, index_sync)
+            .map_err(fuse3::Errno::from)?;
+        let bytes = max_write_kb.saturating_mul(1024).max(4096);
+        let max_write = NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
+        Ok(Self {
+            core: Arc::new(core),
+            handles: V2HandleTable::new(),
+            max_write,
+            attr_ttl,
+        })
+    }
+
+    fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
+        if let Some(key) = dir_cache_key(dir_fd) {
+            self.invalidate_dir_by_key(key);
+        } else {
+            self.core.invalidate_dir(dir_fd);
+            self.handles.clear_all_dir_attr_cache();
+        }
+    }
+
+    fn invalidate_dir_by_key(&self, key: DirCacheKey) {
+        self.core.invalidate_dir_by_key(key);
+        self.handles.clear_dir_attr_cache(key);
+    }
+
+    fn apply_invalidation(&self, inv: DirInvalidation) {
+        inv.apply(|key| self.invalidate_dir_by_key(key));
     }
 }
 
@@ -2434,8 +2461,10 @@ impl PathFilesystem for LongNameFsV2 {
         parent: &OsStr,
         name: &OsStr,
     ) -> Result<(), fuse3::Errno> {
-        self.rename_with_flags(origin_parent, origin_name, parent, name, 0)
+        let inv = self
+            .rename_with_flags(origin_parent, origin_name, parent, name, 0)
             .map_err(fuse3::Errno::from)?;
+        self.apply_invalidation(inv);
         Ok(())
     }
 
@@ -2448,8 +2477,10 @@ impl PathFilesystem for LongNameFsV2 {
         name: &OsStr,
         flags: u32,
     ) -> Result<(), fuse3::Errno> {
-        self.rename_with_flags(origin_parent, origin_name, parent, name, flags)
+        let inv = self
+            .rename_with_flags(origin_parent, origin_name, parent, name, flags)
             .map_err(fuse3::Errno::from)?;
+        self.apply_invalidation(inv);
         Ok(())
     }
 
@@ -3135,6 +3166,10 @@ impl LongNameFsV2Fuser {
         self.handles.clear_dir_attr_cache(key);
     }
 
+    fn apply_invalidation(&self, inv: DirInvalidation) {
+        inv.apply(|key| self.invalidate_dir_by_key(key));
+    }
+
     fn attr_for_entry(&self, entry: &InodeEntry) -> CoreResult<FuserFileAttr> {
         let attr = self.core.stat_path(&entry.path)?;
         Ok(fuser_attr_from_core(attr, entry.ino))
@@ -3189,287 +3224,6 @@ impl LongNameFsV2Fuser {
             }),
             lookup_inc,
         )
-    }
-
-    fn rename_short_to_short(
-        &self,
-        src: &RenameTarget,
-        dst: &RenameTarget,
-        flags: u32,
-    ) -> CoreResult<()> {
-        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
-        let dst_backend = BackendName::Short(dst.path.logical_name.clone());
-        self.core.do_backend_rename(
-            src.ctx.dir_fd.as_fd(),
-            src_backend,
-            dst.ctx.dir_fd.as_fd(),
-            &dst_backend,
-            flags,
-        )?;
-        self.invalidate_dir_by_key(src.path.parent_key);
-        if src.path.parent_key != dst.path.parent_key {
-            self.invalidate_dir_by_key(dst.path.parent_key);
-        }
-        Ok(())
-    }
-
-    fn rename_upgrade(
-        &self,
-        src: &mut RenameTarget,
-        dst: &mut RenameTarget,
-        flags: u32,
-    ) -> CoreResult<()> {
-        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
-        let mut dst_internal = {
-            let mut guard = dst.ctx.state.index.write();
-            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
-        };
-
-        let src_c = src_backend.as_cstring()?;
-        let src_fd = match nix::fcntl::openat(
-            src.ctx.dir_fd.as_fd(),
-            src_c.as_c_str(),
-            OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(nix::errno::Errno::EISDIR) => nix::fcntl::openat(
-                src.ctx.dir_fd.as_fd(),
-                src_c.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY,
-                Mode::empty(),
-            )
-            .map_err(core_errno_from_nix)?,
-            Err(nix::errno::Errno::ELOOP) => return Err(CoreError::from_errno(libc::ELOOP)),
-            Err(err) => return Err(core_errno_from_nix(err)),
-        };
-        set_internal_rawname(src_fd.as_fd(), &dst.path.logical_name)?;
-
-        let mut attempt = 0;
-        loop {
-            let rename_res = self.core.do_backend_rename(
-                src.ctx.dir_fd.as_fd(),
-                src_backend,
-                dst.ctx.dir_fd.as_fd(),
-                &BackendName::Internal(dst_internal.clone()),
-                flags,
-            );
-            match rename_res {
-                Ok(()) => break,
-                Err(err @ CoreError::AlreadyExists) => {
-                    if attempt > 0 {
-                        return Err(err);
-                    }
-                    let raw =
-                        refresh_dir_index_from_backend(dst.ctx.dir_fd.as_fd(), &dst_internal)?;
-                    {
-                        let mut guard = dst.ctx.state.index.write();
-                        guard.index.upsert(dst_internal.clone(), raw);
-                        guard.pending = guard.pending.saturating_add(1);
-                        dst_internal =
-                            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
-                    }
-                    attempt += 1;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        {
-            let mut guard = dst.ctx.state.index.write();
-            guard
-                .index
-                .upsert(dst_internal.clone(), dst.path.logical_name.clone());
-            guard.pending = guard.pending.saturating_add(1);
-        }
-        dst.ctx.state.attr_cache.clear();
-        maybe_flush_index(
-            dst.ctx.dir_fd.as_fd(),
-            &mut dst.ctx.state,
-            self.core.index_sync,
-        )?;
-        self.invalidate_dir_by_key(src.path.parent_key);
-        self.invalidate_dir_by_key(dst.path.parent_key);
-        Ok(())
-    }
-
-    fn rename_downgrade(
-        &self,
-        src: &mut RenameTarget,
-        dst: &mut RenameTarget,
-        flags: u32,
-    ) -> CoreResult<()> {
-        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
-        let dst_backend = BackendName::Short(dst.path.logical_name.clone());
-        self.core.do_backend_rename(
-            src.ctx.dir_fd.as_fd(),
-            src_backend,
-            dst.ctx.dir_fd.as_fd(),
-            &dst_backend,
-            flags,
-        )?;
-        let backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
-        {
-            let mut src_guard = src.ctx.state.index.write();
-            if src_guard.index.remove(&backend_name).is_some() {
-                src_guard.pending = src_guard.pending.saturating_add(1);
-            }
-        }
-        src.ctx.state.attr_cache.clear();
-        maybe_flush_index(
-            src.ctx.dir_fd.as_fd(),
-            &mut src.ctx.state,
-            self.core.index_sync,
-        )?;
-        self.invalidate_dir_by_key(src.path.parent_key);
-        self.invalidate_dir_by_key(dst.path.parent_key);
-        Ok(())
-    }
-
-    fn rename_long_to_long(
-        &self,
-        src: &mut RenameTarget,
-        dst: &mut RenameTarget,
-        flags: u32,
-    ) -> CoreResult<()> {
-        let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
-        let same_dir = src.path.parent_key == dst.path.parent_key;
-        let mut dst_internal = {
-            let mut guard = dst.ctx.state.index.write();
-            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
-        };
-
-        let mut attempt = 0;
-        loop {
-            let res = self.core.do_backend_rename(
-                src.ctx.dir_fd.as_fd(),
-                src_backend,
-                dst.ctx.dir_fd.as_fd(),
-                &BackendName::Internal(dst_internal.clone()),
-                flags,
-            );
-            match res {
-                Ok(()) => break,
-                Err(err @ CoreError::AlreadyExists) => {
-                    if attempt > 0 {
-                        return Err(err);
-                    }
-                    let raw =
-                        refresh_dir_index_from_backend(dst.ctx.dir_fd.as_fd(), &dst_internal)?;
-                    {
-                        let mut guard = dst.ctx.state.index.write();
-                        guard.index.upsert(dst_internal.clone(), raw);
-                        guard.pending = guard.pending.saturating_add(1);
-                        dst_internal =
-                            select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
-                    }
-                    attempt += 1;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        let dst_c = BackendName::Internal(dst_internal.clone()).as_cstring()?;
-        let dst_fd = nix::fcntl::openat(
-            dst.ctx.dir_fd.as_fd(),
-            dst_c.as_c_str(),
-            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(core_errno_from_nix)?;
-        set_internal_rawname(dst_fd.as_fd(), &dst.path.logical_name)?;
-
-        let src_backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
-        if same_dir {
-            let mut guard = dst.ctx.state.index.write();
-            if guard.index.remove(&src_backend_name).is_some() {
-                guard.pending = guard.pending.saturating_add(1);
-            }
-            guard
-                .index
-                .upsert(dst_internal.clone(), dst.path.logical_name.clone());
-            guard.pending = guard.pending.saturating_add(1);
-        } else {
-            let src_key = (src.path.parent_key.dev, src.path.parent_key.ino);
-            let dst_key = (dst.path.parent_key.dev, dst.path.parent_key.ino);
-            if src_key < dst_key {
-                let mut src_guard = src.ctx.state.index.write();
-                let mut dst_guard = dst.ctx.state.index.write();
-                if src_guard.index.remove(&src_backend_name).is_some() {
-                    src_guard.pending = src_guard.pending.saturating_add(1);
-                }
-                dst_guard
-                    .index
-                    .upsert(dst_internal.clone(), dst.path.logical_name.clone());
-                dst_guard.pending = dst_guard.pending.saturating_add(1);
-            } else {
-                let mut dst_guard = dst.ctx.state.index.write();
-                let mut src_guard = src.ctx.state.index.write();
-                if src_guard.index.remove(&src_backend_name).is_some() {
-                    src_guard.pending = src_guard.pending.saturating_add(1);
-                }
-                dst_guard
-                    .index
-                    .upsert(dst_internal.clone(), dst.path.logical_name.clone());
-                dst_guard.pending = dst_guard.pending.saturating_add(1);
-            }
-        }
-        src.ctx.state.attr_cache.clear();
-        dst.ctx.state.attr_cache.clear();
-        maybe_flush_index(
-            src.ctx.dir_fd.as_fd(),
-            &mut src.ctx.state,
-            self.core.index_sync,
-        )?;
-        if src.path.parent_key != dst.path.parent_key {
-            maybe_flush_index(
-                dst.ctx.dir_fd.as_fd(),
-                &mut dst.ctx.state,
-                self.core.index_sync,
-            )?;
-        }
-        self.invalidate_dir_by_key(src.path.parent_key);
-        self.invalidate_dir_by_key(dst.path.parent_key);
-        Ok(())
-    }
-
-    fn rename_with_flags(
-        &self,
-        origin_parent: &OsStr,
-        origin_name: &OsStr,
-        parent: &OsStr,
-        name: &OsStr,
-        flags: u32,
-    ) -> CoreResult<()> {
-        if flags != 0 && flags != libc::RENAME_NOREPLACE {
-            return Err(CoreError::Unsupported);
-        }
-        if flags != 0 && !self.core.supports_renameat2 {
-            return Err(CoreError::Unsupported);
-        }
-
-        let mut src = self
-            .core
-            .resolve_path_for_rename(origin_parent, origin_name)?;
-        if !src.path.exists {
-            return Err(CoreError::NotFound);
-        }
-        let mut dst = self.core.resolve_path_for_rename(parent, name)?;
-
-        match (src.path.kind, dst.path.kind) {
-            (SegmentKind::Short, SegmentKind::Short) => {
-                self.rename_short_to_short(&src, &dst, flags)
-            }
-            (SegmentKind::Long, SegmentKind::Long) => {
-                self.rename_long_to_long(&mut src, &mut dst, flags)
-            }
-            (SegmentKind::Short, SegmentKind::Long) => {
-                self.rename_upgrade(&mut src, &mut dst, flags)
-            }
-            (SegmentKind::Long, SegmentKind::Short) => {
-                self.rename_downgrade(&mut src, &mut dst, flags)
-            }
-        }
     }
 
     fn open_backend_file(&self, entry: &InodeEntry, flags: u32) -> CoreResult<OwnedFd> {
@@ -3989,16 +3743,20 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         };
         let old_path = crate::v2::path::make_child_path(&src_parent_entry.path, name);
-        if let Err(err) = self.rename_with_flags(
+        let inv = match self.core.rename_with_flags(
             &src_parent_entry.path,
             name,
             &dst_parent_entry.path,
             newname,
             flags,
         ) {
-            reply.error(core_err_to_errno(&err));
-            return;
-        }
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        self.apply_invalidation(inv);
 
         let mut dst_ctx = match self.core.resolve_dir(&dst_parent_entry.path) {
             Ok(v) => v,
@@ -5125,5 +4883,89 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             ),
             Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v2::path::MAX_SEGMENT_ON_DISK;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let mut path = std::env::temp_dir();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            path.push(format!("ln2_core_test_{}_{}", std::process::id(), nanos));
+            fs::create_dir(&path).expect("create temp dir");
+            TempDir(path)
+        }
+
+        fn path(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn core_rename_short_to_short_moves_entry() {
+        let tmp = TempDir::new();
+        let file_a = tmp.path().join("a");
+        fs::write(&file_a, b"hello").unwrap();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+        let core = LongNameFsCore::new(config, MAX_SEGMENT_ON_DISK, None, IndexSync::Off).unwrap();
+
+        let inv = core
+            .rename_with_flags(
+                OsStr::new("/"),
+                OsStr::new("a"),
+                OsStr::new("/"),
+                OsStr::new("b"),
+                0,
+            )
+            .unwrap();
+        assert!(tmp.path().join("b").exists());
+        assert!(!file_a.exists());
+        assert!(inv.secondary.is_none());
+    }
+
+    #[test]
+    fn map_segment_for_create_detects_existing_long_name() {
+        let state = DirState {
+            index: Arc::new(RwLock::new(IndexState {
+                index: DirIndex::new(),
+                pending: 0,
+                last_flush: Instant::now(),
+            })),
+            attr_cache: HashMap::new(),
+        };
+        let raw = vec![b'x'; MAX_SEGMENT_ON_DISK + 8];
+        let first = map_segment_for_create(&state, &raw, raw.len() + 4).unwrap();
+        let backend_name = match first.0 {
+            BackendName::Internal(ref name) => name.clone(),
+            BackendName::Short(_) => panic!("expected internal backend name for long segment"),
+        };
+        {
+            let mut guard = state.index.write();
+            guard.index.upsert(backend_name, raw.clone());
+        }
+        let err = map_segment_for_create(&state, &raw, raw.len() + 4).unwrap_err();
+        assert!(matches!(err, CoreError::AlreadyExists));
     }
 }
