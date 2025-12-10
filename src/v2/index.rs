@@ -190,7 +190,9 @@ fn decode_index_bytes(bytes: &[u8]) -> Option<DirIndex> {
             let mut decoder = ZstdDecoder::new(&bytes[MAGIC_ZSTD.len()..]).ok()?;
             let mut decoded = Vec::new();
             decoder.read_to_end(&mut decoded).ok()?;
-            decode_index_bytes(&decoded)
+            // Only decode the decompressed payload as a plain index to avoid recursive
+            // LN2Z nesting from untrusted/corrupt files.
+            decode_plain_index(&decoded)
         }
         _ => None,
     }
@@ -252,4 +254,41 @@ pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> CoreResult<(
         written += n;
     }
     core_sync_and_commit(dir_fd, tmp, INDEX_NAME_CSTR).map_err(CoreError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_index() -> DirIndex {
+        let mut index = DirIndex::new();
+        index.upsert(b"backend".to_vec(), b"raw".to_vec());
+        index
+    }
+
+    #[test]
+    fn decode_index_bytes_handles_single_compression_layer() {
+        let raw = encode_index(&sample_index());
+        let compressed = encode_index_compressed(&raw).unwrap();
+        let decoded = decode_index_bytes(&compressed).expect("compressed index should decode");
+        assert!(decoded.get(b"backend").is_some());
+    }
+
+    #[test]
+    fn decode_index_bytes_rejects_nested_compression() {
+        let raw = encode_index(&sample_index());
+        let compressed = encode_index_compressed(&raw).unwrap();
+
+        let nested_payload = {
+            let mut encoder = ZstdEncoder::new(Vec::new(), 3).unwrap();
+            encoder.write_all(&compressed).unwrap();
+            encoder.finish().unwrap()
+        };
+
+        let mut nested = Vec::with_capacity(MAGIC_ZSTD.len() + nested_payload.len());
+        nested.extend_from_slice(MAGIC_ZSTD);
+        nested.extend_from_slice(&nested_payload);
+
+        assert!(decode_index_bytes(&nested).is_none());
+    }
 }
