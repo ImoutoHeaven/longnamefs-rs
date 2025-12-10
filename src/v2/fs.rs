@@ -212,6 +212,7 @@ pub(crate) struct DirEntryInfo {
     kind: CoreFileType,
     attr: Option<CoreFileAttr>,
     backend_name: Vec<u8>,
+    backend_key: Option<BackendKey>,
 }
 
 #[derive(Debug)]
@@ -548,7 +549,19 @@ impl IndexCache {
 #[derive(Debug)]
 struct DirState {
     index: Arc<RwLock<IndexState>>,
-    attr_cache: HashMap<Vec<u8>, CoreFileAttr>,
+    attr_cache: HashMap<Vec<u8>, CachedAttr>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedAttr {
+    attr: CoreFileAttr,
+    backend: BackendKey,
+}
+
+#[derive(Debug, Clone)]
+struct DirSnapshot {
+    entries: Arc<Vec<DirEntryInfo>>,
+    has_attrs: bool,
 }
 
 #[derive(Debug)]
@@ -556,6 +569,7 @@ pub(crate) struct DirHandle {
     fd: OwnedFd,
     state: RwLock<DirState>,
     cache_key: Option<DirCacheKey>,
+    snapshot: Mutex<Option<DirSnapshot>>,
 }
 
 impl DirHandle {
@@ -565,6 +579,7 @@ impl DirHandle {
             fd,
             state: RwLock::new(state),
             cache_key,
+            snapshot: Mutex::new(None),
         }
     }
 
@@ -1087,10 +1102,11 @@ fn list_logical_entries(
     #[derive(Debug)]
     struct PendingEntry {
         backend_name: Vec<u8>,
-        backend_key: Option<Vec<u8>>,
+        internal_backend_name: Option<Vec<u8>>,
         is_internal: bool,
         kind: Option<CoreFileType>,
         attr: Option<CoreFileAttr>,
+        backend_key: Option<BackendKey>,
         raw_name: Option<Vec<u8>>,
     }
 
@@ -1128,16 +1144,18 @@ fn list_logical_entries(
         let state = handle.state.read();
         let index = state.index.read();
         for entry in &scanned {
-            let attr = state.attr_cache.get(&entry.backend_name).cloned();
-            let kind = entry.kind_hint.or_else(|| attr.as_ref().map(|a| a.kind));
-            let mut backend_key = None;
+            let cached = state.attr_cache.get(&entry.backend_name).cloned();
+            let attr = cached.as_ref().map(|c| c.attr);
+            let backend_key = cached.as_ref().map(|c| c.backend);
+            let kind = entry.kind_hint.or_else(|| attr.map(|a| a.kind));
+
+            let internal_backend_name = entry.is_internal.then(|| entry.backend_name.clone());
 
             let raw_name = if entry.is_internal {
-                backend_key = Some(entry.backend_name.clone());
                 let existing = index
                     .index
                     .get(&entry.backend_name)
-                    .map(|e| e.raw_name.clone());
+                    .map(|e| e.raw_name.as_ref().to_vec());
                 if existing.is_none() {
                     repair_candidates.push(entry.backend_name.clone());
                 }
@@ -1146,17 +1164,19 @@ fn list_logical_entries(
                 Some(entry.backend_name.clone())
             };
 
-            let needs_attr = (need_attr && attr.is_none()) || kind.is_none();
+            let needs_attr =
+                (need_attr && attr.is_none()) || kind.is_none() || backend_key.is_none();
             if needs_attr {
                 attr_miss.push(entry.backend_name.clone());
             }
 
             pending.push(PendingEntry {
                 backend_name: entry.backend_name.clone(),
-                backend_key,
+                internal_backend_name,
                 is_internal: entry.is_internal,
                 kind,
                 attr,
+                backend_key,
                 raw_name,
             });
         }
@@ -1184,7 +1204,7 @@ fn list_logical_entries(
         }
     }
 
-    let mut fetched_attrs: HashMap<Vec<u8>, CoreFileAttr> = HashMap::new();
+    let mut fetched_stats: HashMap<Vec<u8>, nix::sys::stat::FileStat> = HashMap::new();
     for name_bytes in &attr_miss {
         let c_name = match cstring_from_bytes(name_bytes) {
             Ok(v) => v,
@@ -1194,23 +1214,27 @@ fn list_logical_entries(
             Ok(st) => st,
             Err(_) => continue,
         };
-        fetched_attrs.insert(name_bytes.clone(), core_attr_from_stat(&stat));
+        fetched_stats.insert(name_bytes.clone(), stat);
     }
 
     for entry in &mut pending {
         if entry.raw_name.is_none()
             && entry.is_internal
-            && let Some(name) = entry.backend_key.as_ref()
+            && let Some(name) = entry.internal_backend_name.as_ref()
             && let Some(raw) = repairs.get(name)
         {
             entry.raw_name = Some(raw.clone());
         }
-        if entry.attr.is_none()
-            && let Some(attr) = fetched_attrs.get(&entry.backend_name)
+        if (entry.attr.is_none() || entry.backend_key.is_none())
+            && let Some(stat) = fetched_stats.get(&entry.backend_name)
         {
-            entry.attr = Some(*attr);
+            let core_attr = core_attr_from_stat(stat);
+            entry.attr.get_or_insert(core_attr);
+            entry
+                .backend_key
+                .get_or_insert_with(|| backend_key_from_stat(stat));
             if entry.kind.is_none() {
-                entry.kind = Some(attr.kind);
+                entry.kind = Some(core_attr.kind);
             }
         }
     }
@@ -1226,6 +1250,7 @@ fn list_logical_entries(
             kind: entry.kind.unwrap_or(CoreFileType::RegularFile),
             attr: entry.attr,
             backend_name: entry.backend_name.clone(),
+            backend_key: entry.backend_key,
         });
     }
 
@@ -1243,9 +1268,15 @@ fn list_logical_entries(
             }
             state.attr_cache.clear();
         }
-        for (backend_name, attr) in fetched_attrs {
+        for (backend_name, stat) in fetched_stats {
             if seen_backend.contains(&backend_name) {
-                state.attr_cache.insert(backend_name, attr);
+                state.attr_cache.insert(
+                    backend_name,
+                    CachedAttr {
+                        attr: core_attr_from_stat(&stat),
+                        backend: backend_key_from_stat(&stat),
+                    },
+                );
             }
         }
         state.attr_cache.retain(|k, _| seen_backend.contains(k));
@@ -1262,15 +1293,16 @@ fn map_long_for_lookup(
 ) -> CoreResult<Vec<u8>> {
     if let Some(entry) = {
         let guard = state.index.read();
-        guard.index.backend_for_raw(raw).cloned()
+        guard.index.backend_for_raw(raw)
     } {
-        let c_name = cstring_from_bytes(&entry).map_err(|_| CoreError::from_errno(libc::EILSEQ))?;
+        let c_name =
+            cstring_from_bytes(entry.as_ref()).map_err(|_| CoreError::from_errno(libc::EILSEQ))?;
         match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-            Ok(_) => return Ok(entry),
+            Ok(_) => return Ok(entry.as_ref().to_vec()),
             Err(nix::errno::Errno::ENOENT) => {
                 {
                     let mut guard = state.index.write();
-                    guard.index.remove(&entry);
+                    guard.index.remove(entry.as_ref());
                     guard.pending = guard.pending.saturating_add(1);
                 }
                 state.attr_cache.clear();
@@ -1354,7 +1386,7 @@ fn map_segment_for_create(
             if let Some(entry_raw) = {
                 let guard = state.index.read();
                 guard.index.get(base_bytes).map(|e| e.raw_name.clone())
-            } && entry_raw == raw
+            } && entry_raw.as_ref() == raw
             {
                 return Err(CoreError::AlreadyExists);
             }
@@ -1374,7 +1406,7 @@ fn map_segment_for_create(
                 };
                 match entry_raw {
                     None => return Ok((BackendName::Internal(candidate.into_bytes()), kind)),
-                    Some(existing) if existing == raw => {
+                    Some(existing) if existing.as_ref() == raw => {
                         return Err(CoreError::AlreadyExists);
                     }
                     Some(_) => continue,
@@ -1391,7 +1423,7 @@ fn select_backend_for_long_name(
 ) -> CoreResult<Vec<u8>> {
     let hash = encode_long_name(logical_raw);
     if let Some(existing) = dir_index.backend_for_raw(logical_raw) {
-        return Ok(existing.clone());
+        return Ok(existing.as_ref().to_vec());
     }
     let base = backend_basename_from_hash(&hash, None);
     if !dir_index.contains_key(base.as_bytes()) {
@@ -1616,10 +1648,35 @@ impl LongNameFsCore {
 
         let logical = list_logical_entries(handle, self.max_name_len, self.index_sync, need_attr)
             .unwrap_or_default();
+        let has_attrs = logical.iter().all(|e| e.attr.is_some());
         if let Some(cache_key) = key {
-            return self.dir_cache.insert(cache_key, logical, need_attr);
+            return self.dir_cache.insert(cache_key, logical, has_attrs);
         }
         Arc::new(logical)
+    }
+
+    pub(crate) fn load_dir_entries_snapshot(
+        &self,
+        handle: &Arc<DirHandle>,
+        need_attr: bool,
+    ) -> Arc<Vec<DirEntryInfo>> {
+        {
+            let guard = handle.snapshot.lock();
+            if let Some(snapshot) = guard.as_ref()
+                && (!need_attr || snapshot.has_attrs)
+            {
+                return snapshot.entries.clone();
+            }
+        }
+
+        let entries = self.load_dir_entries(handle, true);
+        let snapshot = DirSnapshot {
+            entries: entries.clone(),
+            has_attrs: entries.iter().all(|e| e.attr.is_some()),
+        };
+        let mut guard = handle.snapshot.lock();
+        *guard = Some(snapshot);
+        entries
     }
 
     pub(crate) fn stat_path(&self, path: &OsStr) -> CoreResult<CoreFileAttr> {
@@ -3275,21 +3332,36 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             .unwrap_or(FuserFileType::Directory);
         entries.push((parent_ino, parent_kind, OsString::from("..")));
 
-        let dir_listing = self.core.load_dir_entries(&handle, false);
+        let dir_listing = self.core.load_dir_entries_snapshot(&handle, false);
         for info in dir_listing.iter() {
-            let c_name = match CString::new(info.backend_name.clone()) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let (attr, backend_key) = match (info.attr, info.backend_key) {
+                (Some(attr), Some(backend)) => (attr, backend),
+                _ => {
+                    let c_name = match cstring_from_bytes(&info.backend_name) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let stat = match fstatat(
+                        handle.as_fd(),
+                        c_name.as_c_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    (core_attr_from_stat(&stat), backend_key_from_stat(&stat))
+                }
             };
-            let stat = match fstatat(
-                handle.as_fd(),
-                c_name.as_c_str(),
-                AtFlags::AT_SYMLINK_NOFOLLOW,
-            ) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let child_entry = self.ensure_child_entry(ino, &dir_entry.path, &info.name, stat, 0);
+            let child_entry = self.inode_store.get_or_insert(
+                backend_key,
+                InodeKind::from(attr.kind),
+                crate::v2::path::make_child_path(&dir_entry.path, &info.name),
+                Some(ParentName {
+                    parent: ino,
+                    name: info.name.clone(),
+                }),
+                0,
+            );
             let file_type = FuserFileType::from(child_entry.kind);
             entries.push((child_entry.ino, file_type, info.name.clone()));
         }
@@ -3343,23 +3415,37 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             parent_attr,
         ));
 
-        let dir_listing = self.core.load_dir_entries(&handle, true);
+        let dir_listing = self.core.load_dir_entries_snapshot(&handle, true);
         for info in dir_listing.iter() {
-            let c_name = match CString::new(info.backend_name.clone()) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let (attr, backend_key) = match (info.attr, info.backend_key) {
+                (Some(attr), Some(backend)) => (attr, backend),
+                _ => {
+                    let c_name = match cstring_from_bytes(&info.backend_name) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let stat = match fstatat(
+                        handle.as_fd(),
+                        c_name.as_c_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(st) => st,
+                        Err(_) => continue,
+                    };
+                    (core_attr_from_stat(&stat), backend_key_from_stat(&stat))
+                }
             };
-            let stat = match fstatat(
-                handle.as_fd(),
-                c_name.as_c_str(),
-                AtFlags::AT_SYMLINK_NOFOLLOW,
-            ) {
-                Ok(st) => st,
-                Err(_) => continue,
-            };
-            let core_attr = core_attr_from_stat(&stat);
-            let child_entry = self.ensure_child_entry(ino, &dir_entry.path, &info.name, stat, 0);
-            let attr = fuser_attr_from_core(core_attr, child_entry.ino);
+            let child_entry = self.inode_store.get_or_insert(
+                backend_key,
+                InodeKind::from(attr.kind),
+                crate::v2::path::make_child_path(&dir_entry.path, &info.name),
+                Some(ParentName {
+                    parent: ino,
+                    name: info.name.clone(),
+                }),
+                0,
+            );
+            let attr = fuser_attr_from_core(attr, child_entry.ino);
             entries.push((child_entry.ino, info.name.clone(), attr));
         }
 
