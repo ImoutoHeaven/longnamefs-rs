@@ -190,9 +190,37 @@ impl InodeStore {
 
     pub fn remove_parent_name(&self, ino: InodeId, parent: &ParentName) -> Option<InodeEntry> {
         let mut inner = self.inner.write();
+        // 首先在当前可变借用下移除 parent，并记录新的主 parent（如果有）
         let entry = inner.entries.get_mut(&ino)?;
         entry.parents.retain(|p| p != parent);
-        Some(entry.clone())
+        let new_primary = entry.parents.first().cloned();
+
+        if let Some(new_primary) = new_primary {
+            // 结束对 entry 的可变借用后，再次获取可变引用并读取 parent_entry
+            let parent_entry_path = inner
+                .entries
+                .get(&new_primary.parent)
+                .map(|e| e.path.clone());
+
+            if let Some(parent_path) = parent_entry_path {
+                let name = new_primary.name.as_os_str();
+                let new_path = if parent_path.as_os_str() == OsStr::new("/") {
+                    let mut p = OsString::from("/");
+                    p.push(name);
+                    p
+                } else {
+                    let mut p = parent_path;
+                    p.push(OsStr::new("/"));
+                    p.push(name);
+                    p
+                };
+                if let Some(entry) = inner.entries.get_mut(&ino) {
+                    entry.path = new_path;
+                }
+            }
+        }
+
+        inner.entries.get(&ino).cloned()
     }
 
     pub fn update_path(&self, ino: InodeId, path: OsString) -> Option<InodeEntry> {
