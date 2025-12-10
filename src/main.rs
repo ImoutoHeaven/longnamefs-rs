@@ -199,9 +199,64 @@ async fn main() -> anyhow::Result<()> {
                 attr_ttl,
             )
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-            run_mount_fuser(fs, mountpoint, cli.allow_other, cli.nonempty)
+            run_mount_fuser_with_signals(fs, mountpoint, cli.allow_other, cli.nonempty).await
         }
     }
+}
+
+#[cfg(unix)]
+async fn run_mount_fuser_with_signals(
+    fs: LongNameFsV2Fuser,
+    mountpoint: PathBuf,
+    allow_other: bool,
+    nonempty: bool,
+) -> anyhow::Result<()> {
+    async fn detach_mountpoint(path: PathBuf) -> anyhow::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            umount2(&path, MntFlags::MNT_DETACH).map_err(anyhow::Error::from)
+        })
+        .await?
+    }
+
+    let mountpoint_clone = mountpoint.clone();
+    let mut mount_task = tokio::task::spawn_blocking(move || {
+        run_mount_fuser(fs, mountpoint_clone, allow_other, nonempty)
+    });
+
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    let signals = async {
+        tokio::select! {
+            _ = sigint.recv() => (),
+            _ = sigterm.recv() => (),
+        }
+    };
+    tokio::pin!(signals);
+
+    let result = tokio::select! {
+        res = &mut mount_task => res,
+        _ = &mut signals => {
+            let _ = detach_mountpoint(mountpoint.clone()).await;
+            mount_task.await
+        }
+    };
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(join_err) => Err(join_err.into()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn run_mount_fuser_with_signals(
+    fs: LongNameFsV2Fuser,
+    mountpoint: PathBuf,
+    allow_other: bool,
+    nonempty: bool,
+) -> anyhow::Result<()> {
+    run_mount_fuser(fs, mountpoint, allow_other, nonempty)
 }
 
 async fn run_mount<F>(fs: F, mountpoint: PathBuf, mount_opts: MountOptions) -> anyhow::Result<()>

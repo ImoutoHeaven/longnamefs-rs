@@ -295,14 +295,16 @@ impl DirFdCache {
             return fd;
         }
         let expires_at = Instant::now() + self.ttl;
-        let mut entries = self.entries.lock();
-        entries.insert(
-            key,
-            DirFdCacheEntry {
-                expires_at,
-                fd: fd.clone(),
-            },
-        );
+        {
+            let mut entries = self.entries.lock();
+            entries.insert(
+                key,
+                DirFdCacheEntry {
+                    expires_at,
+                    fd: fd.clone(),
+                },
+            );
+        }
         self.touch_lru(key);
         self.evict_if_needed();
         fd
@@ -738,40 +740,67 @@ impl DirInvalidation {
     }
 }
 
+#[derive(Debug)]
+enum NotifyEvent {
+    InvalEntry(InodeId, OsString),
+    InvalInode(InodeId),
+    Delete(InodeId, InodeId, OsString),
+}
+
+#[derive(Default, Debug)]
+struct NotifyInner {
+    sender: Mutex<Option<mpsc::Sender<NotifyEvent>>>,
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct FsNotifier {
     inner: Arc<NotifyInner>,
 }
 
-#[derive(Default, Debug)]
-struct NotifyInner {
-    notifier: RwLock<Option<FuserNotifier>>,
-}
-
 impl FsNotifier {
     pub fn set(&self, notifier: FuserNotifier) {
-        let mut guard = self.inner.notifier.write();
-        if guard.is_none() {
-            *guard = Some(notifier);
+        let mut guard = self.inner.sender.lock();
+        if guard.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<NotifyEvent>();
+        *guard = Some(tx);
+
+        let _ = thread::Builder::new()
+            .name("ln2-fs-notifier".to_string())
+            .spawn(move || {
+                while let Ok(event) = rx.recv() {
+                    match event {
+                        NotifyEvent::InvalEntry(parent, name) => {
+                            let _ = notifier.inval_entry(parent, &name);
+                        }
+                        NotifyEvent::InvalInode(ino) => {
+                            let _ = notifier.inval_inode(ino, 0, 0);
+                        }
+                        NotifyEvent::Delete(parent, child, name) => {
+                            let _ = notifier.delete(parent, child, &name);
+                        }
+                    }
+                }
+            });
+    }
+
+    fn send(&self, event: NotifyEvent) {
+        if let Some(sender) = self.inner.sender.lock().as_ref() {
+            let _ = sender.send(event);
         }
     }
 
     fn inval_entry(&self, parent: InodeId, name: &OsStr) {
-        if let Some(notifier) = self.inner.notifier.read().as_ref() {
-            let _ = notifier.inval_entry(parent, name);
-        }
+        self.send(NotifyEvent::InvalEntry(parent, name.to_os_string()));
     }
 
     fn inval_inode(&self, ino: InodeId) {
-        if let Some(notifier) = self.inner.notifier.read().as_ref() {
-            let _ = notifier.inval_inode(ino, 0, 0);
-        }
+        self.send(NotifyEvent::InvalInode(ino));
     }
 
     fn delete(&self, parent: InodeId, child: InodeId, name: &OsStr) {
-        if let Some(notifier) = self.inner.notifier.read().as_ref() {
-            let _ = notifier.delete(parent, child, name);
-        }
+        self.send(NotifyEvent::Delete(parent, child, name.to_os_string()));
     }
 }
 
@@ -1075,6 +1104,9 @@ fn list_logical_entries(
         };
         let name_bytes = entry.file_name().to_bytes().to_vec();
         if name_bytes.is_empty() {
+            continue;
+        }
+        if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
         if name_bytes.starts_with(INDEX_NAME.as_bytes())
@@ -2209,8 +2241,12 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             self.attr_for_entry(&entry)
         };
         match result {
-            Ok(attr) => reply.attr(&self.attr_ttl, &attr),
-            Err(err) => reply.error(core_err_to_errno(&err)),
+            Ok(attr) => {
+                reply.attr(&self.attr_ttl, &attr)
+            }
+            Err(err) => {
+                reply.error(core_err_to_errno(&err))
+            }
         }
     }
 
@@ -3209,7 +3245,9 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 let _ = self.inode_store.inc_open(ino);
                 reply.opened(fh, flags as u32);
             }
-            Err(err) => reply.error(core_err_to_errno(&err)),
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+            }
         }
     }
 
