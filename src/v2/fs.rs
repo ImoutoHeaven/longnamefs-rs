@@ -19,8 +19,8 @@ use fuse3::path::reply::{DirectoryEntryPlus, ReplyPoll, ReplyXAttr};
 use fuse3::{FileType, SetAttr};
 use fuser::{
     FileAttr as FuserFileAttr, FileType as FuserFileType, Filesystem as FuserFilesystem,
-    KernelConfig, PollHandle as FuserPollHandle, ReplyAttr as FuserReplyAttr,
-    ReplyCreate as FuserReplyCreate, ReplyData as FuserReplyData,
+    KernelConfig, Notifier as FuserNotifier, PollHandle as FuserPollHandle,
+    ReplyAttr as FuserReplyAttr, ReplyCreate as FuserReplyCreate, ReplyData as FuserReplyData,
     ReplyDirectory as FuserReplyDirectory, ReplyDirectoryPlus as FuserReplyDirectoryPlus,
     ReplyEmpty as FuserReplyEmpty, ReplyEntry as FuserReplyEntry, ReplyOpen as FuserReplyOpen,
     ReplyPoll as FuserReplyPoll, ReplyStatfs as FuserReplyStatfs, ReplyWrite as FuserReplyWrite,
@@ -784,6 +784,40 @@ impl DirInvalidation {
         f(self.primary);
         if let Some(key) = self.secondary {
             f(key);
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct FsNotifier {
+    inner: Arc<NotifyInner>,
+}
+
+#[derive(Default, Debug)]
+struct NotifyInner {
+    notifier: RwLock<Option<FuserNotifier>>,
+}
+
+impl FsNotifier {
+    pub fn set(&self, notifier: FuserNotifier) {
+        *self.inner.notifier.write() = Some(notifier);
+    }
+
+    fn inval_entry(&self, parent: InodeId, name: &OsStr) {
+        if let Some(notifier) = self.inner.notifier.read().as_ref() {
+            let _ = notifier.inval_entry(parent, name);
+        }
+    }
+
+    fn inval_inode(&self, ino: InodeId) {
+        if let Some(notifier) = self.inner.notifier.read().as_ref() {
+            let _ = notifier.inval_inode(ino, 0, 0);
+        }
+    }
+
+    fn delete(&self, parent: InodeId, child: InodeId, name: &OsStr) {
+        if let Some(notifier) = self.inner.notifier.read().as_ref() {
+            let _ = notifier.delete(parent, child, name);
         }
     }
 }
@@ -3115,6 +3149,7 @@ pub struct LongNameFsV2Fuser {
     max_write: NonZeroU32,
     attr_ttl: Duration,
     entry_ttl: Duration,
+    notifier: FsNotifier,
 }
 
 impl LongNameFsV2Fuser {
@@ -3135,7 +3170,7 @@ impl LongNameFsV2Fuser {
         )?);
         let bytes = max_write_kb.saturating_mul(1024).max(4096);
         let max_write = NonZeroU32::new(bytes).unwrap_or_else(|| NonZeroU32::new(4096).unwrap());
-
+        let notifier = FsNotifier::default();
         let inode_store = InodeStore::new();
         let root_fd = core.cached_root_fd()?;
         let root_stat = fstat(root_fd.as_fd()).map_err(core_errno_from_nix)?;
@@ -3149,6 +3184,7 @@ impl LongNameFsV2Fuser {
             max_write,
             attr_ttl,
             entry_ttl: attr_ttl,
+            notifier,
         })
     }
 
@@ -3237,6 +3273,25 @@ impl LongNameFsV2Fuser {
             Mode::from_bits_truncate(0o666),
         )
         .map_err(core_errno_from_nix)
+    }
+
+    pub fn notifier_handle(&self) -> FsNotifier {
+        self.notifier.clone()
+    }
+
+    fn notify_entry_change(&self, parent: InodeId, name: &OsStr) {
+        self.notifier.inval_entry(parent, name);
+        self.notifier.inval_inode(parent);
+    }
+
+    fn notify_delete(&self, parent: InodeId, child: InodeId, name: &OsStr) {
+        self.notifier.delete(parent, child, name);
+        self.notifier.inval_inode(parent);
+        self.notifier.inval_inode(child);
+    }
+
+    fn notify_inode(&self, ino: InodeId) {
+        self.notifier.inval_inode(ino);
     }
 }
 
@@ -3591,6 +3646,8 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         };
         let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+        self.notify_entry_change(parent, name);
+        self.notify_inode(child.ino);
         reply.entry(&self.entry_ttl, &attr, 0);
     }
 
@@ -3672,6 +3729,8 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     let fh = self.handles.insert_file(fd);
                     let _ = self.inode_store.inc_open(child.ino);
                     let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+                    self.notify_entry_change(parent, name);
+                    self.notify_inode(child.ino);
                     reply.created(&self.entry_ttl, &attr, 0, fh, 0);
                     return;
                 }
@@ -3743,6 +3802,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         };
         let old_path = crate::v2::path::make_child_path(&src_parent_entry.path, name);
+        let mut renamed_child: Option<InodeId> = None;
         let inv = match self.core.rename_with_flags(
             &src_parent_entry.path,
             name,
@@ -3797,6 +3857,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         ) {
             let child =
                 self.ensure_child_entry(newparent, &dst_parent_entry.path, newname, stat, 0);
+            renamed_child = Some(child.ino);
             let new_path = crate::v2::path::make_child_path(&dst_parent_entry.path, newname);
             if matches!(child.kind, InodeKind::Directory) {
                 self.inode_store.rename_descendants(&old_path, &new_path);
@@ -3816,6 +3877,11 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     name: newname.to_os_string(),
                 },
             );
+        }
+        self.notify_entry_change(parent, name);
+        self.notify_entry_change(newparent, newname);
+        if let Some(child) = renamed_child {
+            self.notify_inode(child);
         }
         reply.ok();
     }
@@ -3905,6 +3971,9 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         };
         let child = self.ensure_child_entry(newparent, &parent_entry.path, newname, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+        self.notify_entry_change(newparent, newname);
+        self.notify_inode(ino);
+        self.notify_inode(child.ino);
         reply.entry(&self.entry_ttl, &attr, 0);
     }
 
@@ -3988,6 +4057,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 name: name.to_os_string(),
             },
         );
+        self.notify_delete(parent, child.ino, name);
         reply.ok();
     }
 
@@ -4101,6 +4171,9 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     name: name.to_os_string(),
                 },
             );
+            self.notify_delete(parent, child.ino, name);
+        } else {
+            self.notify_entry_change(parent, name);
         }
         reply.ok();
     }
@@ -4186,6 +4259,8 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         };
         let child = self.ensure_child_entry(parent, &parent_entry.path, link_name, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+        self.notify_entry_change(parent, link_name);
+        self.notify_inode(child.ino);
         reply.entry(&self.entry_ttl, &attr, 0);
     }
 
@@ -4491,6 +4566,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 {
                     self.invalidate_dir(mapped.dir_fd.as_fd());
                 }
+                self.notify_inode(ino);
                 reply.written(written as u32);
             }
             Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
@@ -4524,6 +4600,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         {
             self.invalidate_dir(mapped.dir_fd.as_fd());
         }
+        self.notify_inode(ino);
         reply.ok();
     }
 
@@ -4862,6 +4939,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 self.invalidate_dir(ctx.dir_fd.as_fd());
             }
         }
+        self.notify_inode(ino);
         reply.ok();
     }
 

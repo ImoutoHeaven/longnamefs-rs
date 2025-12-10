@@ -13,7 +13,7 @@ use fs::LongNameFs;
 use fuse3::MountOptions;
 use fuse3::path::PathFilesystem;
 use fuse3::path::Session;
-use fuser::{MountOption as FuserMountOption, mount2 as fuser_mount2};
+use fuser::{MountOption as FuserMountOption, Session as FuserSession};
 #[cfg(unix)]
 use futures_util::future::poll_fn;
 #[cfg(unix)]
@@ -316,5 +316,8 @@ fn run_mount_fuser(
     if nonempty {
         options.push(FuserMountOption::CUSTOM("nonempty".to_string()));
     }
-    fuser_mount2(fs, mountpoint, &options).map_err(anyhow::Error::from)
+    let notifier = fs.notifier_handle();
+    let mut session = FuserSession::new(fs, mountpoint, &options).map_err(anyhow::Error::from)?;
+    notifier.set(session.notifier());
+    session.run().map_err(anyhow::Error::from)
 }
