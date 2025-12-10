@@ -800,7 +800,10 @@ struct NotifyInner {
 
 impl FsNotifier {
     pub fn set(&self, notifier: FuserNotifier) {
-        *self.inner.notifier.write() = Some(notifier);
+        let mut guard = self.inner.notifier.write();
+        if guard.is_none() {
+            *guard = Some(notifier);
+        }
     }
 
     fn inval_entry(&self, parent: InodeId, name: &OsStr) {
@@ -3437,6 +3440,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     return;
                 }
             }
+            self.notify_inode(ino);
             match self.attr_for_entry(&entry) {
                 Ok(attr) => reply.attr(&self.attr_ttl, &attr),
                 Err(err) => reply.error(core_err_to_errno(&err)),
@@ -3524,6 +3528,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         }
 
         self.invalidate_dir(mapped.dir_fd.as_fd());
+        self.notify_inode(ino);
         match self.attr_for_entry(&entry) {
             Ok(attr) => reply.attr(&self.attr_ttl, &attr),
             Err(err) => reply.error(core_err_to_errno(&err)),
