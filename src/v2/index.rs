@@ -18,14 +18,14 @@ const INDEX_NAME_CSTR: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b".l
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirIndexEntry {
-    pub backend_name: String,
+    pub backend_name: Vec<u8>,
     pub raw_name: Vec<u8>,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct DirIndex {
-    entries: HashMap<String, DirIndexEntry>,
-    raw_to_backend: HashMap<Vec<u8>, String>,
+    entries: HashMap<Vec<u8>, DirIndexEntry>,
+    raw_to_backend: HashMap<Vec<u8>, Vec<u8>>,
     dirty: bool,
 }
 
@@ -38,7 +38,7 @@ impl DirIndex {
         }
     }
 
-    pub fn upsert(&mut self, backend_name: String, raw_name: Vec<u8>) {
+    pub fn upsert(&mut self, backend_name: Vec<u8>, raw_name: Vec<u8>) {
         let entry = DirIndexEntry {
             backend_name: backend_name.clone(),
             raw_name,
@@ -51,7 +51,7 @@ impl DirIndex {
         self.dirty = true;
     }
 
-    pub fn remove(&mut self, backend_name: &str) -> Option<DirIndexEntry> {
+    pub fn remove(&mut self, backend_name: &[u8]) -> Option<DirIndexEntry> {
         let removed = self.entries.remove(backend_name);
         if let Some(entry) = &removed {
             self.raw_to_backend.remove(&entry.raw_name);
@@ -62,15 +62,15 @@ impl DirIndex {
         removed
     }
 
-    pub fn get(&self, backend_name: &str) -> Option<&DirIndexEntry> {
+    pub fn get(&self, backend_name: &[u8]) -> Option<&DirIndexEntry> {
         self.entries.get(backend_name)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &DirIndexEntry)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &DirIndexEntry)> {
         self.entries.iter()
     }
 
-    pub fn contains_key(&self, backend_name: &str) -> bool {
+    pub fn contains_key(&self, backend_name: &[u8]) -> bool {
         self.entries.contains_key(backend_name)
     }
 
@@ -90,7 +90,7 @@ impl DirIndex {
         self.raw_to_backend.contains_key(raw)
     }
 
-    pub fn backend_for_raw(&self, raw: &[u8]) -> Option<&String> {
+    pub fn backend_for_raw(&self, raw: &[u8]) -> Option<&Vec<u8>> {
         self.raw_to_backend.get(raw)
     }
 }
@@ -146,9 +146,7 @@ fn decode_index_bytes(bytes: &[u8]) -> Option<DirIndex> {
         if bytes.len() < offset + name_len {
             return None;
         }
-        let name = std::str::from_utf8(&bytes[offset..offset + name_len])
-            .ok()?
-            .to_owned();
+        let name = bytes[offset..offset + name_len].to_vec();
         offset += name_len;
 
         let raw_len = read_u32(bytes, &mut offset)? as usize;
@@ -190,9 +188,8 @@ fn encode_index(index: &DirIndex) -> Vec<u8> {
     buf.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
 
     for entry in index.entries.values() {
-        let name_bytes = entry.backend_name.as_bytes();
-        buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        buf.extend_from_slice(name_bytes);
+        buf.extend_from_slice(&(entry.backend_name.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.backend_name);
 
         buf.extend_from_slice(&(entry.raw_name.len() as u32).to_le_bytes());
         buf.extend_from_slice(&entry.raw_name);
@@ -203,6 +200,10 @@ fn encode_index(index: &DirIndex) -> Vec<u8> {
 
 pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> CoreResult<()> {
     let data = encode_index(index);
+    if data.len() > MAX_INDEX_BYTES {
+        eprintln!("Index too large to write: {} bytes", data.len());
+        return Ok(());
+    }
     let tmp = core_begin_temp_file(dir_fd, INDEX_NAME_CSTR, "idx").map_err(CoreError::from)?;
     let mut written = 0;
     while written < data.len() {

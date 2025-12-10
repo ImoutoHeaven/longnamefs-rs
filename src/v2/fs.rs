@@ -868,7 +868,11 @@ fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
 
 fn probe_renameat2(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
     let final_name = core_string_to_cstring(".__ln2_renameat2_probe")?;
-    let temp = core_begin_temp_file(dir_fd, final_name.as_c_str(), "rn2")?;
+    let temp = match core_begin_temp_file(dir_fd, final_name.as_c_str(), "rn2") {
+        Ok(v) => v,
+        Err(err) if err.raw_os_error() == Some(libc::EROFS) => return Ok(false),
+        Err(err) => return Err(CoreError::from(err)),
+    };
     let mut dst_bytes = temp.name.as_bytes().to_vec();
     dst_bytes.extend_from_slice(b".dst");
     let dst_name = CString::new(dst_bytes).map_err(|_| CoreError::from_errno(libc::EINVAL))?;
@@ -939,17 +943,13 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let backend_name = match std::str::from_utf8(&name_bytes) {
-                Ok(s) => s.to_owned(),
-                Err(_) => continue,
-            };
-            index.upsert(backend_name, raw_name);
+            index.upsert(name_bytes, raw_name);
         }
         return Ok(index);
     }
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let (res_tx, res_rx) = mpsc::channel::<(String, Vec<u8>)>();
+    let (res_tx, res_rx) = mpsc::channel::<(Vec<u8>, Vec<u8>)>();
     let workers = PARALLEL_REBUILD_WORKERS.max(1);
 
     thread::scope(|scope| {
@@ -987,11 +987,7 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let backend_name = match std::str::from_utf8(&name_bytes) {
-                        Ok(s) => s.to_owned(),
-                        Err(_) => continue,
-                    };
-                    let _ = res_tx.send((backend_name, raw_name));
+                    let _ = res_tx.send((name_bytes, raw_name));
                 }
             });
         }
@@ -1089,7 +1085,7 @@ fn list_logical_entries(
     #[derive(Debug)]
     struct PendingEntry {
         backend_name: Vec<u8>,
-        backend_str: Option<String>,
+        backend_key: Option<Vec<u8>>,
         is_internal: bool,
         kind: Option<CoreFileType>,
         attr: Option<CoreFileAttr>,
@@ -1132,17 +1128,16 @@ fn list_logical_entries(
         for entry in &scanned {
             let attr = state.attr_cache.get(&entry.backend_name).cloned();
             let kind = entry.kind_hint.or_else(|| attr.as_ref().map(|a| a.kind));
-            let mut backend_str = None;
+            let mut backend_key = None;
 
             let raw_name = if entry.is_internal {
-                let name_str = match std::str::from_utf8(&entry.backend_name) {
-                    Ok(v) => v.to_owned(),
-                    Err(_) => continue,
-                };
-                backend_str = Some(name_str.clone());
-                let existing = index.index.get(&name_str).map(|e| e.raw_name.clone());
+                backend_key = Some(entry.backend_name.clone());
+                let existing = index
+                    .index
+                    .get(&entry.backend_name)
+                    .map(|e| e.raw_name.clone());
                 if existing.is_none() {
-                    repair_candidates.push(name_str);
+                    repair_candidates.push(entry.backend_name.clone());
                 }
                 existing
             } else {
@@ -1156,7 +1151,7 @@ fn list_logical_entries(
 
             pending.push(PendingEntry {
                 backend_name: entry.backend_name.clone(),
-                backend_str,
+                backend_key,
                 is_internal: entry.is_internal,
                 kind,
                 attr,
@@ -1165,9 +1160,9 @@ fn list_logical_entries(
         }
     }
 
-    let mut repairs: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut repairs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     for backend_name in &repair_candidates {
-        let c_name = match core_string_to_cstring(backend_name) {
+        let c_name = match cstring_from_bytes(backend_name) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -1203,7 +1198,7 @@ fn list_logical_entries(
     for entry in &mut pending {
         if entry.raw_name.is_none()
             && entry.is_internal
-            && let Some(name) = entry.backend_str.as_ref()
+            && let Some(name) = entry.backend_key.as_ref()
             && let Some(raw) = repairs.get(name)
         {
             entry.raw_name = Some(raw.clone());
@@ -1267,9 +1262,11 @@ fn map_long_for_lookup(
         let guard = state.index.read();
         guard.index.backend_for_raw(raw).cloned()
     } {
-        let c_name = core_string_to_cstring(&entry)?;
+        let entry_str =
+            String::from_utf8(entry.clone()).map_err(|_| CoreError::from_errno(libc::EILSEQ))?;
+        let c_name = core_string_to_cstring(&entry_str)?;
         match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-            Ok(_) => return Ok(entry),
+            Ok(_) => return Ok(entry_str),
             Err(nix::errno::Errno::ENOENT) => {
                 {
                     let mut guard = state.index.write();
@@ -1300,7 +1297,7 @@ fn map_long_for_lookup(
                 {
                     {
                         let mut guard = state.index.write();
-                        guard.index.upsert(candidate.clone(), raw_name);
+                        guard.index.upsert(candidate.clone().into_bytes(), raw_name);
                         guard.pending = guard.pending.saturating_add(1);
                     }
                     state.attr_cache.clear();
@@ -1353,14 +1350,14 @@ fn map_segment_for_create(
             let base = backend_basename_from_hash(&hash, None);
             if let Some(entry_raw) = {
                 let guard = state.index.read();
-                guard.index.get(&base).map(|e| e.raw_name.clone())
+                guard.index.get(base.as_bytes()).map(|e| e.raw_name.clone())
             } && entry_raw == raw
             {
                 return Err(CoreError::AlreadyExists);
             }
             let has_base = {
                 let guard = state.index.read();
-                guard.index.contains_key(&base)
+                guard.index.contains_key(base.as_bytes())
             };
             if !has_base {
                 return Ok((BackendName::Internal(base), kind));
@@ -1369,7 +1366,10 @@ fn map_segment_for_create(
                 let candidate = backend_basename_from_hash(&hash, Some(suffix));
                 let entry_raw = {
                     let guard = state.index.read();
-                    guard.index.get(&candidate).map(|e| e.raw_name.clone())
+                    guard
+                        .index
+                        .get(candidate.as_bytes())
+                        .map(|e| e.raw_name.clone())
                 };
                 match entry_raw {
                     None => return Ok((BackendName::Internal(candidate), kind)),
@@ -1390,15 +1390,16 @@ fn select_backend_for_long_name(
 ) -> CoreResult<String> {
     let hash = encode_long_name(logical_raw);
     if let Some(existing) = dir_index.backend_for_raw(logical_raw) {
-        return Ok(existing.clone());
+        return String::from_utf8(existing.clone())
+            .map_err(|_| CoreError::from_errno(libc::EILSEQ));
     }
     let base = backend_basename_from_hash(&hash, None);
-    if !dir_index.contains_key(&base) {
+    if !dir_index.contains_key(base.as_bytes()) {
         return Ok(base);
     }
     for suffix in 1..=MAX_COLLISION_SUFFIX {
         let candidate = backend_basename_from_hash(&hash, Some(suffix));
-        if !dir_index.contains_key(&candidate) {
+        if !dir_index.contains_key(candidate.as_bytes()) {
             return Ok(candidate);
         }
     }
@@ -1414,10 +1415,10 @@ enum CreateDecision {
 fn handle_backend_eexist_index_missing(
     dir_fd: BorrowedFd<'_>,
     state: &mut DirState,
-    backend_name: &str,
+    backend_name: &[u8],
     desired_raw: &[u8],
 ) -> CoreResult<CreateDecision> {
-    let c_name = core_string_to_cstring(backend_name)?;
+    let c_name = cstring_from_bytes(backend_name)?;
     let fd = nix::fcntl::openat(
         dir_fd,
         c_name.as_c_str(),
@@ -1485,16 +1486,36 @@ fn open_backend_root(config: &Config) -> CoreResult<OwnedFd> {
     .map_err(core_errno_from_nix)
 }
 
-fn raw_fd_for_xattr(core: &LongNameFsCore, path: &OsStr) -> CoreResult<(RawFd, Option<OwnedFd>)> {
+fn raw_fd_for_xattr(
+    core: &LongNameFsCore,
+    path: &OsStr,
+    write_intent: bool,
+) -> CoreResult<(RawFd, Option<OwnedFd>)> {
+    let access_mode = if write_intent {
+        OFlag::O_RDWR
+    } else {
+        OFlag::O_RDONLY
+    };
     if path == OsStr::new("/") {
-        return Ok((core.config.backend_fd().as_raw_fd(), None));
+        if !write_intent {
+            return Ok((core.config.backend_fd().as_raw_fd(), None));
+        }
+        let fd = nix::fcntl::openat(
+            core.config.backend_fd(),
+            ".",
+            access_mode | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(core_errno_from_nix)?;
+        let raw = fd.as_raw_fd();
+        return Ok((raw, Some(fd)));
     }
     let mapped = core.resolve_path(path)?;
     let fname = mapped.backend_name.as_cstring()?;
     let fd = nix::fcntl::openat(
         mapped.dir_fd.as_fd(),
         fname.as_c_str(),
-        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        access_mode | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
     )
     .map_err(core_errno_from_nix)?;
@@ -1822,7 +1843,7 @@ impl LongNameFsCore {
                         refresh_dir_index_from_backend(dst.ctx.dir_fd.as_fd(), &dst_internal)?;
                     {
                         let mut guard = dst.ctx.state.index.write();
-                        guard.index.upsert(dst_internal.clone(), raw);
+                        guard.index.upsert(dst_internal.as_bytes().to_vec(), raw);
                         guard.pending = guard.pending.saturating_add(1);
                         dst_internal =
                             select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
@@ -1835,9 +1856,10 @@ impl LongNameFsCore {
 
         {
             let mut guard = dst.ctx.state.index.write();
-            guard
-                .index
-                .upsert(dst_internal.clone(), dst.path.logical_name.clone());
+            guard.index.upsert(
+                dst_internal.as_bytes().to_vec(),
+                dst.path.logical_name.clone(),
+            );
             guard.pending = guard.pending.saturating_add(1);
         }
         dst.ctx.state.attr_cache.clear();
@@ -1862,7 +1884,7 @@ impl LongNameFsCore {
             &dst_backend,
             flags,
         )?;
-        let backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
+        let backend_name = src_backend.display_bytes();
         {
             let mut src_guard = src.ctx.state.index.write();
             if src_guard.index.remove(&backend_name).is_some() {
@@ -1908,7 +1930,7 @@ impl LongNameFsCore {
                         refresh_dir_index_from_backend(dst.ctx.dir_fd.as_fd(), &dst_internal)?;
                     {
                         let mut guard = dst.ctx.state.index.write();
-                        guard.index.upsert(dst_internal.clone(), raw);
+                        guard.index.upsert(dst_internal.as_bytes().to_vec(), raw);
                         guard.pending = guard.pending.saturating_add(1);
                         dst_internal =
                             select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?;
@@ -1929,15 +1951,16 @@ impl LongNameFsCore {
         .map_err(core_errno_from_nix)?;
         set_internal_rawname(dst_fd.as_fd(), &dst.path.logical_name)?;
 
-        let src_backend_name = String::from_utf8(src_backend.display_bytes()).unwrap();
+        let src_backend_name = src_backend.display_bytes();
         if same_dir {
             let mut guard = dst.ctx.state.index.write();
             if guard.index.remove(&src_backend_name).is_some() {
                 guard.pending = guard.pending.saturating_add(1);
             }
-            guard
-                .index
-                .upsert(dst_internal.clone(), dst.path.logical_name.clone());
+            guard.index.upsert(
+                dst_internal.as_bytes().to_vec(),
+                dst.path.logical_name.clone(),
+            );
             guard.pending = guard.pending.saturating_add(1);
         } else {
             let src_key = (src.path.parent_key.dev, src.path.parent_key.ino);
@@ -1948,9 +1971,10 @@ impl LongNameFsCore {
                 if src_guard.index.remove(&src_backend_name).is_some() {
                     src_guard.pending = src_guard.pending.saturating_add(1);
                 }
-                dst_guard
-                    .index
-                    .upsert(dst_internal.clone(), dst.path.logical_name.clone());
+                dst_guard.index.upsert(
+                    dst_internal.as_bytes().to_vec(),
+                    dst.path.logical_name.clone(),
+                );
                 dst_guard.pending = dst_guard.pending.saturating_add(1);
             } else {
                 let mut dst_guard = dst.ctx.state.index.write();
@@ -1958,9 +1982,10 @@ impl LongNameFsCore {
                 if src_guard.index.remove(&src_backend_name).is_some() {
                     src_guard.pending = src_guard.pending.saturating_add(1);
                 }
-                dst_guard
-                    .index
-                    .upsert(dst_internal.clone(), dst.path.logical_name.clone());
+                dst_guard.index.upsert(
+                    dst_internal.as_bytes().to_vec(),
+                    dst.path.logical_name.clone(),
+                );
                 dst_guard.pending = dst_guard.pending.saturating_add(1);
             }
         }
@@ -2241,12 +2266,8 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             self.attr_for_entry(&entry)
         };
         match result {
-            Ok(attr) => {
-                reply.attr(&self.attr_ttl, &attr)
-            }
-            Err(err) => {
-                reply.error(core_err_to_errno(&err))
-            }
+            Ok(attr) => reply.attr(&self.attr_ttl, &attr),
+            Err(err) => reply.error(core_err_to_errno(&err)),
         }
     }
 
@@ -2500,10 +2521,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
             {
                 let mut guard = ctx.state.index.write();
-                guard.index.upsert(
-                    String::from_utf8(backend.display_bytes()).unwrap(),
-                    raw.clone(),
-                );
+                guard.index.upsert(backend.display_bytes(), raw.clone());
                 guard.pending = guard.pending.saturating_add(1);
             }
             ctx.state.attr_cache.clear();
@@ -2567,6 +2585,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     return;
                 }
             };
+            let backend_bytes = backend.0.display_bytes();
             match nix::fcntl::openat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
@@ -2581,10 +2600,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                         }
                         {
                             let mut guard = ctx.state.index.write();
-                            guard.index.upsert(
-                                String::from_utf8(backend.0.display_bytes()).unwrap(),
-                                raw.clone(),
-                            );
+                            guard.index.upsert(backend_bytes.clone(), raw.clone());
                             guard.pending = guard.pending.saturating_add(1);
                         }
                         ctx.state.attr_cache.clear();
@@ -2619,7 +2635,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     let decision = match handle_backend_eexist_index_missing(
                         ctx.dir_fd.as_fd(),
                         &mut ctx.state,
-                        &String::from_utf8(backend.0.display_bytes()).unwrap(),
+                        &backend_bytes,
                         &raw,
                     ) {
                         Ok(v) => v,
@@ -2914,11 +2930,8 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         if matches!(kind, SegmentKind::Long) {
             {
                 let mut guard = ctx.state.index.write();
-                if guard
-                    .index
-                    .remove(&String::from_utf8(backend.display_bytes()).unwrap())
-                    .is_some()
-                {
+                let backend_bytes = backend.display_bytes();
+                if guard.index.remove(&backend_bytes).is_some() {
                     guard.pending = guard.pending.saturating_add(1);
                 }
             }
@@ -2982,12 +2995,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )
         .ok();
-        match unlinkat(
+        let backend_bytes = backend.display_bytes();
+        let mut guard = ctx.state.index.write();
+        let removal = match unlinkat(
             ctx.dir_fd.as_fd(),
             fname.as_c_str(),
             UnlinkatFlags::RemoveDir,
         ) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(nix::errno::Errno::ENOTEMPTY) => {
                 if let Ok(target_dir_fd) = nix::fcntl::openat(
                     ctx.dir_fd.as_fd(),
@@ -3010,34 +3025,26 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                         );
                     }
                 }
-                if let Err(err) = unlinkat(
+                unlinkat(
                     ctx.dir_fd.as_fd(),
                     fname.as_c_str(),
                     UnlinkatFlags::RemoveDir,
-                ) {
-                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                    return;
-                }
+                )
+                .map_err(core_errno_from_nix)
             }
-            Err(err) => {
-                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                return;
-            }
+            Err(err) => Err(core_errno_from_nix(err)),
+        };
+        if let Err(err) = removal {
+            reply.error(core_err_to_errno(&err));
+            return;
         }
-        if matches!(kind, SegmentKind::Long) {
-            {
-                let mut guard = ctx.state.index.write();
-                if guard
-                    .index
-                    .remove(&String::from_utf8(backend.display_bytes()).unwrap())
-                    .is_some()
-                {
-                    guard.pending = guard.pending.saturating_add(1);
-                }
-            }
-            ctx.state.attr_cache.clear();
+        if matches!(kind, SegmentKind::Long) && guard.index.remove(&backend_bytes).is_some() {
+            guard.pending = guard.pending.saturating_add(1);
         }
-        let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
+        guard.index.clear_dirty();
+        guard.pending = 0;
+        ctx.state.attr_cache.clear();
+        drop(guard);
         self.invalidate_dir(ctx.dir_fd.as_fd());
         if let Some(stat) = existing_stat {
             let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 0);
@@ -3113,10 +3120,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
             {
                 let mut guard = ctx.state.index.write();
-                guard.index.upsert(
-                    String::from_utf8(backend.display_bytes()).unwrap(),
-                    raw.clone(),
-                );
+                guard.index.upsert(backend.display_bytes(), raw.clone());
                 guard.pending = guard.pending.saturating_add(1);
             }
             ctx.state.attr_cache.clear();
@@ -3204,10 +3208,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
             {
                 let mut guard = ctx.state.index.write();
-                guard.index.upsert(
-                    String::from_utf8(backend.display_bytes()).unwrap(),
-                    raw.clone(),
-                );
+                guard.index.upsert(backend.display_bytes(), raw.clone());
                 guard.pending = guard.pending.saturating_add(1);
             }
             ctx.state.attr_cache.clear();
@@ -3568,7 +3569,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path) {
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path, true) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3615,7 +3616,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path) {
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path, false) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3659,7 +3660,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path) {
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path, false) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3729,7 +3730,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path) {
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path, true) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3920,7 +3921,7 @@ mod tests {
         };
         {
             let mut guard = state.index.write();
-            guard.index.upsert(backend_name, raw.clone());
+            guard.index.upsert(backend_name.into_bytes(), raw.clone());
         }
         let err = map_segment_for_create(&state, &raw, raw.len() + 4).unwrap_err();
         assert!(matches!(err, CoreError::AlreadyExists));
