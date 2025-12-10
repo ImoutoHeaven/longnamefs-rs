@@ -6,7 +6,7 @@ mod pathmap;
 mod util;
 mod v2;
 
-use crate::v2::{IndexSync, LongNameFsV2, LongNameFsV2Fuser};
+use crate::v2::{IndexSync, LongNameFsV2Fuser};
 use clap::{Parser, ValueEnum};
 use config::Config;
 use fs::LongNameFs;
@@ -69,7 +69,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_other: bool,
 
-    /// Select FUSE binding (fuse3 async legacy vs fuser sync, experimental).
+    /// Select FUSE binding (v1 uses fuse3; v2 always uses fuser; this flag is ignored for v2).
     #[arg(long, value_enum, default_value_t = FuseImpl::Fuse3)]
     fuse_impl: FuseImpl,
 
@@ -187,31 +187,19 @@ async fn main() -> anyhow::Result<()> {
             eprintln!(
                 "WARNING: backend layout v2 is experimental and incompatible with v1 data; use a dedicated empty backend directory."
             );
-            match cli.fuse_impl {
-                FuseImpl::Fuse3 => {
-                    let fs = LongNameFsV2::new(
-                        config,
-                        cli.max_name_len,
-                        cache_ttl,
-                        cli.max_write_kb,
-                        cli.index_sync.into(),
-                        attr_ttl,
-                    )?;
-                    run_mount(fs, mountpoint, mount_opts).await
-                }
-                FuseImpl::Fuser => {
-                    let fs = LongNameFsV2Fuser::new(
-                        config,
-                        cli.max_name_len,
-                        cache_ttl,
-                        cli.max_write_kb,
-                        cli.index_sync.into(),
-                        attr_ttl,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                    run_mount_fuser(fs, mountpoint, cli.allow_other, cli.nonempty)
-                }
+            if cli.fuse_impl == FuseImpl::Fuse3 {
+                eprintln!("v2 now only supports the fuser adapter; falling back to fuser.");
             }
+            let fs = LongNameFsV2Fuser::new(
+                config,
+                cli.max_name_len,
+                cache_ttl,
+                cli.max_write_kb,
+                cli.index_sync.into(),
+                attr_ttl,
+            )
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            run_mount_fuser(fs, mountpoint, cli.allow_other, cli.nonempty)
         }
     }
 }

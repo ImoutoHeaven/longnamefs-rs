@@ -1,7 +1,7 @@
 longnamefs-rs
 =============
 
-Rust + FUSE3 implementation of a “long filename shim” with two backend layouts:
+Rust FUSE implementation (v1 via fuse3 async, v2 via fuser sync) of a “long filename shim” with two backend layouts:
 
 - **v1 (hash + namefile)**: matches the original C `longnamefs` layout; safe to share the same backend directory with the C implementation.
 - **v2 (xattr + index)**: a new backend, not compatible with v1/C; use a fresh/dedicated backend directory. Long-name hardlinks are rejected by design.
@@ -60,7 +60,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--nonempty`: allow mounting on a non-empty mountpoint.
 - `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000); also drives the directory FD cache used by the v2 path resolver.
 - `--no-dir-cache`: disable directory cache (useful for debugging).
-- `--attr-ttl-ms`: attr/entry TTL for FUSE replies (default 1000); set to 0 to disable kernel caching (recommended for v2 if you need strict visibility of newly created long names until invalidation is added).
+- `--attr-ttl-ms`: attr/entry TTL for FUSE replies (default 1000); set to 0 to disable kernel caching if you prefer strongest visibility guarantees.
 - `--max-write-kb`: maximum write size advertised to FUSE in KiB (default 1024; kernel may clamp).
 - `--sync-data`: fdatasync after writes for stronger durability (at the cost of throughput).
 - The process attempts to raise `RLIMIT_NOFILE` on Unix to reduce `EMFILE` risk when many directory FDs are cached; set a generous `ulimit -n` (e.g. 65536) in production.
@@ -70,6 +70,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--unsafe-namefile-writes`: use non-transactional namefile updates (faster for many small files, but filename metadata may be lost or become inconsistent on crash).
 
 **v2 (xattr + index, incompatible with C/v1 backends)**
+- Uses the fuser adapter exclusively; the `--fuse-impl` switch is ignored for v2.
 - `--max-name-len`: maximum logical segment length accepted (default 1024; returns `ENAMETOOLONG`/`EINVAL` when exceeded).
 - `--index-sync`: `always` flush index on every mutation, `batch` (default) flushes when 128 pending changes or 5s elapsed, `off` disables background flush (index rebuild will recover).
 
