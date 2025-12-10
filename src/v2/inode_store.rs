@@ -1,7 +1,7 @@
+use crate::v2::error::{CoreError, CoreResult};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type InodeId = u64;
@@ -36,7 +36,8 @@ pub struct InodeEntry {
     pub ino: InodeId,
     pub kind: InodeKind,
     pub backend: BackendKey,
-    pub path: OsString,
+    pub parent: InodeId,
+    pub name: OsString,
     pub parents: Vec<ParentName>,
     pub lookup_count: u64,
     pub open_count: u32,
@@ -82,7 +83,8 @@ impl InodeStore {
             ino: ROOT_INODE,
             kind: InodeKind::Directory,
             backend,
-            path: OsString::from("/"),
+            parent: ROOT_INODE,
+            name: OsString::from("/"),
             parents: Vec::new(),
             lookup_count: 1,
             open_count: 0,
@@ -96,48 +98,81 @@ impl InodeStore {
         self.inner.read().entries.get(&ino).cloned()
     }
 
+    pub fn get_path(&self, ino: InodeId) -> CoreResult<OsString> {
+        if ino == ROOT_INODE {
+            return Ok(OsString::from("/"));
+        }
+        let inner = self.inner.read();
+        let mut components = Vec::new();
+        let mut current_ino = ino;
+        let mut depth = 0usize;
+        const MAX_DEPTH: usize = 256;
+
+        while current_ino != ROOT_INODE {
+            if depth >= MAX_DEPTH {
+                return Err(CoreError::InternalMeta);
+            }
+            let entry = inner.entries.get(&current_ino).ok_or(CoreError::NotFound)?;
+            components.push(entry.name.clone());
+            if entry.parent == current_ino {
+                return Err(CoreError::InternalMeta);
+            }
+            current_ino = entry.parent;
+            depth += 1;
+        }
+
+        let mut path = OsString::from("/");
+        for component in components.iter().rev() {
+            if path.len() > 1 {
+                path.push(OsStr::new("/"));
+            }
+            path.push(component);
+        }
+        Ok(path)
+    }
+
+    pub fn move_entry(&self, ino: InodeId, new_parent: ParentName) -> CoreResult<InodeEntry> {
+        let mut inner = self.inner.write();
+        let entry = inner.entries.get_mut(&ino).ok_or(CoreError::NotFound)?;
+        Self::set_primary_parent(entry, &new_parent);
+        Ok(entry.clone())
+    }
+
     pub fn lookup_or_create(
         &self,
         backend: BackendKey,
         kind: InodeKind,
-        path: OsString,
-        parent: Option<ParentName>,
+        parent: ParentName,
     ) -> InodeEntry {
-        self.get_or_insert(backend, kind, path, parent, 1)
+        self.get_or_insert(backend, kind, parent, 1)
     }
 
     pub fn get_or_insert(
         &self,
         backend: BackendKey,
         kind: InodeKind,
-        path: OsString,
-        parent: Option<ParentName>,
+        parent: ParentName,
         lookup_inc: u64,
     ) -> InodeEntry {
         let mut inner = self.inner.write();
         if let Some(&ino) = inner.backend.get(&backend) {
             let entry = inner.entries.get_mut(&ino).expect("inode map out of sync");
             entry.lookup_count = entry.lookup_count.saturating_add(lookup_inc);
-            entry.path = path.clone();
-            if let Some(parent) = parent {
-                Self::push_parent(entry, parent);
-            }
+            Self::set_primary_parent(entry, &parent);
             return entry.clone();
         }
 
         let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-        let mut entry = InodeEntry {
+        let entry = InodeEntry {
             ino,
             kind,
             backend,
-            path,
-            parents: Vec::new(),
+            parent: parent.parent,
+            name: parent.name.clone(),
+            parents: vec![parent],
             lookup_count: lookup_inc,
             open_count: 0,
         };
-        if let Some(parent) = parent {
-            Self::push_parent(&mut entry, parent);
-        }
         inner.backend.insert(backend, ino);
         inner.entries.insert(ino, entry.clone());
         entry
@@ -190,77 +225,40 @@ impl InodeStore {
 
     pub fn remove_parent_name(&self, ino: InodeId, parent: &ParentName) -> Option<InodeEntry> {
         let mut inner = self.inner.write();
-        // 首先在当前可变借用下移除 parent，并记录新的主 parent（如果有）
         let entry = inner.entries.get_mut(&ino)?;
+        let removing_primary = entry.parent == parent.parent && entry.name == parent.name;
         entry.parents.retain(|p| p != parent);
-        let new_primary = entry.parents.first().cloned();
-
-        if let Some(new_primary) = new_primary {
-            // 结束对 entry 的可变借用后，再次获取可变引用并读取 parent_entry
-            let parent_entry_path = inner
-                .entries
-                .get(&new_primary.parent)
-                .map(|e| e.path.clone());
-
-            if let Some(parent_path) = parent_entry_path {
-                let name = new_primary.name.as_os_str();
-                let new_path = if parent_path.as_os_str() == OsStr::new("/") {
-                    let mut p = OsString::from("/");
-                    p.push(name);
-                    p
-                } else {
-                    let mut p = parent_path;
-                    p.push(OsStr::new("/"));
-                    p.push(name);
-                    p
-                };
-                if let Some(entry) = inner.entries.get_mut(&ino) {
-                    entry.path = new_path;
-                }
+        if removing_primary {
+            if let Some(new_primary) = entry.parents.first().cloned() {
+                Self::set_primary_parent(entry, &new_primary);
+            } else if ino != ROOT_INODE {
+                entry.parent = ROOT_INODE;
+                entry.name = OsString::new();
             }
         }
 
         inner.entries.get(&ino).cloned()
     }
 
-    pub fn update_path(&self, ino: InodeId, path: OsString) -> Option<InodeEntry> {
-        let mut inner = self.inner.write();
-        let entry = inner.entries.get_mut(&ino)?;
-        entry.path = path;
-        Some(entry.clone())
-    }
-
-    pub fn rename_descendants(&self, old_prefix: &OsStr, new_prefix: &OsStr) {
-        let old_bytes = old_prefix.as_bytes();
-        let new_bytes = new_prefix.as_bytes();
-
-        let mut inner = self.inner.write();
-        for entry in inner.entries.values_mut() {
-            let path_bytes = entry.path.as_bytes();
-            if path_bytes.len() < old_bytes.len() {
-                continue;
-            }
-            if !path_bytes.starts_with(old_bytes) {
-                continue;
-            }
-            if path_bytes.len() > old_bytes.len() && path_bytes.get(old_bytes.len()) != Some(&b'/')
-            {
-                continue;
-            }
-
-            let mut replaced =
-                Vec::with_capacity(new_bytes.len() + path_bytes.len() - old_bytes.len());
-            replaced.extend_from_slice(new_bytes);
-            replaced.extend_from_slice(&path_bytes[old_bytes.len()..]);
-            entry.path = OsString::from_vec(replaced);
-        }
-    }
-
     fn push_parent(entry: &mut InodeEntry, parent: ParentName) {
         if entry.parents.iter().any(|p| p == &parent) {
             return;
         }
+        if entry.parents.is_empty() {
+            entry.parent = parent.parent;
+            entry.name = parent.name.clone();
+        }
         entry.parents.push(parent);
+    }
+
+    fn set_primary_parent(entry: &mut InodeEntry, parent: &ParentName) {
+        entry.parent = parent.parent;
+        entry.name = parent.name.clone();
+        if let Some(pos) = entry.parents.iter().position(|p| p == parent) {
+            entry.parents.swap(0, pos);
+        } else {
+            entry.parents.insert(0, parent.clone());
+        }
     }
 }
 
@@ -269,49 +267,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rename_descendants_updates_subtree_paths() {
+    fn get_path_reconstructs_from_parents() {
         let store = InodeStore::new();
         store.init_root(BackendKey { dev: 1, ino: 1 });
 
         let dir = store.lookup_or_create(
             BackendKey { dev: 1, ino: 2 },
             InodeKind::Directory,
-            OsString::from("/old"),
-            Some(ParentName {
+            ParentName {
                 parent: ROOT_INODE,
                 name: OsString::from("old"),
-            }),
+            },
         );
         let child = store.lookup_or_create(
             BackendKey { dev: 1, ino: 3 },
             InodeKind::File,
-            OsString::from("/old/file"),
-            Some(ParentName {
+            ParentName {
                 parent: dir.ino,
                 name: OsString::from("file"),
-            }),
+            },
         );
-        let outside = store.lookup_or_create(
-            BackendKey { dev: 1, ino: 4 },
-            InodeKind::File,
-            OsString::from("/oldest/file"),
-            Some(ParentName {
+
+        assert_eq!(
+            store.get_path(child.ino).unwrap(),
+            OsString::from("/old/file")
+        );
+    }
+
+    #[test]
+    fn move_entry_updates_primary_path_only() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let dir = store.lookup_or_create(
+            BackendKey { dev: 1, ino: 2 },
+            InodeKind::Directory,
+            ParentName {
                 parent: ROOT_INODE,
-                name: OsString::from("oldest"),
-            }),
+                name: OsString::from("old"),
+            },
+        );
+        let child = store.lookup_or_create(
+            BackendKey { dev: 1, ino: 3 },
+            InodeKind::File,
+            ParentName {
+                parent: dir.ino,
+                name: OsString::from("file"),
+            },
         );
 
-        store.rename_descendants(OsStr::new("/old"), OsStr::new("/new"));
+        let _ = store.move_entry(
+            dir.ino,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("new"),
+            },
+        );
 
-        assert_eq!(store.get(dir.ino).unwrap().path, OsString::from("/new"));
+        assert_eq!(store.get_path(dir.ino).unwrap(), OsString::from("/new"));
         assert_eq!(
-            store.get(child.ino).unwrap().path,
+            store.get_path(child.ino).unwrap(),
             OsString::from("/new/file")
-        );
-        // Prefix matches must respect path boundaries.
-        assert_eq!(
-            store.get(outside.ino).unwrap().path,
-            OsString::from("/oldest/file")
         );
     }
 }

@@ -2155,26 +2155,32 @@ impl LongNameFsV2Fuser {
         inv.apply(|key| self.invalidate_dir_by_key(key));
     }
 
+    fn entry_path(&self, entry: &InodeEntry) -> CoreResult<OsString> {
+        self.inode_store.get_path(entry.ino)
+    }
+
     fn attr_for_entry(&self, entry: &InodeEntry) -> CoreResult<FuserFileAttr> {
-        let attr = self.core.stat_path(&entry.path)?;
+        let path = self.entry_path(entry)?;
+        let attr = self.core.stat_path(&path)?;
         Ok(fuser_attr_from_core(attr, entry.ino))
     }
 
     fn parent_ino_for(&self, entry: &InodeEntry) -> InodeId {
-        entry
-            .parents
-            .first()
-            .map(|p| p.parent)
-            .unwrap_or(ROOT_INODE)
+        if entry.ino == ROOT_INODE {
+            ROOT_INODE
+        } else {
+            entry.parent
+        }
     }
 
     fn open_dir_handle(&self, entry: &InodeEntry) -> CoreResult<DirHandle> {
-        if entry.path == OsStr::new("/") {
+        let path = self.entry_path(entry)?;
+        if entry.ino == ROOT_INODE || path == OsStr::new("/") {
             let fd = open_backend_root(&self.core.config)?;
             let index = load_dir_state(&self.core.index_cache, fd.as_fd())?;
             return Ok(DirHandle::new(fd, index));
         }
-        let mapped = self.core.resolve_path(&entry.path)?;
+        let mapped = self.core.resolve_path(&path)?;
         let fname = mapped.backend_name.as_cstring()?;
         let fd = nix::fcntl::openat(
             mapped.dir_fd.as_fd(),
@@ -2190,7 +2196,6 @@ impl LongNameFsV2Fuser {
     fn ensure_child_entry(
         &self,
         parent: InodeId,
-        parent_path: &OsStr,
         name: &OsStr,
         stat: nix::sys::stat::FileStat,
         lookup_inc: u64,
@@ -2198,21 +2203,20 @@ impl LongNameFsV2Fuser {
         let backend = backend_key_from_stat(&stat);
         let attr = core_attr_from_stat(&stat);
         let kind = InodeKind::from(attr.kind);
-        let path = crate::v2::path::make_child_path(parent_path, name);
         self.inode_store.get_or_insert(
             backend,
             kind,
-            path,
-            Some(ParentName {
+            ParentName {
                 parent,
                 name: name.to_os_string(),
-            }),
+            },
             lookup_inc,
         )
     }
 
     fn open_backend_file(&self, entry: &InodeEntry, flags: u32) -> CoreResult<OwnedFd> {
-        let mapped = self.core.resolve_path(&entry.path)?;
+        let path = self.entry_path(entry)?;
+        let mapped = self.core.resolve_path(&path)?;
         let oflag = oflag_from_bits(flags) | OFlag::O_CLOEXEC;
         let fname = mapped.backend_name.as_cstring()?;
         nix::fcntl::openat(
@@ -2267,7 +2271,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let child_path = crate::v2::path::make_child_path(&parent_entry.path, name);
+        let parent_path = match self.entry_path(&parent_entry) {
+            Ok(path) => path,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let child_path = crate::v2::path::make_child_path(&parent_path, name);
         let mapped = match self.core.resolve_path(&child_path) {
             Ok(v) => v,
             Err(err) => {
@@ -2293,7 +2304,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let child_entry = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 1);
+        let child_entry = self.ensure_child_entry(parent, name, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child_entry.ino);
         reply.entry(&self.entry_ttl, &attr, 0);
     }
@@ -2346,11 +2357,18 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
+        let path = match self.entry_path(&entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
         if flags.unwrap_or(0) != 0 {
             reply.error(libc::EOPNOTSUPP);
             return;
         }
-        if entry.path == OsStr::new("/") {
+        if path == OsStr::new("/") {
             if let Some(mode) = mode
                 && let Err(err) = nix::sys::stat::fchmod(
                     self.core.config.backend_fd(),
@@ -2394,7 +2412,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         }
 
-        let mapped = match self.core.resolve_path(&entry.path) {
+        let mapped = match self.core.resolve_path(&path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -2486,7 +2504,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let mapped = match self.core.resolve_path(&entry.path) {
+        let path = match self.entry_path(&entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let mapped = match self.core.resolve_path(&path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -2520,7 +2545,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+        let parent_path = match self.entry_path(&parent_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -2592,7 +2624,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 1);
+        let child = self.ensure_child_entry(parent, name, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
         self.notify_entry_change(parent, name);
         self.notify_inode(child.ino);
@@ -2613,7 +2645,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+        let parent_path = match self.entry_path(&parent_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -2671,7 +2710,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                             return;
                         }
                     };
-                    let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 1);
+                    let child = self.ensure_child_entry(parent, name, stat, 1);
                     let fh = self.handles.insert_file(fd);
                     let _ = self.inode_store.inc_open(child.ino);
                     let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
@@ -2747,12 +2786,25 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let old_path = crate::v2::path::make_child_path(&src_parent_entry.path, name);
+        let src_parent_path = match self.entry_path(&src_parent_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let dst_parent_path = match self.entry_path(&dst_parent_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
         let mut renamed_child: Option<InodeId> = None;
         let inv = match self.core.rename_with_flags(
-            &src_parent_entry.path,
+            &src_parent_path,
             name,
-            &dst_parent_entry.path,
+            &dst_parent_path,
             newname,
             flags,
         ) {
@@ -2764,7 +2816,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         };
         self.apply_invalidation(inv);
 
-        let mut dst_ctx = match self.core.resolve_dir(&dst_parent_entry.path) {
+        let mut dst_ctx = match self.core.resolve_dir(&dst_parent_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -2801,14 +2853,8 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             fname.as_c_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         ) {
-            let child =
-                self.ensure_child_entry(newparent, &dst_parent_entry.path, newname, stat, 0);
+            let child = self.ensure_child_entry(newparent, newname, stat, 0);
             renamed_child = Some(child.ino);
-            let new_path = crate::v2::path::make_child_path(&dst_parent_entry.path, newname);
-            if matches!(child.kind, InodeKind::Directory) {
-                self.inode_store.rename_descendants(&old_path, &new_path);
-            }
-            let _ = self.inode_store.update_path(child.ino, new_path);
             let _ = self.inode_store.remove_parent_name(
                 child.ino,
                 &ParentName {
@@ -2816,13 +2862,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     name: name.to_os_string(),
                 },
             );
-            let _ = self.inode_store.add_parent_name(
-                child.ino,
-                ParentName {
-                    parent: newparent,
-                    name: newname.to_os_string(),
-                },
-            );
+            let new_parent_name = ParentName {
+                parent: newparent,
+                name: newname.to_os_string(),
+            };
+            let _ = self
+                .inode_store
+                .add_parent_name(child.ino, new_parent_name.clone());
+            let _ = self.inode_store.move_entry(child.ino, new_parent_name);
         }
         self.notify_entry_change(parent, name);
         self.notify_entry_change(newparent, newname);
@@ -2844,7 +2891,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let target = match self.core.resolve_path(&target_entry.path) {
+        let target_path = match self.entry_path(&target_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let target = match self.core.resolve_path(&target_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -2859,7 +2913,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let ctx = match self.core.resolve_dir(&parent_entry.path) {
+        let parent_path = match self.entry_path(&parent_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let ctx = match self.core.resolve_dir(&parent_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -2915,7 +2976,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let child = self.ensure_child_entry(newparent, &parent_entry.path, newname, stat, 1);
+        let child = self.ensure_child_entry(newparent, newname, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
         self.notify_entry_change(newparent, newname);
         self.notify_inode(ino);
@@ -2934,7 +2995,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+        let parent_path = match self.entry_path(&parent_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -2992,7 +3060,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         }
         let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
         self.invalidate_dir(ctx.dir_fd.as_fd());
-        let child = self.ensure_child_entry(parent, &parent_entry.path, name, existing_stat, 0);
+        let child = self.ensure_child_entry(parent, name, existing_stat, 0);
         let _ = self.inode_store.remove_parent_name(
             child.ino,
             &ParentName {
@@ -3015,7 +3083,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+        let parent_path = match self.entry_path(&parent_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3100,7 +3175,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         drop(guard);
         self.invalidate_dir(ctx.dir_fd.as_fd());
         if let Some(stat) = existing_stat {
-            let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 0);
+            let child = self.ensure_child_entry(parent, name, stat, 0);
             let _ = self.inode_store.remove_parent_name(
                 child.ino,
                 &ParentName {
@@ -3127,7 +3202,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+        let parent_path = match self.entry_path(&parent_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3191,7 +3273,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let child = self.ensure_child_entry(parent, &parent_entry.path, link_name, stat, 1);
+        let child = self.ensure_child_entry(parent, link_name, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
         self.notify_entry_change(parent, link_name);
         self.notify_inode(child.ino);
@@ -3211,7 +3293,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let mut ctx = match self.core.resolve_dir(&parent_entry.path) {
+        let parent_path = match self.entry_path(&parent_entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let mut ctx = match self.core.resolve_dir(&parent_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3279,7 +3368,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let child = self.ensure_child_entry(parent, &parent_entry.path, name, stat, 1);
+        let child = self.ensure_child_entry(parent, name, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
         reply.entry(&self.entry_ttl, &attr, 0);
     }
@@ -3355,11 +3444,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             let child_entry = self.inode_store.get_or_insert(
                 backend_key,
                 InodeKind::from(attr.kind),
-                crate::v2::path::make_child_path(&dir_entry.path, &info.name),
-                Some(ParentName {
+                ParentName {
                     parent: ino,
                     name: info.name.clone(),
-                }),
+                },
                 0,
             );
             let file_type = FuserFileType::from(child_entry.kind);
@@ -3438,11 +3526,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             let child_entry = self.inode_store.get_or_insert(
                 backend_key,
                 InodeKind::from(attr.kind),
-                crate::v2::path::make_child_path(&dir_entry.path, &info.name),
-                Some(ParentName {
+                ParentName {
                     parent: ino,
                     name: info.name.clone(),
-                }),
+                },
                 0,
             );
             let attr = fuser_attr_from_core(attr, child_entry.ino);
@@ -3523,8 +3610,9 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     let _ = fdatasync(handle.as_fd());
                 }
                 if let Some(entry) = self.inode_store.get(ino)
-                    && entry.path != OsStr::new("/")
-                    && let Ok(mapped) = self.core.resolve_path(&entry.path)
+                    && let Ok(path) = self.entry_path(&entry)
+                    && path != OsStr::new("/")
+                    && let Ok(mapped) = self.core.resolve_path(&path)
                 {
                     self.invalidate_dir(mapped.dir_fd.as_fd());
                 }
@@ -3557,8 +3645,9 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         }
         if let Some(entry) = self.inode_store.get(ino)
-            && entry.path != OsStr::new("/")
-            && let Ok(mapped) = self.core.resolve_path(&entry.path)
+            && let Ok(path) = self.entry_path(&entry)
+            && path != OsStr::new("/")
+            && let Ok(mapped) = self.core.resolve_path(&path)
         {
             self.invalidate_dir(mapped.dir_fd.as_fd());
         }
@@ -3586,8 +3675,15 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
+        let path = match self.entry_path(&entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
         let flags = access_mask_from_bits(mask as u32);
-        if entry.path == OsStr::new("/") {
+        if path == OsStr::new("/") {
             if let Err(err) = faccessat(self.core.config.backend_fd(), ".", flags, AtFlags::empty())
             {
                 reply.error(core_err_to_errno(&core_errno_from_nix(err)));
@@ -3596,7 +3692,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.ok();
             return;
         }
-        let mapped = match self.core.resolve_path(&entry.path) {
+        let mapped = match self.core.resolve_path(&path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3651,7 +3747,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path, true) {
+        let path = match self.entry_path(&entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &path, true) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3698,7 +3801,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path, false) {
+        let path = match self.entry_path(&entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &path, false) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3742,7 +3852,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path, false) {
+        let path = match self.entry_path(&entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &path, false) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3812,7 +3929,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &entry.path, true) {
+        let path = match self.entry_path(&entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &path, true) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3894,10 +4018,12 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(core_err_to_errno(&core_errno_from_nix(err)));
             return;
         }
-        if let Some(dir_entry) = self.inode_store.get(ino) {
-            if dir_entry.path == OsStr::new("/") {
+        if let Some(dir_entry) = self.inode_store.get(ino)
+            && let Ok(path) = self.entry_path(&dir_entry)
+        {
+            if path == OsStr::new("/") {
                 self.invalidate_dir(handle.as_fd());
-            } else if let Ok(ctx) = self.core.resolve_dir(&dir_entry.path) {
+            } else if let Ok(ctx) = self.core.resolve_dir(&path) {
                 self.invalidate_dir(ctx.dir_fd.as_fd());
             }
         }
