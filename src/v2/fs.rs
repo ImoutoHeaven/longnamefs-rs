@@ -111,6 +111,12 @@ pub(crate) struct DirCacheKey {
     ino: u64,
 }
 
+// Lock ordering (v2):
+// - InodeStore backend_map -> inode shard
+// - IndexCache shard mutex -> per-dir IndexState lock (multiple dirs in (dev, ino) order)
+// - DirCache shard locks are independent; keep I/O outside
+// - Handle table shards are independent; iterate shards one at a time
+
 #[derive(Debug)]
 struct DirCacheEntry {
     expires_at: Instant,
@@ -124,14 +130,30 @@ struct DirCacheHit {
     has_attrs: bool,
 }
 
+#[derive(Debug, Default)]
+struct DirCacheShard {
+    entries: HashMap<DirCacheKey, DirCacheEntry>,
+    lru: VecDeque<DirCacheKey>,
+}
+
 const DIR_CACHE_MAX_DIRS: usize = 1024;
+const DIR_CACHE_SHARD_COUNT: usize = 64;
+const DIR_CACHE_SHARD_MASK: usize = DIR_CACHE_SHARD_COUNT - 1;
+// Keep per-shard capacity generous to avoid aggressive eviction on busy shards.
+const DIR_CACHE_MAX_DIRS_PER_SHARD: usize =
+    if DIR_CACHE_MAX_DIRS.div_ceil(DIR_CACHE_SHARD_COUNT) > 64 {
+        DIR_CACHE_MAX_DIRS.div_ceil(DIR_CACHE_SHARD_COUNT)
+    } else {
+        64
+    };
 const DIR_FD_CACHE_MAX_DIRS: usize = 1024;
+const _: () = assert!(DIR_CACHE_SHARD_COUNT.is_power_of_two());
 
 #[derive(Debug)]
 struct DirCache {
     ttl: Duration,
     enabled: bool,
-    entries: RwLock<HashMap<DirCacheKey, DirCacheEntry>>,
+    shards: Vec<RwLock<DirCacheShard>>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,10 +169,44 @@ impl DirCache {
             Some(t) => (true, t),
             None => (false, Duration::ZERO),
         };
+        let shards = (0..DIR_CACHE_SHARD_COUNT)
+            .map(|_| RwLock::new(DirCacheShard::default()))
+            .collect();
         Self {
             ttl,
             enabled,
-            entries: RwLock::new(HashMap::new()),
+            shards,
+        }
+    }
+
+    fn shard(&self, key: DirCacheKey) -> &RwLock<DirCacheShard> {
+        let idx = ((key.dev ^ key.ino) as usize) & DIR_CACHE_SHARD_MASK;
+        &self.shards[idx]
+    }
+
+    fn touch_lru(shard: &mut DirCacheShard, key: DirCacheKey) {
+        if let Some(pos) = shard.lru.iter().position(|k| *k == key) {
+            shard.lru.remove(pos);
+        }
+        shard.lru.push_back(key);
+        while shard.lru.len() > DIR_CACHE_MAX_DIRS_PER_SHARD {
+            shard.lru.pop_front();
+        }
+    }
+
+    fn evict_if_needed(shard: &mut DirCacheShard) {
+        while shard.entries.len() > DIR_CACHE_MAX_DIRS_PER_SHARD {
+            if let Some(old) = shard.lru.pop_front() {
+                shard.entries.remove(&old);
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn drop_from_lru(shard: &mut DirCacheShard, key: &DirCacheKey) {
+        if let Some(pos) = shard.lru.iter().position(|k| k == key) {
+            shard.lru.remove(pos);
         }
     }
 
@@ -159,19 +215,27 @@ impl DirCache {
             return None;
         }
         let now = Instant::now();
-        let mut guard = self.entries.write();
-        if let Some(entry) = guard.get_mut(&key) {
+        let shard = self.shard(key);
+        let mut guard = shard.write();
+        let hit = if let Some(entry) = guard.entries.get_mut(&key) {
             if entry.expires_at > now {
                 entry.expires_at = now + self.ttl;
-                return Some(DirCacheHit {
+                Some(DirCacheHit {
                     entries: entry.entries.clone(),
                     has_attrs: entry.has_attrs,
-                });
+                })
+            } else {
+                guard.entries.remove(&key);
+                Self::drop_from_lru(&mut guard, &key);
+                None
             }
-            guard.remove(&key);
-            return None;
+        } else {
+            None
+        };
+        if hit.is_some() {
+            Self::touch_lru(&mut guard, key);
         }
-        None
+        hit
     }
 
     fn insert(
@@ -185,11 +249,11 @@ impl DirCache {
         }
         let expires_at = Instant::now() + self.ttl;
         let entries = Arc::new(items);
-        let mut guard = self.entries.write();
-        if guard.len() >= DIR_CACHE_MAX_DIRS {
-            guard.clear();
-        }
-        guard.insert(
+        let shard = self.shard(key);
+        let mut guard = shard.write();
+        Self::touch_lru(&mut guard, key);
+        Self::evict_if_needed(&mut guard);
+        guard.entries.insert(
             key,
             DirCacheEntry {
                 expires_at,
@@ -204,16 +268,19 @@ impl DirCache {
         if !self.enabled {
             return;
         }
-        let mut guard = self.entries.write();
-        guard.remove(&key);
+        let shard = self.shard(key);
+        let mut guard = shard.write();
+        guard.entries.remove(&key);
+        Self::drop_from_lru(&mut guard, &key);
     }
 
     fn patch(&self, key: DirCacheKey, op: CacheOp) {
         if !self.enabled {
             return;
         }
-        let mut guard = self.entries.write();
-        let Some(entry) = guard.get_mut(&key) else {
+        let shard = self.shard(key);
+        let mut guard = shard.write();
+        let Some(entry) = guard.entries.get_mut(&key) else {
             return;
         };
         let mut vec = (*entry.entries).clone();
@@ -235,6 +302,8 @@ impl DirCache {
         entry.entries = Arc::new(vec);
         entry.has_attrs = entry.entries.iter().all(|e| e.attr.is_some());
         entry.expires_at = Instant::now() + self.ttl;
+        Self::touch_lru(&mut guard, key);
+        Self::evict_if_needed(&mut guard);
     }
 }
 
@@ -510,43 +579,59 @@ struct IndexCacheEntry {
 }
 
 const INDEX_CACHE_MAX_DIRS: usize = 1024;
+const INDEX_CACHE_SHARD_COUNT: usize = 64;
+const INDEX_CACHE_SHARD_MASK: usize = INDEX_CACHE_SHARD_COUNT - 1;
+const INDEX_CACHE_MAX_DIRS_PER_SHARD: usize =
+    INDEX_CACHE_MAX_DIRS.div_ceil(INDEX_CACHE_SHARD_COUNT);
+const _: () = assert!(INDEX_CACHE_SHARD_COUNT.is_power_of_two());
 
 #[derive(Debug, Default)]
+struct IndexCacheShard {
+    entries: HashMap<DirCacheKey, IndexCacheEntry>,
+    lru: VecDeque<DirCacheKey>,
+}
+
+#[derive(Debug)]
 struct IndexCache {
-    entries: Mutex<HashMap<DirCacheKey, IndexCacheEntry>>,
-    lru: Mutex<VecDeque<DirCacheKey>>,
+    shards: Vec<Mutex<IndexCacheShard>>,
 }
 
 impl IndexCache {
     fn new() -> Self {
-        Self::default()
+        let shards = (0..INDEX_CACHE_SHARD_COUNT)
+            .map(|_| Mutex::new(IndexCacheShard::default()))
+            .collect();
+        Self { shards }
     }
 
-    fn touch_lru(&self, key: DirCacheKey) {
-        let mut lru = self.lru.lock();
-        if let Some(pos) = lru.iter().position(|k| *k == key) {
-            lru.remove(pos);
+    fn shard(&self, key: DirCacheKey) -> &Mutex<IndexCacheShard> {
+        let idx = ((key.dev ^ key.ino) as usize) & INDEX_CACHE_SHARD_MASK;
+        &self.shards[idx]
+    }
+
+    fn touch_lru(shard: &mut IndexCacheShard, key: DirCacheKey) {
+        if let Some(pos) = shard.lru.iter().position(|k| *k == key) {
+            shard.lru.remove(pos);
         }
-        lru.push_back(key);
-        while lru.len() > INDEX_CACHE_MAX_DIRS {
-            lru.pop_front();
+        shard.lru.push_back(key);
+        while shard.lru.len() > INDEX_CACHE_MAX_DIRS_PER_SHARD {
+            shard.lru.pop_front();
         }
     }
 
-    fn evict_if_needed(&self) {
-        let mut lru = self.lru.lock();
-        let mut entries = self.entries.lock();
-        while entries.len() > INDEX_CACHE_MAX_DIRS {
-            if let Some(old) = lru.pop_front() {
-                let can_drop = entries
+    fn evict_if_needed(shard: &mut IndexCacheShard) {
+        while shard.entries.len() > INDEX_CACHE_MAX_DIRS_PER_SHARD {
+            if let Some(old) = shard.lru.pop_front() {
+                let can_drop = shard
+                    .entries
                     .get(&old)
                     .map(|entry| Arc::strong_count(&entry.value) == 1)
                     .unwrap_or(true);
                 if can_drop {
-                    entries.remove(&old);
+                    shard.entries.remove(&old);
                     continue;
                 }
-                lru.push_back(old);
+                shard.lru.push_back(old);
                 break;
             } else {
                 break;
@@ -556,12 +641,12 @@ impl IndexCache {
 
     fn get_or_load(&self, dir_fd: BorrowedFd<'_>) -> CoreResult<Arc<RwLock<IndexState>>> {
         let key = dir_cache_key(dir_fd).ok_or(CoreError::NotFound)?;
+        let shard = self.shard(key);
         {
-            let entries = self.entries.lock();
-            if let Some(entry) = entries.get(&key) {
+            let mut guard = shard.lock();
+            if let Some(entry) = guard.entries.get(&key) {
                 let value = entry.value.clone();
-                drop(entries);
-                self.touch_lru(key);
+                Self::touch_lru(&mut guard, key);
                 return Ok(value);
             }
         }
@@ -583,15 +668,24 @@ impl IndexCache {
             journal_ops_since_compact,
         }));
 
-        let mut entries = self.entries.lock();
-        let existing = entries.entry(key).or_insert_with(|| IndexCacheEntry {
-            value: state.clone(),
-        });
-        let value = existing.value.clone();
-        drop(entries);
-        self.touch_lru(key);
-        self.evict_if_needed();
+        let mut guard = shard.lock();
+        let value = guard
+            .entries
+            .entry(key)
+            .or_insert_with(|| IndexCacheEntry {
+                value: state.clone(),
+            })
+            .value
+            .clone();
+        Self::touch_lru(&mut guard, key);
+        Self::evict_if_needed(&mut guard);
         Ok(value)
+    }
+}
+
+impl Default for IndexCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -657,66 +751,96 @@ impl Handle {
 }
 
 #[derive(Debug, Default)]
+struct HandleShard {
+    entries: HashMap<u64, Handle>,
+}
+
+const HANDLE_SHARD_COUNT: usize = 64;
+const HANDLE_SHARD_MASK: usize = HANDLE_SHARD_COUNT - 1;
+const _: () = assert!(HANDLE_SHARD_COUNT.is_power_of_two());
+
+#[derive(Debug)]
 struct V2HandleTable {
     next_id: AtomicU64,
-    entries: RwLock<HashMap<u64, Handle>>,
+    shards: Vec<RwLock<HandleShard>>,
 }
 
 impl V2HandleTable {
     fn new() -> Self {
-        Self::default()
+        let shards = (0..HANDLE_SHARD_COUNT)
+            .map(|_| RwLock::new(HandleShard::default()))
+            .collect();
+        Self {
+            next_id: AtomicU64::new(0),
+            shards,
+        }
+    }
+
+    fn shard(&self, id: u64) -> &RwLock<HandleShard> {
+        let idx = (id as usize) & HANDLE_SHARD_MASK;
+        &self.shards[idx]
     }
 
     fn insert_file(&self, fd: OwnedFd) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.entries.write().insert(id, Handle::File(Arc::new(fd)));
+        let shard = self.shard(id);
+        shard.write().entries.insert(id, Handle::File(Arc::new(fd)));
         id
     }
 
     fn insert_dir(&self, handle: DirHandle) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.entries
+        let shard = self.shard(id);
+        shard
             .write()
+            .entries
             .insert(id, Handle::Dir(Arc::new(handle)));
         id
     }
 
     fn get_file(&self, id: u64) -> Option<Arc<OwnedFd>> {
-        let guard = self.entries.read();
-        match guard.get(&id)? {
+        let shard = self.shard(id);
+        let guard = shard.read();
+        match guard.entries.get(&id)? {
             Handle::File(fd) => Some(fd.clone()),
             _ => None,
         }
     }
 
     fn get_dir(&self, id: u64) -> Option<Arc<DirHandle>> {
-        let guard = self.entries.read();
-        match guard.get(&id)? {
+        let shard = self.shard(id);
+        let guard = shard.read();
+        match guard.entries.get(&id)? {
             Handle::Dir(dir) => Some(dir.clone()),
             _ => None,
         }
     }
 
     fn remove(&self, id: u64) -> Option<Handle> {
-        self.entries.write().remove(&id)
+        let shard = self.shard(id);
+        shard.write().entries.remove(&id)
     }
 
     fn clear_dir_attr_cache(&self, key: DirCacheKey) {
-        let guard = self.entries.read();
-        for handle in guard.values() {
-            if let Handle::Dir(dir) = handle
-                && dir.cache_key == Some(key)
-            {
-                dir.clear_cached_attrs();
+        for shard in &self.shards {
+            let guard = shard.read();
+            for handle in guard.entries.values() {
+                if let Handle::Dir(dir) = handle
+                    && dir.cache_key == Some(key)
+                {
+                    dir.clear_cached_attrs();
+                }
             }
         }
     }
 
     fn clear_all_dir_attr_cache(&self) {
-        let guard = self.entries.read();
-        for handle in guard.values() {
-            if let Handle::Dir(dir) = handle {
-                dir.clear_cached_attrs();
+        for shard in &self.shards {
+            let guard = shard.read();
+            for handle in guard.entries.values() {
+                if let Handle::Dir(dir) = handle {
+                    dir.clear_cached_attrs();
+                }
             }
         }
     }
