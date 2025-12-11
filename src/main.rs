@@ -13,16 +13,22 @@ use fs::LongNameFs;
 use fuse3::MountOptions;
 use fuse3::path::PathFilesystem;
 use fuse3::path::Session;
-use fuser::{MountOption as FuserMountOption, Session as FuserSession};
+use fuser::{
+    Filesystem as FuserFilesystem, MountOption as FuserMountOption, Session as FuserSession,
+};
 #[cfg(unix)]
 use futures_util::future::poll_fn;
 #[cfg(unix)]
 use nix::mount::{MntFlags, umount2};
 #[cfg(unix)]
 use std::cmp::min;
+use std::env;
+use std::fs as stdfs;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::pin::Pin;
+use std::sync::OnceLock;
+use std::thread;
 use std::time::Duration;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -352,9 +358,10 @@ fn run_mount_fuser(
         FuserMountOption::RW,
         FuserMountOption::FSName("longnamefs-rs".to_string()),
         FuserMountOption::Subtype("ln2".to_string()),
-        // fuser 0.16 doesn't expose a writeback flag; pass the raw option through.
-        FuserMountOption::CUSTOM("writeback_cache".to_string()),
     ];
+    if writeback_cache_supported() {
+        options.push(FuserMountOption::CUSTOM("writeback_cache".to_string()));
+    }
     if allow_other {
         options.push(FuserMountOption::AllowOther);
     }
@@ -365,4 +372,54 @@ fn run_mount_fuser(
     let mut session = FuserSession::new(fs, mountpoint, &options).map_err(anyhow::Error::from)?;
     notifier.set(session.notifier());
     session.run().map_err(anyhow::Error::from)
+}
+
+#[derive(Debug)]
+struct ProbeFs;
+
+impl FuserFilesystem for ProbeFs {}
+
+fn writeback_cache_supported() -> bool {
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        let mut mount_dir = None;
+        let base = env::temp_dir();
+        for idx in 0..8 {
+            let candidate = base.join(format!("ln2_wb_probe_{idx}"));
+            if stdfs::create_dir(&candidate).is_ok() {
+                mount_dir = Some(candidate);
+                break;
+            }
+        }
+        let Some(dir) = mount_dir else {
+            return false;
+        };
+
+        let opts = vec![
+            FuserMountOption::RW,
+            FuserMountOption::FSName("ln2-probe".to_string()),
+            FuserMountOption::Subtype("ln2probe".to_string()),
+            FuserMountOption::CUSTOM("writeback_cache".to_string()),
+        ];
+        let supported = match FuserSession::new(ProbeFs, &dir, &opts) {
+            Ok(mut session) => {
+                let mut unmounter = session.unmount_callable();
+                let handle = thread::spawn(move || session.run());
+                // best-effort unmount immediately; ignore errors so probe is non-fatal
+                let _ = unmounter.unmount();
+                let _ = handle.join();
+                true
+            }
+            Err(err) => {
+                if err.raw_os_error() == Some(libc::EINVAL) {
+                    false
+                } else {
+                    eprintln!("writeback_cache probe failed ({err}), disabling option");
+                    false
+                }
+            }
+        };
+        let _ = stdfs::remove_dir(&dir);
+        supported
+    })
 }
