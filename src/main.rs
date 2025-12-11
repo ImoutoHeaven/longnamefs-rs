@@ -352,6 +352,8 @@ fn run_mount_fuser(
         FuserMountOption::RW,
         FuserMountOption::FSName("longnamefs-rs".to_string()),
         FuserMountOption::Subtype("ln2".to_string()),
+        // fuser 0.16 doesn't expose a writeback flag; pass the raw option through.
+        FuserMountOption::CUSTOM("writeback_cache".to_string()),
     ];
     if allow_other {
         options.push(FuserMountOption::AllowOther);
