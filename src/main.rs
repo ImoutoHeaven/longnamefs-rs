@@ -109,6 +109,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     enable_passthrough: bool,
 
+    /// Enable FUSE writeback cache (v2 only).
+    #[arg(long, default_value_t = false)]
+    enable_writeback_cache: bool,
+
     /// v2 index flush strategy: always sync, batch by time/ops, or off (no flush).
     #[arg(long, value_enum, default_value_t = IndexSyncCli::Batch)]
     index_sync: IndexSyncCli,
@@ -208,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.index_sync.into(),
                 attr_ttl,
                 cli.enable_passthrough,
+                cli.enable_writeback_cache,
             )
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             run_mount_fuser_with_signals(fs, mountpoint, cli.allow_other, cli.nonempty).await

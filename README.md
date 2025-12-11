@@ -75,6 +75,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - `--max-name-len`: maximum logical segment length accepted (default 1024; returns `ENAMETOOLONG`/`EINVAL` when exceeded).
 - `--index-sync`: `always` flush index on every mutation, `batch` (default) flushes when 128 pending changes or 5s elapsed, `off` disables background flush (index rebuild will recover).
 - `--enable-passthrough`: request FUSE passthrough (kernel 7.40+ with `FUSE_PASSTHROUGH` required; fuser `abi-7-40` feature is compiled in by default). On failure to negotiate, IO automatically falls back to userspace and logs the reason once per process start.
+- `--enable-writeback-cache`: request FUSE writeback cache (off by default). When accepted, the kernel may buffer/merge writes; durability still requires fsync/fdatasync.
 
 The process stays in the foreground and runs until the filesystem is unmounted
 or the process is terminated. This is intentional and makes it easy to use

@@ -2444,6 +2444,7 @@ pub struct LongNameFsV2Fuser {
     passthrough_runtime: bool,
     #[cfg(feature = "abi-7-40")]
     passthrough_handles: PassthroughHandleTable,
+    writeback_cache_cfg: bool,
     max_write: NonZeroU32,
     attr_ttl: Duration,
     entry_ttl: Duration,
@@ -2460,6 +2461,7 @@ impl LongNameFsV2Fuser {
         index_sync: IndexSync,
         attr_ttl: Duration,
         enable_passthrough: bool,
+        enable_writeback_cache: bool,
     ) -> CoreResult<Self> {
         let core = Arc::new(LongNameFsCore::new(
             config,
@@ -2484,6 +2486,7 @@ impl LongNameFsV2Fuser {
             passthrough_runtime: false,
             #[cfg(feature = "abi-7-40")]
             passthrough_handles: PassthroughHandleTable::default(),
+            writeback_cache_cfg: enable_writeback_cache,
             max_write,
             attr_ttl,
             entry_ttl: attr_ttl,
@@ -2647,15 +2650,19 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         config: &mut KernelConfig,
     ) -> Result<(), libc::c_int> {
         let _ = config.set_max_write(self.max_write.get());
-        match config.add_capabilities(fuser_consts::FUSE_WRITEBACK_CACHE) {
-            Ok(()) => {
-                eprintln!("longnamefs-rs v2: writeback_cache requested and accepted");
+        if self.writeback_cache_cfg {
+            match config.add_capabilities(fuser_consts::FUSE_WRITEBACK_CACHE) {
+                Ok(()) => {
+                    eprintln!("longnamefs-rs v2: writeback_cache requested and accepted");
+                }
+                Err(missing) => {
+                    eprintln!(
+                        "longnamefs-rs v2: writeback_cache not accepted (missing {missing:#x}), continuing without"
+                    );
+                }
             }
-            Err(missing) => {
-                eprintln!(
-                    "longnamefs-rs v2: writeback_cache not accepted (missing {missing:#x}), continuing without"
-                );
-            }
+        } else {
+            eprintln!("longnamefs-rs v2: writeback_cache disabled by CLI");
         }
         #[cfg(feature = "abi-7-40")]
         {
