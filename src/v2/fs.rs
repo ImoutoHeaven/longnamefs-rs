@@ -3,7 +3,10 @@ use crate::util::{
     access_mask_from_bits, core_begin_temp_file, oflag_from_bits, retry_eintr, string_to_cstring,
 };
 use crate::v2::error::{CoreError, CoreResult, core_err_to_errno};
-use crate::v2::index::{DirIndex, INDEX_NAME, read_dir_index, write_dir_index};
+use crate::v2::index::{
+    DirIndex, INDEX_NAME, IndexLoadResult, JOURNAL_MAX_BYTES, JOURNAL_MAX_OPS, JOURNAL_NAME,
+    append_to_journal, read_dir_index, reset_journal, write_dir_index,
+};
 use crate::v2::inode_store::{
     BackendKey, InodeEntry, InodeId, InodeKind, InodeStore, ParentName, ROOT_INODE,
 };
@@ -49,7 +52,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RAWNAME_XATTR: &str = "user.ln2.rawname";
-const JOURNAL_NAME: &str = ".ln2_journal";
 const PARALLEL_REBUILD_THRESHOLD: usize = 64;
 const PARALLEL_REBUILD_WORKERS: usize = 4;
 
@@ -131,6 +133,13 @@ struct DirCache {
     entries: RwLock<HashMap<DirCacheKey, DirCacheEntry>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum CacheOp {
+    Add(DirEntryInfo),
+    Remove(Vec<u8>),
+    UpdateAttr(Vec<u8>, CoreFileAttr),
+}
+
 impl DirCache {
     fn new(ttl: Option<Duration>) -> Self {
         let (enabled, ttl) = match ttl {
@@ -196,6 +205,35 @@ impl DirCache {
         }
         let mut guard = self.entries.write();
         guard.remove(&key);
+    }
+
+    fn patch(&self, key: DirCacheKey, op: CacheOp) {
+        if !self.enabled {
+            return;
+        }
+        let mut guard = self.entries.write();
+        let Some(entry) = guard.get_mut(&key) else {
+            return;
+        };
+        let mut vec = (*entry.entries).clone();
+        match op {
+            CacheOp::Add(info) => {
+                if !vec.iter().any(|e| e.backend_name == info.backend_name) {
+                    vec.push(info);
+                }
+            }
+            CacheOp::Remove(backend) => {
+                vec.retain(|e| e.backend_name != backend);
+            }
+            CacheOp::UpdateAttr(backend, new_attr) => {
+                if let Some(item) = vec.iter_mut().find(|e| e.backend_name == backend) {
+                    item.attr = Some(new_attr);
+                }
+            }
+        }
+        entry.entries = Arc::new(vec);
+        entry.has_attrs = entry.entries.iter().all(|e| e.attr.is_some());
+        entry.expires_at = Instant::now() + self.ttl;
     }
 }
 
@@ -460,6 +498,8 @@ struct IndexState {
     index: DirIndex,
     pending: usize,
     last_flush: Instant,
+    journal_size_bytes: u64,
+    journal_ops_since_compact: u64,
 }
 
 #[derive(Debug)]
@@ -524,14 +564,20 @@ impl IndexCache {
             }
         }
 
-        let index = match read_dir_index(dir_fd)? {
-            Some(idx) => idx,
-            None => rebuild_dir_index_from_backend(dir_fd)?,
+        let (index, journal_size_bytes, journal_ops_since_compact) = match read_dir_index(dir_fd)? {
+            Some(IndexLoadResult {
+                index,
+                journal_size,
+                journal_ops_since_compact,
+            }) => (index, journal_size, journal_ops_since_compact),
+            None => (rebuild_dir_index_from_backend(dir_fd)?, 0, 0),
         };
         let state = Arc::new(RwLock::new(IndexState {
             index,
             pending: 0,
             last_flush: Instant::now(),
+            journal_size_bytes,
+            journal_ops_since_compact,
         }));
 
         let mut entries = self.entries.lock();
@@ -1019,6 +1065,8 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
     for (backend_name, raw_name) in res_rx {
         index.upsert(backend_name, raw_name);
     }
+    index.clear_pending_ops();
+    index.clear_dirty();
     Ok(index)
 }
 
@@ -1043,9 +1091,9 @@ fn maybe_flush_index(
     strategy: IndexSync,
 ) -> CoreResult<()> {
     let plan = {
-        let guard = state.index.write();
+        let mut guard = state.index.write();
         let should_flush = match strategy {
-            IndexSync::Always => guard.index.is_dirty(),
+            IndexSync::Always => guard.index.is_dirty() || guard.index.has_pending_ops(),
             IndexSync::Batch {
                 max_pending,
                 max_age,
@@ -1055,25 +1103,76 @@ fn maybe_flush_index(
             }
             IndexSync::Off => false,
         };
+        let should_compact = guard.journal_size_bytes > JOURNAL_MAX_BYTES
+            || guard.journal_ops_since_compact > JOURNAL_MAX_OPS;
 
-        if should_flush {
-            Some((guard.index.clone(), guard.pending))
-        } else {
-            None
+        if !(should_flush || should_compact) {
+            return Ok(());
         }
+
+        let pending_ops = guard.index.take_pending_ops();
+        let snapshot = guard.index.clone();
+        let pending_before = guard.pending;
+        let journal_size = guard.journal_size_bytes;
+        let journal_ops_since_compact = guard.journal_ops_since_compact;
+        (
+            pending_ops,
+            snapshot,
+            pending_before,
+            journal_size,
+            journal_ops_since_compact,
+            should_compact,
+        )
     };
 
-    let Some((snapshot, pending_before)) = plan else {
-        return Ok(());
-    };
+    let (
+        pending_ops,
+        snapshot,
+        pending_before,
+        mut journal_size_bytes,
+        mut journal_ops_since_compact,
+        mut should_compact,
+    ) = plan;
 
-    write_dir_index(dir_fd, &snapshot)?;
+    let restore_ops = pending_ops.clone();
+
+    let flush_res: CoreResult<(u64, u64)> = (|| {
+        if !pending_ops.is_empty() {
+            let (_added_bytes, added_ops, size_after) = append_to_journal(dir_fd, &pending_ops)?;
+            journal_size_bytes = size_after;
+            journal_ops_since_compact = journal_ops_since_compact.saturating_add(added_ops);
+            if journal_size_bytes > JOURNAL_MAX_BYTES {
+                should_compact = true;
+            }
+        }
+
+        if should_compact || journal_ops_since_compact > JOURNAL_MAX_OPS {
+            write_dir_index(dir_fd, &snapshot)?;
+            reset_journal(dir_fd)?;
+            journal_size_bytes = 0;
+            journal_ops_since_compact = 0;
+        }
+        Ok((journal_size_bytes, journal_ops_since_compact))
+    })();
+
+    if let Err(err) = flush_res {
+        let mut guard = state.index.write();
+        guard.index.extend_pending_ops(restore_ops);
+        return Err(err);
+    }
+    let (journal_size_bytes, journal_ops_since_compact) = flush_res.unwrap();
+
     let mut guard = state.index.write();
     if guard.pending == pending_before {
         guard.index.clear_dirty();
+        guard.index.clear_pending_ops();
         guard.pending = 0;
         guard.last_flush = Instant::now();
+    } else {
+        guard.pending = guard.pending.saturating_sub(pending_before);
     }
+    guard.journal_size_bytes = journal_size_bytes;
+    guard.journal_ops_since_compact = journal_ops_since_compact;
     Ok(())
 }
 
@@ -1608,6 +1707,12 @@ impl LongNameFsCore {
     pub(crate) fn invalidate_dir_by_key(&self, key: DirCacheKey) {
         self.dir_cache.invalidate(key);
         self.dir_fd_cache.invalidate(key);
+    }
+
+    pub(crate) fn patch_dir_cache(&self, dir_fd: BorrowedFd<'_>, op: CacheOp) {
+        if let Some(key) = dir_cache_key(dir_fd) {
+            self.dir_cache.patch(key, op);
+        }
     }
 
     pub(crate) fn cached_root_fd(&self) -> CoreResult<Arc<OwnedFd>> {
@@ -2169,6 +2274,13 @@ impl LongNameFsV2Fuser {
         inv.apply(|key| self.invalidate_dir_by_key(key));
     }
 
+    fn patch_dir_cache(&self, dir_fd: BorrowedFd<'_>, op: CacheOp) {
+        if let Some(key) = dir_cache_key(dir_fd) {
+            self.core.dir_cache.patch(key, op);
+            self.handles.clear_dir_attr_cache(key);
+        }
+    }
+
     fn entry_path(&self, entry: &InodeEntry) -> CoreResult<OsString> {
         self.inode_store.get_path(entry.ino)
     }
@@ -2582,6 +2694,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let backend_bytes = backend.display_bytes();
         let fname = match backend.as_cstring() {
             Ok(v) => v,
             Err(err) => {
@@ -2620,13 +2733,12 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
             {
                 let mut guard = ctx.state.index.write();
-                guard.index.upsert(backend.display_bytes(), raw.clone());
+                guard.index.upsert(backend_bytes.clone(), raw.clone());
                 guard.pending = guard.pending.saturating_add(1);
             }
             ctx.state.attr_cache.clear();
             let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
         }
-        self.invalidate_dir(ctx.dir_fd.as_fd());
         let stat = match fstatat(
             ctx.dir_fd.as_fd(),
             fname.as_c_str(),
@@ -2638,6 +2750,25 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let core_attr = core_attr_from_stat(&stat);
+        let backend_key = backend_key_from_stat(&stat);
+        ctx.state.attr_cache.insert(
+            backend_bytes.clone(),
+            CachedAttr {
+                attr: core_attr_from_stat(&stat),
+                backend: backend_key,
+            },
+        );
+        self.patch_dir_cache(
+            ctx.dir_fd.as_fd(),
+            CacheOp::Add(DirEntryInfo {
+                name: name.to_os_string(),
+                kind: core_attr.kind,
+                attr: Some(core_attr),
+                backend_name: backend_bytes.clone(),
+                backend_key: Some(backend_key),
+            }),
+        );
         let child = self.ensure_child_entry(parent, name, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
         self.notify_entry_change(parent, name);
@@ -2716,7 +2847,6 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                             self.core.index_sync,
                         );
                     }
-                    self.invalidate_dir(ctx.dir_fd.as_fd());
                     let stat = match fstat(fd.as_fd()) {
                         Ok(st) => st,
                         Err(err) => {
@@ -2724,6 +2854,25 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                             return;
                         }
                     };
+                    let core_attr = core_attr_from_stat(&stat);
+                    let backend_key = backend_key_from_stat(&stat);
+                    ctx.state.attr_cache.insert(
+                        backend_bytes.clone(),
+                        CachedAttr {
+                            attr: core_attr_from_stat(&stat),
+                            backend: backend_key,
+                        },
+                    );
+                    self.patch_dir_cache(
+                        ctx.dir_fd.as_fd(),
+                        CacheOp::Add(DirEntryInfo {
+                            name: name.to_os_string(),
+                            kind: core_attr.kind,
+                            attr: Some(core_attr),
+                            backend_name: backend_bytes.clone(),
+                            backend_key: Some(backend_key),
+                        }),
+                    );
                     let child = self.ensure_child_entry(parent, name, stat, 1);
                     let fh = self.handles.insert_file(fd);
                     let _ = self.inode_store.inc_open(child.ino);
@@ -2934,7 +3083,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let ctx = match self.core.resolve_dir(&parent_path) {
+        let mut ctx = match self.core.resolve_dir(&parent_path) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -2978,7 +3127,6 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(core_err_to_errno(&core_errno_from_nix(err)));
             return;
         }
-        self.invalidate_dir(ctx.dir_fd.as_fd());
         let stat = match fstatat(
             ctx.dir_fd.as_fd(),
             to_c.as_c_str(),
@@ -2990,6 +3138,26 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let core_attr = core_attr_from_stat(&stat);
+        let backend_key = backend_key_from_stat(&stat);
+        let backend_bytes = dest_backend.display_bytes();
+        ctx.state.attr_cache.insert(
+            backend_bytes.clone(),
+            CachedAttr {
+                attr: core_attr_from_stat(&stat),
+                backend: backend_key,
+            },
+        );
+        self.patch_dir_cache(
+            ctx.dir_fd.as_fd(),
+            CacheOp::Add(DirEntryInfo {
+                name: newname.to_os_string(),
+                kind: core_attr.kind,
+                attr: Some(core_attr),
+                backend_name: backend_bytes.clone(),
+                backend_key: Some(backend_key),
+            }),
+        );
         let child = self.ensure_child_entry(newparent, newname, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
         self.notify_entry_change(newparent, newname);
@@ -3043,6 +3211,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let backend_bytes = backend.display_bytes();
         let existing_stat = match fstatat(
             ctx.dir_fd.as_fd(),
             fname.as_c_str(),
@@ -3065,16 +3234,16 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         if matches!(kind, SegmentKind::Long) {
             {
                 let mut guard = ctx.state.index.write();
-                let backend_bytes = backend.display_bytes();
                 if guard.index.remove(&backend_bytes).is_some() {
                     guard.pending = guard.pending.saturating_add(1);
                 }
             }
             ctx.state.attr_cache.clear();
         }
+        ctx.state.attr_cache.remove(&backend_bytes);
         let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
-        self.invalidate_dir(ctx.dir_fd.as_fd());
         let child = self.ensure_child_entry(parent, name, existing_stat, 0);
+        self.patch_dir_cache(ctx.dir_fd.as_fd(), CacheOp::Remove(backend_bytes));
         let _ = self.inode_store.remove_parent_name(
             child.ino,
             &ParentName {
@@ -3131,14 +3300,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let backend_bytes = backend.display_bytes();
         let existing_stat = fstatat(
             ctx.dir_fd.as_fd(),
             fname.as_c_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )
         .ok();
-        let backend_bytes = backend.display_bytes();
-        let mut guard = ctx.state.index.write();
         let removal = match unlinkat(
             ctx.dir_fd.as_fd(),
             fname.as_c_str(),
@@ -3180,14 +3348,19 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(core_err_to_errno(&err));
             return;
         }
-        if matches!(kind, SegmentKind::Long) && guard.index.remove(&backend_bytes).is_some() {
-            guard.pending = guard.pending.saturating_add(1);
+        {
+            let mut guard = ctx.state.index.write();
+            if matches!(kind, SegmentKind::Long) && guard.index.remove(&backend_bytes).is_some() {
+                guard.pending = guard.pending.saturating_add(1);
+            }
+            guard.index.clear_pending_ops();
+            guard.index.clear_dirty();
+            guard.pending = 0;
+            guard.journal_size_bytes = 0;
+            guard.journal_ops_since_compact = 0;
         }
-        guard.index.clear_dirty();
-        guard.pending = 0;
         ctx.state.attr_cache.clear();
-        drop(guard);
-        self.invalidate_dir(ctx.dir_fd.as_fd());
+        self.patch_dir_cache(ctx.dir_fd.as_fd(), CacheOp::Remove(backend_bytes));
         if let Some(stat) = existing_stat {
             let child = self.ensure_child_entry(parent, name, stat, 0);
             let _ = self.inode_store.remove_parent_name(
@@ -3239,6 +3412,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let backend_bytes = backend.display_bytes();
         let fname = match backend.as_cstring() {
             Ok(v) => v,
             Err(err) => {
@@ -3275,7 +3449,6 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             ctx.state.attr_cache.clear();
             let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
         }
-        self.invalidate_dir(ctx.dir_fd.as_fd());
         let stat = match fstatat(
             ctx.dir_fd.as_fd(),
             fname.as_c_str(),
@@ -3287,6 +3460,25 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let core_attr = core_attr_from_stat(&stat);
+        let backend_key = backend_key_from_stat(&stat);
+        ctx.state.attr_cache.insert(
+            backend_bytes.clone(),
+            CachedAttr {
+                attr: core_attr_from_stat(&stat),
+                backend: backend_key,
+            },
+        );
+        self.patch_dir_cache(
+            ctx.dir_fd.as_fd(),
+            CacheOp::Add(DirEntryInfo {
+                name: link_name.to_os_string(),
+                kind: core_attr.kind,
+                attr: Some(core_attr),
+                backend_name: backend_bytes.clone(),
+                backend_key: Some(backend_key),
+            }),
+        );
         let child = self.ensure_child_entry(parent, link_name, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
         self.notify_entry_change(parent, link_name);
@@ -3330,6 +3522,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let backend_bytes = backend.display_bytes();
         let fname = match backend.as_cstring() {
             Ok(v) => v,
             Err(err) => {
@@ -3364,13 +3557,12 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
             {
                 let mut guard = ctx.state.index.write();
-                guard.index.upsert(backend.display_bytes(), raw.clone());
+                guard.index.upsert(backend_bytes.clone(), raw.clone());
                 guard.pending = guard.pending.saturating_add(1);
             }
             ctx.state.attr_cache.clear();
             let _ = maybe_flush_index(ctx.dir_fd.as_fd(), &mut ctx.state, self.core.index_sync);
         }
-        self.invalidate_dir(ctx.dir_fd.as_fd());
         let stat = match fstatat(
             ctx.dir_fd.as_fd(),
             fname.as_c_str(),
@@ -3382,6 +3574,25 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let core_attr = core_attr_from_stat(&stat);
+        let backend_key = backend_key_from_stat(&stat);
+        ctx.state.attr_cache.insert(
+            backend_bytes.clone(),
+            CachedAttr {
+                attr: core_attr_from_stat(&stat),
+                backend: backend_key,
+            },
+        );
+        self.patch_dir_cache(
+            ctx.dir_fd.as_fd(),
+            CacheOp::Add(DirEntryInfo {
+                name: name.to_os_string(),
+                kind: core_attr.kind,
+                attr: Some(core_attr),
+                backend_name: backend_bytes.clone(),
+                backend_key: Some(backend_key),
+            }),
+        );
         let child = self.ensure_child_entry(parent, name, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
         reply.entry(&self.entry_ttl, &attr, 0);
@@ -4026,6 +4237,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::EBADF);
             return;
         };
+        {
+            let mut state = handle.state.write();
+            if let Err(err) = maybe_flush_index(handle.as_fd(), &mut state, IndexSync::Always) {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        }
         let sync_res = if datasync {
             fdatasync(handle.as_fd())
         } else {
@@ -4135,6 +4353,8 @@ mod tests {
                 index: DirIndex::new(),
                 pending: 0,
                 last_flush: Instant::now(),
+                journal_size_bytes: 0,
+                journal_ops_since_compact: 0,
             })),
             attr_cache: HashMap::new(),
         };
