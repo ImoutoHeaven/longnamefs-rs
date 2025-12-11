@@ -214,26 +214,16 @@ impl InodeStore {
 
     pub fn dec_lookup(&self, ino: InodeId, n: u64) -> Option<InodeEntry> {
         let shard_idx = Self::shard_index(ino);
-        let should_remove = {
-            let mut shard = self.shards[shard_idx].write();
-            let entry = shard.entries.get_mut(&ino)?;
-            entry.lookup_count = entry.lookup_count.saturating_sub(n);
-            entry.lookup_count == 0 && entry.open_count == 0 && ino != ROOT_INODE
-        };
-
-        if !should_remove {
-            return None;
-        }
-
         let mut backend_map = self.backend_map.write();
         let mut shard = self.shards[shard_idx].write();
-        let entry = shard.entries.get(&ino)?;
-        if entry.lookup_count > 0 || entry.open_count > 0 || ino == ROOT_INODE {
-            return None;
+        let entry = shard.entries.get_mut(&ino)?;
+        entry.lookup_count = entry.lookup_count.saturating_sub(n);
+        if entry.lookup_count == 0 && entry.open_count == 0 && ino != ROOT_INODE {
+            let removed = shard.entries.remove(&ino)?;
+            backend_map.remove(&removed.backend);
+            return Some(removed);
         }
-        let removed = shard.entries.remove(&ino)?;
-        backend_map.remove(&removed.backend);
-        Some(removed)
+        None
     }
 
     pub fn inc_open(&self, ino: InodeId) -> Option<InodeEntry> {
@@ -245,26 +235,16 @@ impl InodeStore {
 
     pub fn dec_open(&self, ino: InodeId) -> Option<InodeEntry> {
         let shard_idx = Self::shard_index(ino);
-        let should_remove = {
-            let mut shard = self.shards[shard_idx].write();
-            let entry = shard.entries.get_mut(&ino)?;
-            entry.open_count = entry.open_count.saturating_sub(1);
-            entry.lookup_count == 0 && entry.open_count == 0 && ino != ROOT_INODE
-        };
-
-        if !should_remove {
-            return None;
-        }
-
         let mut backend_map = self.backend_map.write();
         let mut shard = self.shards[shard_idx].write();
-        let entry = shard.entries.get(&ino)?;
-        if entry.lookup_count > 0 || entry.open_count > 0 || ino == ROOT_INODE {
-            return None;
+        let entry = shard.entries.get_mut(&ino)?;
+        entry.open_count = entry.open_count.saturating_sub(1);
+        if entry.lookup_count == 0 && entry.open_count == 0 && ino != ROOT_INODE {
+            let removed = shard.entries.remove(&ino)?;
+            backend_map.remove(&removed.backend);
+            return Some(removed);
         }
-        let removed = shard.entries.remove(&ino)?;
-        backend_map.remove(&removed.backend);
-        Some(removed)
+        None
     }
 
     pub fn add_parent_name(&self, ino: InodeId, parent: ParentName) -> Option<InodeEntry> {

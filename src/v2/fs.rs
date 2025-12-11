@@ -1109,8 +1109,10 @@ fn maybe_flush_index(
         };
         let should_compact = guard.journal_size_bytes > JOURNAL_MAX_BYTES
             || guard.journal_ops_since_compact > JOURNAL_MAX_OPS;
+        let need_force_sync_only =
+            force_sync && !should_flush && !should_compact && guard.journal_size_bytes > 0;
 
-        if !(should_flush || should_compact) {
+        if !(should_flush || should_compact || need_force_sync_only) {
             return Ok(());
         }
 
@@ -1126,6 +1128,7 @@ fn maybe_flush_index(
             journal_size,
             journal_ops_since_compact,
             should_compact,
+            need_force_sync_only,
             guard.journal_file.take(),
         )
     };
@@ -1137,6 +1140,7 @@ fn maybe_flush_index(
         mut journal_size_bytes,
         mut journal_ops_since_compact,
         mut should_compact,
+        need_force_sync_only,
         mut journal_file,
     ) = plan;
 
@@ -1163,6 +1167,22 @@ fn maybe_flush_index(
                 if journal_size_bytes > JOURNAL_MAX_BYTES {
                     should_compact = true;
                 }
+            }
+        }
+        if need_force_sync_only && journal_size_bytes > 0 {
+            if journal_file.is_none() {
+                let name = core_string_to_cstring(JOURNAL_NAME)?;
+                let fd = nix::fcntl::openat(
+                    dir_fd,
+                    name.as_c_str(),
+                    OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::from_bits_truncate(0o600),
+                )
+                .map_err(core_errno_from_nix)?;
+                journal_file = Some(File::from(fd));
+            }
+            if let Some(file) = journal_file.as_mut() {
+                file.sync_all().map_err(CoreError::from)?;
             }
         }
 
