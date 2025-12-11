@@ -113,6 +113,19 @@ impl InodeStore {
         if ino == ROOT_INODE {
             return Ok(OsString::from("/"));
         }
+
+        // Orphaned inodes (no parents, primary set to root with empty name) are invalid.
+        {
+            let shard = self.shard(ino).read();
+            if let Some(entry) = shard.entries.get(&ino)
+                && entry.parent == ROOT_INODE
+                && entry.name.is_empty()
+                && entry.parents.is_empty()
+            {
+                return Err(CoreError::StaleInode);
+            }
+        }
+
         let mut components = Vec::new();
         let mut current_ino = ino;
         let mut depth = 0usize;
