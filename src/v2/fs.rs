@@ -1956,7 +1956,7 @@ impl LongNameFsCore {
             }
         }
 
-        let entries = self.load_dir_entries(handle, true);
+        let entries = self.load_dir_entries(handle, need_attr);
         let snapshot = DirSnapshot {
             entries: entries.clone(),
             has_attrs: entries.iter().all(|e| e.attr.is_some()),
@@ -2152,7 +2152,7 @@ impl LongNameFsCore {
         let src_fd = match nix::fcntl::openat(
             src.ctx.dir_fd.as_fd(),
             src_c.as_c_str(),
-            OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
