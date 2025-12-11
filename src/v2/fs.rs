@@ -3567,6 +3567,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         }
         self.patch_dir_cache(ctx.dir_fd.as_fd(), CacheOp::Remove(backend_bytes));
         if let Some(stat) = existing_stat {
+            let child_key = DirCacheKey {
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+            };
+            self.core.invalidate_dir_by_key(child_key);
+            self.handles.clear_dir_attr_cache(child_key);
+        }
+        if let Some(stat) = existing_stat {
             let child = self.ensure_child_entry(parent, name, stat, 0);
             let _ = self.inode_store.remove_parent_name(
                 child.ino,
