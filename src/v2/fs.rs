@@ -2667,6 +2667,9 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         #[cfg(feature = "abi-7-40")]
         {
             if self.passthrough_cfg {
+                // Enable passthrough by advertising a non-zero max_stack_depth.
+                // A depth of 1 is sufficient when the backend is not itself a stacked filesystem.
+                let _ = config.set_max_stack_depth(1);
                 match config.add_capabilities(fuser_consts::FUSE_PASSTHROUGH) {
                     Ok(()) => {
                         self.passthrough_runtime = true;
@@ -4147,7 +4150,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
         };
         #[cfg(feature = "abi-7-40")]
-        if self.passthrough_active() {
+        if self.passthrough_active() && entry.kind == InodeKind::File {
             match reply.open_backing(fd.as_fd()) {
                 Ok(backing_id) => {
                     let fh = self.handles.allocate_fh();
@@ -4157,10 +4160,19 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     return;
                 }
                 Err(err) => {
+                    let errno = err.raw_os_error().unwrap_or(libc::EIO);
                     eprintln!(
                         "longnamefs-rs v2: open_backing failed for ino {ino} ({err}), falling back to userspace IO"
                     );
-                    self.passthrough_runtime = false;
+                    // Only disable passthrough globally on capability or ioctl-level errors.
+                    // For per-file limitations (e.g. non-regular files), keep passthrough for
+                    // other inodes to avoid silent global performance regressions.
+                    if errno == libc::EPERM
+                        || errno == libc::EOPNOTSUPP
+                        || errno == libc::ENOTTY
+                    {
+                        self.passthrough_runtime = false;
+                    }
                 }
             }
         }
