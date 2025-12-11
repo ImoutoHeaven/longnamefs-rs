@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::v2::error::{CoreError, CoreResult};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -19,12 +20,12 @@ pub fn is_reserved_prefix(raw: &[u8]) -> bool {
     raw.starts_with(INTERNAL_PREFIX.as_bytes())
 }
 
-pub fn classify_segment(raw: &[u8], max_name_len: usize) -> Result<SegmentKind, fuse3::Errno> {
+pub fn classify_segment(raw: &[u8], max_name_len: usize) -> CoreResult<SegmentKind> {
     if raw.len() > max_name_len {
-        return Err(fuse3::Errno::from(libc::ENAMETOOLONG));
+        return Err(CoreError::NameTooLong);
     }
     if is_reserved_prefix(raw) {
-        return Err(fuse3::Errno::from(libc::EINVAL));
+        return Err(CoreError::ReservedPrefix);
     }
     if raw.len() <= MAX_SEGMENT_ON_DISK {
         return Ok(SegmentKind::Short);

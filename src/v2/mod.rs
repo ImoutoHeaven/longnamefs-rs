@@ -5,6 +5,11 @@
 //! 目标：基于 `refine-fs-plan.md` 的设计，后续在这里实现
 //! xattr + 索引版的长文件名映射。
 
+pub mod error;
 pub mod fs;
 pub mod index;
+pub mod inode_store;
 pub mod path;
+
+#[allow(unused_imports)]
+pub use fs::{IndexSync, LongNameFsCore, LongNameFsV2Fuser};

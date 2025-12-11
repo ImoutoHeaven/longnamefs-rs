@@ -6,22 +6,29 @@ mod pathmap;
 mod util;
 mod v2;
 
-use crate::v2::fs::{IndexSync, LongNameFsV2};
+use crate::v2::{IndexSync, LongNameFsV2Fuser};
 use clap::{Parser, ValueEnum};
 use config::Config;
 use fs::LongNameFs;
 use fuse3::MountOptions;
 use fuse3::path::PathFilesystem;
 use fuse3::path::Session;
+use fuser::{
+    Filesystem as FuserFilesystem, MountOption as FuserMountOption, Session as FuserSession,
+};
 #[cfg(unix)]
 use futures_util::future::poll_fn;
 #[cfg(unix)]
 use nix::mount::{MntFlags, umount2};
 #[cfg(unix)]
 use std::cmp::min;
+use std::env;
+use std::fs as stdfs;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::pin::Pin;
+use std::sync::OnceLock;
+use std::thread;
 use std::time::Duration;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -68,6 +75,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_other: bool,
 
+    /// Select FUSE binding (v1 uses fuse3; v2 always uses fuser; this flag is ignored for v2).
+    #[arg(long, value_enum, default_value_t = FuseImpl::Fuse3)]
+    fuse_impl: FuseImpl,
+
     /// Permit mounting on a non-empty directory.
     #[arg(long, default_value_t = false)]
     nonempty: bool,
@@ -113,6 +124,12 @@ struct Cli {
 enum BackendLayout {
     V1,
     V2,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum FuseImpl {
+    Fuse3,
+    Fuser,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -166,6 +183,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.backend_layout {
         BackendLayout::V1 => {
             namefile::set_relaxed_namefile_mode(cli.unsafe_namefile_writes);
+            if cli.fuse_impl != FuseImpl::Fuse3 {
+                anyhow::bail!("fuser adapter is not implemented for backend layout v1");
+            }
             let fs = LongNameFs::new(config, cache_ttl, cli.max_write_kb);
             run_mount(fs, mountpoint, mount_opts).await
         }
@@ -173,17 +193,76 @@ async fn main() -> anyhow::Result<()> {
             eprintln!(
                 "WARNING: backend layout v2 is experimental and incompatible with v1 data; use a dedicated empty backend directory."
             );
-            let fs = LongNameFsV2::new(
+            if cli.fuse_impl == FuseImpl::Fuse3 {
+                eprintln!("v2 now only supports the fuser adapter; falling back to fuser.");
+            }
+            let fs = LongNameFsV2Fuser::new(
                 config,
                 cli.max_name_len,
                 cache_ttl,
                 cli.max_write_kb,
                 cli.index_sync.into(),
                 attr_ttl,
-            )?;
-            run_mount(fs, mountpoint, mount_opts).await
+            )
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            run_mount_fuser_with_signals(fs, mountpoint, cli.allow_other, cli.nonempty).await
         }
     }
+}
+
+#[cfg(unix)]
+async fn run_mount_fuser_with_signals(
+    fs: LongNameFsV2Fuser,
+    mountpoint: PathBuf,
+    allow_other: bool,
+    nonempty: bool,
+) -> anyhow::Result<()> {
+    async fn detach_mountpoint(path: PathBuf) -> anyhow::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            umount2(&path, MntFlags::MNT_DETACH).map_err(anyhow::Error::from)
+        })
+        .await?
+    }
+
+    let mountpoint_clone = mountpoint.clone();
+    let mut mount_task = tokio::task::spawn_blocking(move || {
+        run_mount_fuser(fs, mountpoint_clone, allow_other, nonempty)
+    });
+
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    let signals = async {
+        tokio::select! {
+            _ = sigint.recv() => (),
+            _ = sigterm.recv() => (),
+        }
+    };
+    tokio::pin!(signals);
+
+    let result = tokio::select! {
+        res = &mut mount_task => res,
+        _ = &mut signals => {
+            let _ = detach_mountpoint(mountpoint.clone()).await;
+            mount_task.await
+        }
+    };
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(join_err) => Err(join_err.into()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn run_mount_fuser_with_signals(
+    fs: LongNameFsV2Fuser,
+    mountpoint: PathBuf,
+    allow_other: bool,
+    nonempty: bool,
+) -> anyhow::Result<()> {
+    run_mount_fuser(fs, mountpoint, allow_other, nonempty)
 }
 
 async fn run_mount<F>(fs: F, mountpoint: PathBuf, mount_opts: MountOptions) -> anyhow::Result<()>
@@ -267,4 +346,80 @@ where
     }
 
     Ok(())
+}
+
+fn run_mount_fuser(
+    fs: LongNameFsV2Fuser,
+    mountpoint: PathBuf,
+    allow_other: bool,
+    nonempty: bool,
+) -> anyhow::Result<()> {
+    let mut options = vec![
+        FuserMountOption::RW,
+        FuserMountOption::FSName("longnamefs-rs".to_string()),
+        FuserMountOption::Subtype("ln2".to_string()),
+    ];
+    if writeback_cache_supported() {
+        options.push(FuserMountOption::CUSTOM("writeback_cache".to_string()));
+    }
+    if allow_other {
+        options.push(FuserMountOption::AllowOther);
+    }
+    if nonempty {
+        options.push(FuserMountOption::CUSTOM("nonempty".to_string()));
+    }
+    let notifier = fs.notifier_handle();
+    let mut session = FuserSession::new(fs, mountpoint, &options).map_err(anyhow::Error::from)?;
+    notifier.set(session.notifier());
+    session.run().map_err(anyhow::Error::from)
+}
+
+#[derive(Debug)]
+struct ProbeFs;
+
+impl FuserFilesystem for ProbeFs {}
+
+fn writeback_cache_supported() -> bool {
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        let mut mount_dir = None;
+        let base = env::temp_dir();
+        for idx in 0..8 {
+            let candidate = base.join(format!("ln2_wb_probe_{idx}"));
+            if stdfs::create_dir(&candidate).is_ok() {
+                mount_dir = Some(candidate);
+                break;
+            }
+        }
+        let Some(dir) = mount_dir else {
+            return false;
+        };
+
+        let opts = vec![
+            FuserMountOption::RW,
+            FuserMountOption::FSName("ln2-probe".to_string()),
+            FuserMountOption::Subtype("ln2probe".to_string()),
+            FuserMountOption::CUSTOM("writeback_cache".to_string()),
+        ];
+        let supported = match FuserSession::new(ProbeFs, &dir, &opts) {
+            Ok(mut session) => {
+                let mut unmounter = session.unmount_callable();
+                let handle = thread::spawn(move || session.run());
+                // best-effort unmount immediately; ignore errors so probe is non-fatal
+                let _ = unmounter.unmount();
+                let _ = handle.join();
+                true
+            }
+            Err(err) => {
+                if err.raw_os_error() == Some(libc::EINVAL) {
+                    false
+                } else {
+                    eprintln!("writeback_cache probe failed ({err}), disabling option");
+                    false
+                }
+            }
+        };
+        let _ = stdfs::remove_dir(&dir);
+        supported
+    })
 }

@@ -5,12 +5,17 @@ use nix::fcntl::{OFlag, openat, renameat};
 use nix::sys::stat::{FileStat, Mode};
 use nix::unistd::{fdatasync, fsync};
 use std::ffi::{CStr, CString};
+use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn errno_from_nix(err: nix::Error) -> fuse3::Errno {
     fuse3::Errno::from(err as i32)
+}
+
+fn io_error_from_nix(err: nix::Error) -> io::Error {
+    io::Error::from_raw_os_error(err as i32)
 }
 
 pub fn string_to_cstring(value: &str) -> Result<CString, fuse3::Errno> {
@@ -90,12 +95,7 @@ pub struct TempFile {
 const TMP_ATTEMPTS: usize = 16;
 static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-fn build_temp_name(
-    base: &CStr,
-    pid: u32,
-    counter: u32,
-    extra_suffix: &str,
-) -> Result<CString, fuse3::Errno> {
+fn build_temp_name(base: &CStr, pid: u32, counter: u32, extra_suffix: &str) -> io::Result<CString> {
     let pid_str = pid.to_string();
     let counter_str = counter.to_string();
     let mut buf = Vec::with_capacity(
@@ -119,7 +119,7 @@ fn build_temp_name(
         buf.push(b'.');
         buf.extend_from_slice(extra_suffix.as_bytes());
     }
-    CString::new(buf).map_err(|_| fuse3::Errno::from(libc::EINVAL))
+    CString::new(buf).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
 pub fn begin_temp_file(
@@ -127,6 +127,15 @@ pub fn begin_temp_file(
     final_name: &CStr,
     extra_suffix: &str,
 ) -> Result<TempFile, fuse3::Errno> {
+    core_begin_temp_file(dir_fd, final_name, extra_suffix)
+        .map_err(|e| fuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))
+}
+
+pub fn core_begin_temp_file(
+    dir_fd: BorrowedFd<'_>,
+    final_name: &CStr,
+    extra_suffix: &str,
+) -> io::Result<TempFile> {
     let pid = std::process::id();
     let mut counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
 
@@ -143,11 +152,11 @@ pub fn begin_temp_file(
                 counter = counter.wrapping_add(1);
                 continue;
             }
-            Err(err) => return Err(errno_from_nix(err)),
+            Err(err) => return Err(io_error_from_nix(err)),
         }
     }
 
-    Err(fuse3::Errno::from(libc::EEXIST))
+    Err(io::Error::from_raw_os_error(libc::EEXIST))
 }
 
 pub fn sync_and_commit(
@@ -155,14 +164,27 @@ pub fn sync_and_commit(
     temp: TempFile,
     final_name: &CStr,
 ) -> Result<(), fuse3::Errno> {
-    retry_eintr(|| fdatasync(temp.fd.as_fd())).map_err(errno_from_nix)?;
+    core_sync_and_commit(dir_fd, temp, final_name)
+        .map_err(|e| fuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))
+}
 
-    renameat(dir_fd, temp.name.as_c_str(), dir_fd, final_name).map_err(errno_from_nix)?;
+pub fn core_sync_and_commit(
+    dir_fd: BorrowedFd<'_>,
+    temp: TempFile,
+    final_name: &CStr,
+) -> io::Result<()> {
+    retry_eintr(|| fdatasync(temp.fd.as_fd())).map_err(io_error_from_nix)?;
 
-    fsync_dir(dir_fd)
+    renameat(dir_fd, temp.name.as_c_str(), dir_fd, final_name).map_err(io_error_from_nix)?;
+
+    core_fsync_dir(dir_fd)
 }
 
 pub fn fsync_dir(dir_fd: BorrowedFd<'_>) -> Result<(), fuse3::Errno> {
+    core_fsync_dir(dir_fd).map_err(|e| fuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))
+}
+
+pub fn core_fsync_dir(dir_fd: BorrowedFd<'_>) -> io::Result<()> {
     match retry_eintr(|| fsync(dir_fd)) {
         Ok(()) => Ok(()),
         Err(NixErrno::EBADF) => {
@@ -173,11 +195,11 @@ pub fn fsync_dir(dir_fd: BorrowedFd<'_>) -> Result<(), fuse3::Errno> {
                 OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
                 Mode::empty(),
             )
-            .map_err(errno_from_nix)?;
-            let res = retry_eintr(|| fsync(reopened.as_fd())).map_err(errno_from_nix);
+            .map_err(io_error_from_nix)?;
+            let res = retry_eintr(|| fsync(reopened.as_fd())).map_err(io_error_from_nix);
             drop(reopened);
             res
         }
-        Err(err) => Err(errno_from_nix(err)),
+        Err(err) => Err(io_error_from_nix(err)),
     }
 }
