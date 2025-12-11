@@ -1097,6 +1097,7 @@ fn list_logical_entries(
         backend_name: Vec<u8>,
         kind_hint: Option<CoreFileType>,
         is_internal: bool,
+        ino: u64,
     }
 
     #[derive(Debug)]
@@ -1110,6 +1111,7 @@ fn list_logical_entries(
         raw_name: Option<Vec<u8>>,
     }
 
+    let dir_dev = fstat(dir_fd).ok().map(|stat| stat.st_dev);
     let mut scanned = Vec::new();
     for entry in dir.iter() {
         let entry = match entry {
@@ -1134,6 +1136,7 @@ fn list_logical_entries(
             backend_name: name_bytes,
             kind_hint,
             is_internal,
+            ino: entry.ino(),
         });
     }
 
@@ -1146,7 +1149,15 @@ fn list_logical_entries(
         for entry in &scanned {
             let cached = state.attr_cache.get(&entry.backend_name).cloned();
             let attr = cached.as_ref().map(|c| c.attr);
-            let backend_key = cached.as_ref().map(|c| c.backend);
+            let mut backend_key = cached.as_ref().map(|c| c.backend);
+            if backend_key.is_none() {
+                backend_key = dir_dev.and_then(|dev| {
+                    (entry.ino != 0).then_some(BackendKey {
+                        dev,
+                        ino: entry.ino,
+                    })
+                });
+            }
             let kind = entry.kind_hint.or_else(|| attr.map(|a| a.kind));
 
             let internal_backend_name = entry.is_internal.then(|| entry.backend_name.clone());
@@ -1164,8 +1175,11 @@ fn list_logical_entries(
                 Some(entry.backend_name.clone())
             };
 
-            let needs_attr =
-                (need_attr && attr.is_none()) || kind.is_none() || backend_key.is_none();
+            let needs_attr = if need_attr {
+                attr.is_none() || backend_key.is_none() || kind.is_none()
+            } else {
+                kind.is_none()
+            };
             if needs_attr {
                 attr_miss.push(entry.backend_name.clone());
             }
@@ -3423,27 +3437,30 @@ impl FuserFilesystem for LongNameFsV2Fuser {
 
         let dir_listing = self.core.load_dir_entries_snapshot(&handle, false);
         for info in dir_listing.iter() {
-            let (attr, backend_key) = match (info.attr, info.backend_key) {
-                (Some(attr), Some(backend)) => (attr, backend),
-                _ => {
-                    let c_name = match cstring_from_bytes(&info.backend_name) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let stat = match fstatat(
-                        handle.as_fd(),
-                        c_name.as_c_str(),
-                        AtFlags::AT_SYMLINK_NOFOLLOW,
-                    ) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    (core_attr_from_stat(&stat), backend_key_from_stat(&stat))
+            let mut backend_key = info.backend_key;
+            let mut kind = Some(info.kind);
+            let needs_stat = backend_key.map(|k| k.ino == 0).unwrap_or(true) || kind.is_none();
+            if needs_stat {
+                let c_name = match cstring_from_bytes(&info.backend_name) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Ok(stat) = fstatat(
+                    handle.as_fd(),
+                    c_name.as_c_str(),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                ) {
+                    kind.get_or_insert_with(|| core_file_type_from_mode(stat.st_mode));
+                    backend_key.get_or_insert_with(|| backend_key_from_stat(&stat));
                 }
+            }
+            let Some(kind) = kind else { continue };
+            let Some(backend_key) = backend_key else {
+                continue;
             };
             let child_entry = self.inode_store.get_or_insert(
                 backend_key,
-                InodeKind::from(attr.kind),
+                InodeKind::from(kind),
                 ParentName {
                     parent: ino,
                     name: info.name.clone(),
