@@ -407,6 +407,53 @@ pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> CoreResult<(
     core_sync_and_commit(dir_fd, tmp, INDEX_NAME_CSTR).map_err(CoreError::from)
 }
 
+pub fn append_to_journal_file(
+    file: &mut std::fs::File,
+    ops: &[JournalOp],
+    sync: bool,
+) -> CoreResult<(u64, u64, u64)> {
+    if ops.is_empty() {
+        return Ok((0, 0, 0));
+    }
+
+    let estimated: usize = ops
+        .iter()
+        .map(|op| match op {
+            JournalOp::Upsert(k, v) => 1 + 4 + k.len() + 4 + v.len(),
+            JournalOp::Remove(k) => 1 + 4 + k.len() + 4,
+        })
+        .sum();
+    let mut buf = Vec::with_capacity(estimated);
+
+    for op in ops {
+        match op {
+            JournalOp::Upsert(k, v) => {
+                buf.push(1u8);
+                buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                buf.extend_from_slice(v);
+            }
+            JournalOp::Remove(k) => {
+                buf.push(2u8);
+                buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+
+    file.write_all(&buf).map_err(CoreError::from)?;
+    if sync {
+        file.sync_all().map_err(CoreError::from)?;
+    }
+
+    let size_after = fstat(file.as_fd())
+        .map(|st| st.st_size as u64)
+        .unwrap_or(buf.len() as u64);
+    Ok((buf.len() as u64, ops.len() as u64, size_after))
+}
+
 pub fn append_to_journal(
     dir_fd: BorrowedFd<'_>,
     ops: &[JournalOp],
@@ -426,37 +473,7 @@ pub fn append_to_journal(
     )
     .map_err(CoreError::from)?;
     let mut file = std::fs::File::from(fd);
-    let mut added_bytes = 0u64;
-
-    for op in ops {
-        let mut buf = Vec::new();
-        match op {
-            JournalOp::Upsert(k, v) => {
-                buf.push(1u8);
-                buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                buf.extend_from_slice(v);
-            }
-            JournalOp::Remove(k) => {
-                buf.push(2u8);
-                buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(&0u32.to_le_bytes());
-            }
-        }
-        file.write_all(&buf).map_err(CoreError::from)?;
-        added_bytes = added_bytes.saturating_add(buf.len() as u64);
-    }
-
-    if sync {
-        file.sync_all().map_err(CoreError::from)?;
-    }
-
-    let size_after = fstat(file.as_fd())
-        .map(|st| st.st_size as u64)
-        .unwrap_or(added_bytes);
-    Ok((added_bytes, ops.len() as u64, size_after))
+    append_to_journal_file(&mut file, ops, sync)
 }
 
 pub fn reset_journal(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {

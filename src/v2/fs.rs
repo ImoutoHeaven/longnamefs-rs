@@ -5,7 +5,7 @@ use crate::util::{
 use crate::v2::error::{CoreError, CoreResult, core_err_to_errno};
 use crate::v2::index::{
     DirIndex, INDEX_NAME, IndexLoadResult, JOURNAL_MAX_BYTES, JOURNAL_MAX_OPS, JOURNAL_NAME,
-    append_to_journal, read_dir_index, reset_journal, write_dir_index,
+    append_to_journal_file, read_dir_index, reset_journal, write_dir_index,
 };
 use crate::v2::inode_store::{
     BackendKey, InodeEntry, InodeId, InodeKind, InodeStore, ParentName, ROOT_INODE,
@@ -38,6 +38,7 @@ use nix::unistd::{
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
+use std::fs::File;
 use std::io;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -496,6 +497,7 @@ fn map_dirent_type(entry: &nix::dir::Entry) -> Option<CoreFileType> {
 #[derive(Debug)]
 struct IndexState {
     index: DirIndex,
+    journal_file: Option<File>,
     pending: usize,
     last_flush: Instant,
     journal_size_bytes: u64,
@@ -574,6 +576,7 @@ impl IndexCache {
         };
         let state = Arc::new(RwLock::new(IndexState {
             index,
+            journal_file: None,
             pending: 0,
             last_flush: Instant::now(),
             journal_size_bytes,
@@ -1123,6 +1126,7 @@ fn maybe_flush_index(
             journal_size,
             journal_ops_since_compact,
             should_compact,
+            guard.journal_file.take(),
         )
     };
 
@@ -1133,37 +1137,53 @@ fn maybe_flush_index(
         mut journal_size_bytes,
         mut journal_ops_since_compact,
         mut should_compact,
+        mut journal_file,
     ) = plan;
 
     let restore_ops = pending_ops.clone();
 
-    let flush_res: CoreResult<(u64, u64)> = (|| {
+    let flush_res: CoreResult<(u64, u64, Option<File>)> = (|| {
         if !pending_ops.is_empty() {
-            let (_added_bytes, added_ops, size_after) =
-                append_to_journal(dir_fd, &pending_ops, force_sync)?;
-            journal_size_bytes = size_after;
-            journal_ops_since_compact = journal_ops_since_compact.saturating_add(added_ops);
-            if journal_size_bytes > JOURNAL_MAX_BYTES {
-                should_compact = true;
+            if journal_file.is_none() {
+                let name = core_string_to_cstring(JOURNAL_NAME)?;
+                let fd = nix::fcntl::openat(
+                    dir_fd,
+                    name.as_c_str(),
+                    OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::from_bits_truncate(0o600),
+                )
+                .map_err(core_errno_from_nix)?;
+                journal_file = Some(File::from(fd));
+            }
+            if let Some(file) = journal_file.as_mut() {
+                let (_added_bytes, added_ops, size_after) =
+                    append_to_journal_file(file, &pending_ops, force_sync)?;
+                journal_size_bytes = size_after;
+                journal_ops_since_compact = journal_ops_since_compact.saturating_add(added_ops);
+                if journal_size_bytes > JOURNAL_MAX_BYTES {
+                    should_compact = true;
+                }
             }
         }
 
         if should_compact || journal_ops_since_compact > JOURNAL_MAX_OPS {
+            journal_file = None;
             write_dir_index(dir_fd, &snapshot)?;
             reset_journal(dir_fd)?;
             journal_size_bytes = 0;
             journal_ops_since_compact = 0;
         }
-        Ok((journal_size_bytes, journal_ops_since_compact))
+        Ok((journal_size_bytes, journal_ops_since_compact, journal_file))
     })();
 
     if let Err(err) = flush_res {
         let mut guard = state.index.write();
         guard.index.extend_pending_ops(restore_ops);
         guard.pending = pending_before;
+        guard.journal_file = None;
         return Err(err);
     }
-    let (journal_size_bytes, journal_ops_since_compact) = flush_res.unwrap();
+    let (journal_size_bytes, journal_ops_since_compact, journal_file) = flush_res.unwrap();
 
     let mut guard = state.index.write();
     if guard.pending == pending_before {
@@ -1176,6 +1196,7 @@ fn maybe_flush_index(
     }
     guard.journal_size_bytes = journal_size_bytes;
     guard.journal_ops_since_compact = journal_ops_since_compact;
+    guard.journal_file = journal_file;
     Ok(())
 }
 
@@ -4402,6 +4423,7 @@ mod tests {
         let state = DirState {
             index: Arc::new(RwLock::new(IndexState {
                 index: DirIndex::new(),
+                journal_file: None,
                 pending: 0,
                 last_flush: Instant::now(),
                 journal_size_bytes: 0,
