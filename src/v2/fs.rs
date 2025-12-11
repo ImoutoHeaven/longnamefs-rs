@@ -778,20 +778,24 @@ impl V2HandleTable {
         }
     }
 
+    fn allocate_fh(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn shard(&self, id: u64) -> &RwLock<HandleShard> {
         let idx = (id as usize) & HANDLE_SHARD_MASK;
         &self.shards[idx]
     }
 
     fn insert_file(&self, fd: OwnedFd) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.allocate_fh();
         let shard = self.shard(id);
         shard.write().entries.insert(id, Handle::File(Arc::new(fd)));
         id
     }
 
     fn insert_dir(&self, handle: DirHandle) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.allocate_fh();
         let shard = self.shard(id);
         shard
             .write()
@@ -851,7 +855,6 @@ impl V2HandleTable {
 #[cfg(feature = "abi-7-40")]
 #[derive(Debug)]
 struct PassthroughHandleTable {
-    next_id: AtomicU64,
     handles: RwLock<HashMap<u64, Arc<BackingId>>>,
 }
 
@@ -859,7 +862,6 @@ struct PassthroughHandleTable {
 impl Default for PassthroughHandleTable {
     fn default() -> Self {
         Self {
-            next_id: AtomicU64::new(1),
             handles: RwLock::new(HashMap::new()),
         }
     }
@@ -867,11 +869,10 @@ impl Default for PassthroughHandleTable {
 
 #[cfg(feature = "abi-7-40")]
 impl PassthroughHandleTable {
-    fn insert(&self, id: BackingId) -> (u64, Arc<BackingId>) {
-        let fh = self.next_id.fetch_add(1, Ordering::Relaxed);
+    fn insert(&self, fh: u64, id: BackingId) -> Arc<BackingId> {
         let backing = Arc::new(id);
         self.handles.write().insert(fh, backing.clone());
-        (fh, backing)
+        backing
     }
 
     fn contains(&self, fh: u64) -> bool {
@@ -2646,6 +2647,16 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         config: &mut KernelConfig,
     ) -> Result<(), libc::c_int> {
         let _ = config.set_max_write(self.max_write.get());
+        match config.add_capabilities(fuser_consts::FUSE_WRITEBACK_CACHE) {
+            Ok(()) => {
+                eprintln!("longnamefs-rs v2: writeback_cache requested and accepted");
+            }
+            Err(missing) => {
+                eprintln!(
+                    "longnamefs-rs v2: writeback_cache not accepted (missing {missing:#x}), continuing without"
+                );
+            }
+        }
         #[cfg(feature = "abi-7-40")]
         {
             if self.passthrough_cfg {
@@ -4132,7 +4143,8 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         if self.passthrough_active() {
             match reply.open_backing(fd.as_fd()) {
                 Ok(backing_id) => {
-                    let (fh, backing) = self.passthrough_handles.insert(backing_id);
+                    let fh = self.handles.allocate_fh();
+                    let backing = self.passthrough_handles.insert(fh, backing_id);
                     let _ = self.inode_store.inc_open(ino);
                     reply.opened_passthrough(fh, 0, &backing);
                     return;
@@ -4141,6 +4153,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     eprintln!(
                         "longnamefs-rs v2: open_backing failed for ino {ino} ({err}), falling back to userspace IO"
                     );
+                    self.passthrough_runtime = false;
                 }
             }
         }

@@ -56,6 +56,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 **Common options (v1 and v2)**
 - `--backend` (required): backend directory on disk.
 - `--backend-layout` (`v1` default): choose layout; only `v1` is compatible with the C implementation, `v2` requires its own backend.
+- `--fuse-impl` (`fuse3` default): binding selection for v1 (`fuser` available for testing); ignored on v2 which always uses fuser.
 - `--allow-other`: pass `allow_other` to FUSE.
 - `--nonempty`: allow mounting on a non-empty mountpoint.
 - `--dir-cache-ttl-ms`: per-directory readdir cache TTL in milliseconds (default 1000); also drives the directory FD cache used by the v2 path resolver.
@@ -73,6 +74,7 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 - Uses the fuser adapter exclusively; the `--fuse-impl` switch is ignored for v2.
 - `--max-name-len`: maximum logical segment length accepted (default 1024; returns `ENAMETOOLONG`/`EINVAL` when exceeded).
 - `--index-sync`: `always` flush index on every mutation, `batch` (default) flushes when 128 pending changes or 5s elapsed, `off` disables background flush (index rebuild will recover).
+- `--enable-passthrough`: request FUSE passthrough (kernel 7.40+ with `FUSE_PASSTHROUGH` required; fuser `abi-7-40` feature is compiled in by default). On failure to negotiate, IO automatically falls back to userspace and logs the reason once per process start.
 
 The process stays in the foreground and runs until the filesystem is unmounted
 or the process is terminated. This is intentional and makes it easy to use
