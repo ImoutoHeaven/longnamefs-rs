@@ -3,6 +3,10 @@ name = "longnamefs-rs"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["abi-7-40"]
+abi-7-40 = ["fuser/abi-7-40"]
+
 [dependencies]
 anyhow = "1.0.95"
 bytes = "1.7.2"

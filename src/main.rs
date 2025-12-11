@@ -111,6 +111,10 @@ struct Cli {
     #[arg(long)]
     attr_ttl_ms: Option<u64>,
 
+    /// Enable v2 passthrough IO (requires fuser abi-7-40 and kernel support).
+    #[arg(long, default_value_t = false)]
+    enable_passthrough: bool,
+
     /// v2 index flush strategy: always sync, batch by time/ops, or off (no flush).
     #[arg(long, value_enum, default_value_t = IndexSyncCli::Batch)]
     index_sync: IndexSyncCli,
@@ -196,6 +200,12 @@ async fn main() -> anyhow::Result<()> {
             if cli.fuse_impl == FuseImpl::Fuse3 {
                 eprintln!("v2 now only supports the fuser adapter; falling back to fuser.");
             }
+            #[cfg(feature = "abi-7-40")]
+            eprintln!("longnamefs-rs v2: fuser abi-7-40 enabled (passthrough APIs compiled in)");
+            #[cfg(not(feature = "abi-7-40"))]
+            eprintln!(
+                "longnamefs-rs v2: fuser passthrough APIs not compiled (build without abi-7-40)"
+            );
             let fs = LongNameFsV2Fuser::new(
                 config,
                 cli.max_name_len,
@@ -203,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.max_write_kb,
                 cli.index_sync.into(),
                 attr_ttl,
+                cli.enable_passthrough,
             )
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             run_mount_fuser_with_signals(fs, mountpoint, cli.allow_other, cli.nonempty).await

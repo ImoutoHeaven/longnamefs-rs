@@ -14,6 +14,8 @@ use crate::v2::path::{
     INTERNAL_PREFIX, MAX_COLLISION_SUFFIX, SegmentKind, backend_basename_from_hash,
     classify_segment, encode_long_name, is_reserved_prefix, normalize_osstr,
 };
+#[cfg(feature = "abi-7-40")]
+use fuser::{BackingId, consts as fuser_consts};
 use fuser::{
     FileAttr as FuserFileAttr, FileType as FuserFileType, Filesystem as FuserFilesystem,
     KernelConfig, Notifier as FuserNotifier, PollHandle as FuserPollHandle,
@@ -843,6 +845,41 @@ impl V2HandleTable {
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "abi-7-40")]
+#[derive(Debug)]
+struct PassthroughHandleTable {
+    next_id: AtomicU64,
+    handles: RwLock<HashMap<u64, Arc<BackingId>>>,
+}
+
+#[cfg(feature = "abi-7-40")]
+impl Default for PassthroughHandleTable {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            handles: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+#[cfg(feature = "abi-7-40")]
+impl PassthroughHandleTable {
+    fn insert(&self, id: BackingId) -> (u64, Arc<BackingId>) {
+        let fh = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let backing = Arc::new(id);
+        self.handles.write().insert(fh, backing.clone());
+        (fh, backing)
+    }
+
+    fn contains(&self, fh: u64) -> bool {
+        self.handles.read().contains_key(&fh)
+    }
+
+    fn remove(&self, fh: u64) -> Option<Arc<BackingId>> {
+        self.handles.write().remove(&fh)
     }
 }
 
@@ -2402,6 +2439,10 @@ pub struct LongNameFsV2Fuser {
     core: Arc<LongNameFsCore>,
     inode_store: InodeStore,
     handles: V2HandleTable,
+    passthrough_cfg: bool,
+    passthrough_runtime: bool,
+    #[cfg(feature = "abi-7-40")]
+    passthrough_handles: PassthroughHandleTable,
     max_write: NonZeroU32,
     attr_ttl: Duration,
     entry_ttl: Duration,
@@ -2417,6 +2458,7 @@ impl LongNameFsV2Fuser {
         max_write_kb: u32,
         index_sync: IndexSync,
         attr_ttl: Duration,
+        enable_passthrough: bool,
     ) -> CoreResult<Self> {
         let core = Arc::new(LongNameFsCore::new(
             config,
@@ -2437,11 +2479,46 @@ impl LongNameFsV2Fuser {
             core,
             inode_store,
             handles: V2HandleTable::new(),
+            passthrough_cfg: enable_passthrough,
+            passthrough_runtime: false,
+            #[cfg(feature = "abi-7-40")]
+            passthrough_handles: PassthroughHandleTable::default(),
             max_write,
             attr_ttl,
             entry_ttl: attr_ttl,
             notifier,
         })
+    }
+
+    fn passthrough_active(&self) -> bool {
+        #[cfg(feature = "abi-7-40")]
+        {
+            self.passthrough_cfg && self.passthrough_runtime
+        }
+        #[cfg(not(feature = "abi-7-40"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn is_passthrough_fh(&self, fh: u64) -> bool {
+        self.passthrough_handles.contains(fh)
+    }
+
+    #[cfg(not(feature = "abi-7-40"))]
+    fn is_passthrough_fh(&self, _fh: u64) -> bool {
+        false
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn remove_passthrough_fh(&self, fh: u64) -> bool {
+        self.passthrough_handles.remove(fh).is_some()
+    }
+
+    #[cfg(not(feature = "abi-7-40"))]
+    fn remove_passthrough_fh(&self, _fh: u64) -> bool {
+        false
     }
 
     fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
@@ -2569,6 +2646,37 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         config: &mut KernelConfig,
     ) -> Result<(), libc::c_int> {
         let _ = config.set_max_write(self.max_write.get());
+        #[cfg(feature = "abi-7-40")]
+        {
+            if self.passthrough_cfg {
+                match config.add_capabilities(fuser_consts::FUSE_PASSTHROUGH) {
+                    Ok(()) => {
+                        self.passthrough_runtime = true;
+                        eprintln!(
+                            "longnamefs-rs v2: passthrough requested and FUSE_PASSTHROUGH accepted"
+                        );
+                    }
+                    Err(err) => {
+                        self.passthrough_runtime = false;
+                        eprintln!(
+                            "longnamefs-rs v2: passthrough requested but FUSE_PASSTHROUGH not accepted ({err}), disabling"
+                        );
+                    }
+                }
+            } else {
+                self.passthrough_runtime = false;
+                eprintln!("longnamefs-rs v2: passthrough disabled by CLI");
+            }
+        }
+        #[cfg(not(feature = "abi-7-40"))]
+        {
+            if self.passthrough_cfg {
+                eprintln!(
+                    "longnamefs-rs v2: passthrough requested but fuser abi-7-40 is not compiled, disabling"
+                );
+            }
+            self.passthrough_runtime = false;
+        }
         Ok(())
     }
 
@@ -2635,11 +2743,15 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         };
         let result = if let Some(fh) = fh {
-            self.handles
-                .get_file(fh)
-                .and_then(|fd| fstat(fd.as_fd()).ok())
-                .map(|stat| fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino))
-                .ok_or(CoreError::NotFound)
+            if self.passthrough_active() && self.is_passthrough_fh(fh) {
+                self.attr_for_entry(&entry)
+            } else {
+                self.handles
+                    .get_file(fh)
+                    .and_then(|fd| fstat(fd.as_fd()).ok())
+                    .map(|stat| fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino))
+                    .ok_or(CoreError::NotFound)
+            }
         } else {
             self.attr_for_entry(&entry)
         };
@@ -2764,14 +2876,19 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         }
         if let Some(size) = size {
+            let mut truncated = false;
             if let Some(fh) = fh {
-                if let Some(fd) = self.handles.get_file(fh)
-                    && let Err(err) = nix::unistd::ftruncate(fd.as_fd(), size as i64)
-                {
-                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                    return;
+                if let Some(fd) = self.handles.get_file(fh) {
+                    if let Err(err) = nix::unistd::ftruncate(fd.as_fd(), size as i64) {
+                        reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                        return;
+                    }
+                    truncated = true;
+                } else if self.passthrough_active() && self.is_passthrough_fh(fh) {
+                    // passthrough handles do not live in self.handles; fall through to path-based truncate
                 }
-            } else {
+            }
+            if !truncated {
                 let file = match nix::fcntl::openat(
                     mapped.dir_fd.as_fd(),
                     fname.as_c_str(),
@@ -4004,14 +4121,32 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        match self.open_backend_file(&entry, flags as u32) {
-            Ok(fd) => {
-                let fh = self.handles.insert_file(fd);
-                let _ = self.inode_store.inc_open(ino);
-                reply.opened(fh, 0);
+        let fd = match self.open_backend_file(&entry, flags as u32) {
+            Ok(fd) => fd,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
             }
-            Err(err) => reply.error(core_err_to_errno(&err)),
+        };
+        #[cfg(feature = "abi-7-40")]
+        if self.passthrough_active() {
+            match reply.open_backing(fd.as_fd()) {
+                Ok(backing_id) => {
+                    let (fh, backing) = self.passthrough_handles.insert(backing_id);
+                    let _ = self.inode_store.inc_open(ino);
+                    reply.opened_passthrough(fh, 0, &backing);
+                    return;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "longnamefs-rs v2: open_backing failed for ino {ino} ({err}), falling back to userspace IO"
+                    );
+                }
+            }
         }
+        let fh = self.handles.insert_file(fd);
+        let _ = self.inode_store.inc_open(ino);
+        reply.opened(fh, 0);
     }
 
     fn read(
@@ -4025,6 +4160,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         _lock_owner: Option<u64>,
         reply: FuserReplyData,
     ) {
+        if self.passthrough_active() && self.is_passthrough_fh(fh) {
+            eprintln!(
+                "longnamefs-rs v2: read for passthrough fh {fh} unexpectedly reached userspace; returning EIO"
+            );
+            reply.error(libc::EIO);
+            return;
+        }
         let Some(handle) = self.handles.get_file(fh) else {
             reply.error(libc::EBADF);
             return;
@@ -4051,6 +4193,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         _lock_owner: Option<u64>,
         reply: FuserReplyWrite,
     ) {
+        if self.passthrough_active() && self.is_passthrough_fh(fh) {
+            eprintln!(
+                "longnamefs-rs v2: write for passthrough fh {fh} unexpectedly reached userspace; returning EIO"
+            );
+            reply.error(libc::EIO);
+            return;
+        }
         let Some(handle) = self.handles.get_file(fh) else {
             reply.error(libc::EBADF);
             return;
@@ -4082,18 +4231,21 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         datasync: bool,
         reply: FuserReplyEmpty,
     ) {
-        let Some(handle) = self.handles.get_file(fh) else {
+        let handle = self.handles.get_file(fh);
+        if handle.is_none() && !(self.passthrough_active() && self.is_passthrough_fh(fh)) {
             reply.error(libc::EBADF);
             return;
-        };
-        let sync_res = if datasync {
-            fdatasync(handle.as_fd())
-        } else {
-            fsync(handle.as_fd())
-        };
-        if let Err(err) = sync_res {
-            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-            return;
+        }
+        if let Some(handle) = handle.as_ref() {
+            let sync_res = if datasync {
+                fdatasync(handle.as_fd())
+            } else {
+                fsync(handle.as_fd())
+            };
+            if let Err(err) = sync_res {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
         }
         if let Some(entry) = self.inode_store.get(ino)
             && let Ok(path) = self.entry_path(&entry)
@@ -4115,6 +4267,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         reply: FuserReplyEmpty,
     ) {
         if self.handles.get_file(fh).is_none() {
+            if self.passthrough_active() && self.is_passthrough_fh(fh) {
+                reply.ok();
+                return;
+            }
             reply.error(libc::EBADF);
             return;
         }
@@ -4414,6 +4570,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         reply: FuserReplyPoll,
     ) {
         if self.handles.get_file(fh).is_none() {
+            if self.passthrough_active() && self.is_passthrough_fh(fh) {
+                reply.poll(0);
+                return;
+            }
             reply.error(libc::EBADF);
             return;
         }
@@ -4430,6 +4590,19 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         _flush: bool,
         reply: FuserReplyEmpty,
     ) {
+        if self.passthrough_active() && self.remove_passthrough_fh(fh) {
+            let _ = self.inode_store.dec_open(ino);
+            if let Some(entry) = self.inode_store.get(ino)
+                && let Ok(path) = self.entry_path(&entry)
+                && path != OsStr::new("/")
+                && let Ok(mapped) = self.core.resolve_path(&path)
+            {
+                self.invalidate_dir(mapped.dir_fd.as_fd());
+            }
+            self.notify_inode(ino);
+            reply.ok();
+            return;
+        }
         self.handles.remove(fh);
         let _ = self.inode_store.dec_open(ino);
         reply.ok();
