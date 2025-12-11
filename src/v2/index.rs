@@ -320,7 +320,15 @@ pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<IndexLoadResu
     let (journal, journal_size) = match read_journal_bytes(dir_fd)? {
         Some((buf, size)) => {
             if size > JOURNAL_MAX_BYTES {
-                return Err(CoreError::NoSpace);
+                let _ = reset_journal(dir_fd);
+                if has_base_index {
+                    return Ok(Some(IndexLoadResult {
+                        index,
+                        journal_size: 0,
+                        journal_ops_since_compact: 0,
+                    }));
+                }
+                return Ok(None);
             }
             (buf, size)
         }
@@ -399,7 +407,11 @@ pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> CoreResult<(
     core_sync_and_commit(dir_fd, tmp, INDEX_NAME_CSTR).map_err(CoreError::from)
 }
 
-pub fn append_to_journal(dir_fd: BorrowedFd<'_>, ops: &[JournalOp]) -> CoreResult<(u64, u64, u64)> {
+pub fn append_to_journal(
+    dir_fd: BorrowedFd<'_>,
+    ops: &[JournalOp],
+    sync: bool,
+) -> CoreResult<(u64, u64, u64)> {
     if ops.is_empty() {
         return Ok((0, 0, 0));
     }
@@ -435,6 +447,10 @@ pub fn append_to_journal(dir_fd: BorrowedFd<'_>, ops: &[JournalOp]) -> CoreResul
         }
         file.write_all(&buf).map_err(CoreError::from)?;
         added_bytes = added_bytes.saturating_add(buf.len() as u64);
+    }
+
+    if sync {
+        file.sync_all().map_err(CoreError::from)?;
     }
 
     let size_after = fstat(file.as_fd())
