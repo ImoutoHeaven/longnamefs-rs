@@ -482,15 +482,37 @@ impl DirFdCache {
         }
         let now = Instant::now();
         let mut index = self.name_index.lock();
-        let dir = index.dirs.get_mut(&parent)?;
-        if dir.expires_at <= now {
+        let expired = index
+            .dirs
+            .get(&parent)
+            .is_none_or(|dir| dir.expires_at <= now);
+        if expired {
             index.dirs.remove(&parent);
             if let Some(pos) = index.lru.iter().position(|k| *k == parent) {
                 index.lru.remove(pos);
             }
             return None;
         }
-        dir.entries.get(name).copied()
+
+        let key = {
+            let dir = index
+                .dirs
+                .get_mut(&parent)
+                .expect("dir exists and is not expired");
+            let key = dir.entries.get(name).copied();
+            if key.is_some() {
+                dir.expires_at = now + self.ttl;
+                if let Some(pos) = dir.lru.iter().position(|k| k.as_slice() == name) {
+                    let val = dir.lru.remove(pos).expect("pos checked");
+                    dir.lru.push_back(val);
+                }
+            }
+            key
+        };
+        if key.is_some() {
+            Self::name_index_touch_dir_lru(&mut index.lru, parent);
+        }
+        key
     }
 
     fn name_index_insert(&self, parent: DirCacheKey, name: &[u8], child: DirCacheKey) {
