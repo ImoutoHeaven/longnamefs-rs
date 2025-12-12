@@ -50,6 +50,11 @@ fn increase_rlimit_nofile() -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn detach_mountpoint_lazy(path: &std::path::Path) -> anyhow::Result<()> {
+    umount2(path, MntFlags::MNT_DETACH).map_err(anyhow::Error::from)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "longnamefs-rs")]
 #[command(about = "FUSE3 long file name shim compatible with the C longnamefs backend layout")]
@@ -227,13 +232,6 @@ async fn run_mount_fuser_with_signals(
     allow_other: bool,
     nonempty: bool,
 ) -> anyhow::Result<()> {
-    async fn detach_mountpoint(path: PathBuf) -> anyhow::Result<()> {
-        tokio::task::spawn_blocking(move || {
-            umount2(&path, MntFlags::MNT_DETACH).map_err(anyhow::Error::from)
-        })
-        .await?
-    }
-
     let mountpoint_clone = mountpoint.clone();
     let mut mount_task = tokio::task::spawn_blocking(move || {
         run_mount_fuser(fs, mountpoint_clone, allow_other, nonempty)
@@ -253,8 +251,11 @@ async fn run_mount_fuser_with_signals(
     let result = tokio::select! {
         res = &mut mount_task => res,
         _ = &mut signals => {
-            let _ = detach_mountpoint(mountpoint.clone()).await;
-            mount_task.await
+            if let Err(err) = detach_mountpoint_lazy(&mountpoint) {
+                eprintln!("longnamefs-rs v2: lazy unmount failed on signal ({err})");
+            }
+            eprintln!("longnamefs-rs v2: termination signal received, forcing exit");
+            std::process::exit(0);
         }
     };
 
@@ -284,14 +285,6 @@ where
 
     #[cfg(unix)]
     {
-        async fn detach_mountpoint(path: &std::path::Path) -> anyhow::Result<()> {
-            let owned = path.to_owned();
-            tokio::task::spawn_blocking(move || {
-                umount2(&owned, MntFlags::MNT_DETACH).map_err(anyhow::Error::from)
-            })
-            .await?
-        }
-
         fn is_ebusy(err: &anyhow::Error) -> bool {
             err.downcast_ref::<std::io::Error>()
                 .and_then(|io| io.raw_os_error())
@@ -299,7 +292,7 @@ where
         }
 
         // Listen for termination signals and unmount cleanly before exiting.
-        let (unmount_tx, unmount_rx) = oneshot::channel::<()>();
+        let (_unmount_tx, unmount_rx) = oneshot::channel::<()>();
 
         let mut mount_task = tokio::spawn(async move {
             let mut handle = Some(handle);
@@ -333,15 +326,18 @@ where
         let result = tokio::select! {
             res = &mut mount_task => res,
             _ = &mut signals => {
-                let _ = unmount_tx.send(());
-                mount_task.await
+                if let Err(err) = detach_mountpoint_lazy(&mountpoint) {
+                    eprintln!("longnamefs-rs v1: lazy unmount failed on signal ({err})");
+                }
+                eprintln!("longnamefs-rs v1: termination signal received, forcing exit");
+                std::process::exit(0);
             }
         };
 
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) if is_ebusy(&err) => {
-                detach_mountpoint(&mountpoint).await?;
+                detach_mountpoint_lazy(&mountpoint)?;
             }
             Ok(Err(err)) => return Err(err),
             Err(join_err) => return Err(join_err.into()),
