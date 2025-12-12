@@ -332,11 +332,35 @@ struct DirFdCacheEntry {
 }
 
 #[derive(Debug)]
+struct DirFdNameIndexDir {
+    expires_at: Instant,
+    entries: HashMap<Vec<u8>, DirCacheKey>,
+    lru: VecDeque<Vec<u8>>,
+}
+
+impl Default for DirFdNameIndexDir {
+    fn default() -> Self {
+        Self {
+            expires_at: Instant::now(),
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DirFdNameIndex {
+    dirs: HashMap<DirCacheKey, DirFdNameIndexDir>,
+    lru: VecDeque<DirCacheKey>,
+}
+
+#[derive(Debug)]
 struct DirFdCache {
     ttl: Duration,
     enabled: bool,
     entries: Mutex<HashMap<DirCacheKey, DirFdCacheEntry>>,
     lru: Mutex<VecDeque<DirCacheKey>>,
+    name_index: Mutex<DirFdNameIndex>,
 }
 
 impl DirFdCache {
@@ -350,6 +374,7 @@ impl DirFdCache {
             enabled,
             entries: Mutex::new(HashMap::new()),
             lru: Mutex::new(VecDeque::new()),
+            name_index: Mutex::new(DirFdNameIndex::default()),
         }
     }
 
@@ -421,6 +446,17 @@ impl DirFdCache {
         fd
     }
 
+    fn invalidate_name_index_dir(&self, key: DirCacheKey) {
+        if !self.enabled {
+            return;
+        }
+        let mut index = self.name_index.lock();
+        index.dirs.remove(&key);
+        if let Some(pos) = index.lru.iter().position(|k| *k == key) {
+            index.lru.remove(pos);
+        }
+    }
+
     fn invalidate(&self, key: DirCacheKey) {
         if !self.enabled {
             return;
@@ -430,6 +466,103 @@ impl DirFdCache {
         let mut lru = self.lru.lock();
         if let Some(pos) = lru.iter().position(|k| *k == key) {
             lru.remove(pos);
+        }
+    }
+
+    fn name_index_touch_dir_lru(lru: &mut VecDeque<DirCacheKey>, key: DirCacheKey) {
+        if let Some(pos) = lru.iter().position(|k| *k == key) {
+            lru.remove(pos);
+        }
+        lru.push_back(key);
+    }
+
+    fn name_index_get(&self, parent: DirCacheKey, name: &[u8]) -> Option<DirCacheKey> {
+        if !self.enabled {
+            return None;
+        }
+        let now = Instant::now();
+        let mut index = self.name_index.lock();
+        let dir = index.dirs.get_mut(&parent)?;
+        if dir.expires_at <= now {
+            index.dirs.remove(&parent);
+            if let Some(pos) = index.lru.iter().position(|k| *k == parent) {
+                index.lru.remove(pos);
+            }
+            return None;
+        }
+        dir.entries.get(name).copied()
+    }
+
+    fn name_index_insert(&self, parent: DirCacheKey, name: &[u8], child: DirCacheKey) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let mut index = self.name_index.lock();
+        let dir = index.dirs.entry(parent).or_default();
+        dir.expires_at = now + self.ttl;
+
+        const MAX_NAMES_PER_DIR: usize = 256;
+        if !dir.entries.contains_key(name) {
+            dir.lru.push_back(name.to_vec());
+        }
+        dir.entries.insert(name.to_vec(), child);
+        while dir.entries.len() > MAX_NAMES_PER_DIR {
+            if let Some(old) = dir.lru.pop_front() {
+                dir.entries.remove(&old);
+            } else {
+                break;
+            }
+        }
+
+        Self::name_index_touch_dir_lru(&mut index.lru, parent);
+        while index.lru.len() > DIR_FD_CACHE_MAX_DIRS {
+            if let Some(old_parent) = index.lru.pop_front() {
+                index.dirs.remove(&old_parent);
+            }
+        }
+    }
+
+    fn name_index_remove(&self, parent: DirCacheKey, name: &[u8]) {
+        if !self.enabled {
+            return;
+        }
+        let mut index = self.name_index.lock();
+        let Some(dir) = index.dirs.get_mut(&parent) else {
+            return;
+        };
+        dir.entries.remove(name);
+        if let Some(pos) = dir.lru.iter().position(|k| k.as_slice() == name) {
+            dir.lru.remove(pos);
+        }
+        if dir.entries.is_empty() {
+            index.dirs.remove(&parent);
+            if let Some(pos) = index.lru.iter().position(|k| *k == parent) {
+                index.lru.remove(pos);
+            }
+        }
+    }
+
+    fn patch_name_index(&self, parent: DirCacheKey, op: CacheOp) {
+        match op {
+            CacheOp::Add(info) => {
+                if info.kind != CoreFileType::Directory {
+                    return;
+                }
+                let Some(backend_key) = info.backend_key else {
+                    return;
+                };
+                self.name_index_insert(
+                    parent,
+                    &info.backend_name,
+                    DirCacheKey {
+                        dev: backend_key.dev,
+                        ino: backend_key.ino,
+                    },
+                );
+            }
+            CacheOp::Remove(backend) => self.name_index_remove(parent, &backend),
+            CacheOp::UpdateAttr(..) => {}
         }
     }
 }
@@ -908,6 +1041,13 @@ impl BackendName {
         match self {
             BackendName::Short(raw) => raw.clone(),
             BackendName::Internal(name) => name.clone(),
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            BackendName::Short(raw) => raw.as_slice(),
+            BackendName::Internal(name) => name.as_slice(),
         }
     }
 
@@ -1983,11 +2123,13 @@ impl LongNameFsCore {
     pub(crate) fn invalidate_dir_by_key(&self, key: DirCacheKey) {
         self.dir_cache.invalidate(key);
         self.dir_fd_cache.invalidate(key);
+        self.dir_fd_cache.invalidate_name_index_dir(key);
     }
 
     pub(crate) fn patch_dir_cache(&self, dir_fd: BorrowedFd<'_>, op: CacheOp) {
         if let Some(key) = dir_cache_key(dir_fd) {
-            self.dir_cache.patch(key, op);
+            self.dir_cache.patch(key, op.clone());
+            self.dir_fd_cache.patch_name_index(key, op);
         }
     }
 
@@ -2005,6 +2147,16 @@ impl LongNameFsCore {
         parent_fd: BorrowedFd<'_>,
         backend: &BackendName,
     ) -> CoreResult<Arc<OwnedFd>> {
+        let parent_key = dir_cache_key(parent_fd);
+        if let Some(parent_key) = parent_key
+            && let Some(child_key) = self
+                .dir_fd_cache
+                .name_index_get(parent_key, backend.as_bytes())
+            && let Some(cached) = self.dir_fd_cache.get(child_key)
+        {
+            return Ok(cached);
+        }
+
         let c_name = backend.as_cstring()?;
         let fd = nix::fcntl::openat(
             parent_fd,
@@ -2018,6 +2170,10 @@ impl LongNameFsCore {
             dev: stat.st_dev,
             ino: stat.st_ino,
         };
+        if let Some(parent_key) = parent_key {
+            self.dir_fd_cache
+                .name_index_insert(parent_key, backend.as_bytes(), key);
+        }
         if let Some(cached) = self.dir_fd_cache.get(key) {
             return Ok(cached);
         }
@@ -2611,7 +2767,8 @@ impl LongNameFsV2Fuser {
 
     fn patch_dir_cache(&self, dir_fd: BorrowedFd<'_>, op: CacheOp) {
         if let Some(key) = dir_cache_key(dir_fd) {
-            self.core.dir_cache.patch(key, op);
+            self.core.dir_cache.patch(key, op.clone());
+            self.core.dir_fd_cache.patch_name_index(key, op);
             self.handles.clear_dir_attr_cache(key);
         }
     }
@@ -4852,7 +5009,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     struct TempDir(PathBuf);
 
@@ -4927,5 +5084,56 @@ mod tests {
         }
         let err = map_segment_for_create(&state, &raw, raw.len() + 4).unwrap_err();
         assert!(matches!(err, CoreError::AlreadyExists));
+    }
+
+    #[test]
+    fn dir_fd_name_index_tracks_parent_name_to_child_key() {
+        let tmp = TempDir::new();
+        fs::create_dir(tmp.path().join("a")).unwrap();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+        let fs = LongNameFsV2Fuser::new(
+            config,
+            MAX_SEGMENT_ON_DISK,
+            Some(Duration::from_secs(60)),
+            1024,
+            IndexSync::Off,
+            Duration::from_secs(1),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let root_fd = fs.core.cached_root_fd().unwrap();
+        let child_fd = fs
+            .core
+            .open_dir_cached(root_fd.as_fd(), &BackendName::Short(b"a".to_vec()))
+            .unwrap();
+
+        let parent_key = dir_cache_key(root_fd.as_fd()).unwrap();
+        let child_stat = fstat(child_fd.as_fd()).unwrap();
+        let child_key = DirCacheKey {
+            dev: child_stat.st_dev,
+            ino: child_stat.st_ino,
+        };
+
+        assert_eq!(
+            fs.core.dir_fd_cache.name_index_get(parent_key, b"a"),
+            Some(child_key)
+        );
+
+        fs.core.invalidate_dir_by_key(parent_key);
+        assert_eq!(fs.core.dir_fd_cache.name_index_get(parent_key, b"a"), None);
+
+        let _ = fs
+            .core
+            .open_dir_cached(root_fd.as_fd(), &BackendName::Short(b"a".to_vec()))
+            .unwrap();
+        assert_eq!(
+            fs.core.dir_fd_cache.name_index_get(parent_key, b"a"),
+            Some(child_key)
+        );
+
+        fs.patch_dir_cache(root_fd.as_fd(), CacheOp::Remove(b"a".to_vec()));
+        assert_eq!(fs.core.dir_fd_cache.name_index_get(parent_key, b"a"), None);
     }
 }
