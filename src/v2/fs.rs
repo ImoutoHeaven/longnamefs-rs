@@ -3012,99 +3012,152 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
         };
         let raw = normalize_osstr(name);
-        let (backend, kind) = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len)
-        {
+        let mut backend = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
                 return;
             }
         };
-        let backend_bytes = backend.display_bytes();
-        let fname = match backend.as_cstring() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(core_err_to_errno(&err));
-                return;
-            }
-        };
-        let sflag = nix::sys::stat::SFlag::from_bits_truncate(mode);
-        let perm = Mode::from_bits_truncate(mode);
-        if let Err(err) = mknodat(
-            ctx.dir_fd.as_fd(),
-            fname.as_c_str(),
-            sflag,
-            perm,
-            rdev as u64,
-        ) {
-            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-            return;
-        }
-        if matches!(kind, SegmentKind::Long) {
-            let fd = match nix::fcntl::openat(
+
+        let mut attempt = 0;
+        loop {
+            let fname = match backend.0.as_cstring() {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            let backend_bytes = backend.0.display_bytes();
+            let sflag = nix::sys::stat::SFlag::from_bits_truncate(mode);
+            let perm = Mode::from_bits_truncate(mode);
+            match mknodat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
+                sflag,
+                perm,
+                rdev as u64,
             ) {
-                Ok(fd) => fd,
+                Ok(()) => {
+                    if matches!(backend.1, SegmentKind::Long) {
+                        let fd = match nix::fcntl::openat(
+                            ctx.dir_fd.as_fd(),
+                            fname.as_c_str(),
+                            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                            Mode::empty(),
+                        ) {
+                            Ok(fd) => fd,
+                            Err(err) => {
+                                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                                return;
+                            }
+                        };
+                        if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+                            reply.error(core_err_to_errno(&err));
+                            return;
+                        }
+                        {
+                            let mut guard = ctx.state.index.write();
+                            guard.index.upsert(backend_bytes.clone(), raw.clone());
+                            guard.pending = guard.pending.saturating_add(1);
+                        }
+                        ctx.state.attr_cache.clear();
+                        let _ = maybe_flush_index(
+                            ctx.dir_fd.as_fd(),
+                            &mut ctx.state,
+                            self.core.index_sync,
+                            false,
+                        );
+                    }
+                    let stat = match fstatat(
+                        ctx.dir_fd.as_fd(),
+                        fname.as_c_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(st) => st,
+                        Err(err) => {
+                            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                            return;
+                        }
+                    };
+                    let core_attr = core_attr_from_stat(&stat);
+                    let backend_key = backend_key_from_stat(&stat);
+                    ctx.state.attr_cache.insert(
+                        backend_bytes.clone(),
+                        CachedAttr {
+                            attr: core_attr_from_stat(&stat),
+                            backend: backend_key,
+                        },
+                    );
+                    self.patch_dir_cache(
+                        ctx.dir_fd.as_fd(),
+                        CacheOp::Add(DirEntryInfo {
+                            name: name.to_os_string(),
+                            kind: core_attr.kind,
+                            attr: Some(core_attr),
+                            backend_name: backend_bytes.clone(),
+                            backend_key: Some(backend_key),
+                        }),
+                    );
+                    let child = self.ensure_child_entry(parent, name, stat, 1);
+                    let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+                    self.notify_entry_change(parent, name);
+                    self.notify_inode(child.ino);
+                    reply.entry(&self.entry_ttl, &attr, 0);
+                    return;
+                }
+                Err(nix::errno::Errno::EEXIST) => {
+                    if matches!(backend.1, SegmentKind::Short) || attempt > MAX_COLLISION_SUFFIX {
+                        reply.error(libc::EEXIST);
+                        return;
+                    }
+                    let decision = match handle_backend_eexist_index_missing(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        &backend_bytes,
+                        &raw,
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            reply.error(core_err_to_errno(&err));
+                            return;
+                        }
+                    };
+                    let _ = maybe_flush_index(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        self.core.index_sync,
+                        false,
+                    );
+                    match decision {
+                        CreateDecision::AlreadyExistsSameName => {
+                            reply.error(libc::EEXIST);
+                            return;
+                        }
+                        CreateDecision::NeedNewSuffix => {
+                            backend = match map_segment_for_create(
+                                &ctx.state,
+                                &raw,
+                                self.core.max_name_len,
+                            ) {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    reply.error(core_err_to_errno(&err));
+                                    return;
+                                }
+                            };
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+                }
                 Err(err) => {
                     reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                     return;
                 }
-            };
-            if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
-                reply.error(core_err_to_errno(&err));
-                return;
             }
-            {
-                let mut guard = ctx.state.index.write();
-                guard.index.upsert(backend_bytes.clone(), raw.clone());
-                guard.pending = guard.pending.saturating_add(1);
-            }
-            ctx.state.attr_cache.clear();
-            let _ = maybe_flush_index(
-                ctx.dir_fd.as_fd(),
-                &mut ctx.state,
-                self.core.index_sync,
-                false,
-            );
         }
-        let stat = match fstatat(
-            ctx.dir_fd.as_fd(),
-            fname.as_c_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        ) {
-            Ok(st) => st,
-            Err(err) => {
-                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                return;
-            }
-        };
-        let core_attr = core_attr_from_stat(&stat);
-        let backend_key = backend_key_from_stat(&stat);
-        ctx.state.attr_cache.insert(
-            backend_bytes.clone(),
-            CachedAttr {
-                attr: core_attr_from_stat(&stat),
-                backend: backend_key,
-            },
-        );
-        self.patch_dir_cache(
-            ctx.dir_fd.as_fd(),
-            CacheOp::Add(DirEntryInfo {
-                name: name.to_os_string(),
-                kind: core_attr.kind,
-                attr: Some(core_attr),
-                backend_name: backend_bytes.clone(),
-                backend_key: Some(backend_key),
-            }),
-        );
-        let child = self.ensure_child_entry(parent, name, stat, 1);
-        let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
-        self.notify_entry_change(parent, name);
-        self.notify_inode(child.ino);
-        reply.entry(&self.entry_ttl, &attr, 0);
     }
 
     fn create(
@@ -3117,6 +3170,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         flags: i32,
         reply: FuserReplyCreate,
     ) {
+        // fuser 0.16 doesn't expose a ReplyCreate variant that can carry a backing_id /
+        // FOPEN_PASSTHROUGH. When passthrough is active, return ENOSYS so the kernel falls back
+        // to MKNOD + OPEN, allowing OPEN to enable passthrough for the new fd.
+        if self.passthrough_active() {
+            reply.error(libc::ENOSYS);
+            return;
+        }
         let Some(parent_entry) = self.inode_store.get(parent) else {
             reply.error(libc::ESTALE);
             return;
@@ -4167,10 +4227,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     // Only disable passthrough globally on capability or ioctl-level errors.
                     // For per-file limitations (e.g. non-regular files), keep passthrough for
                     // other inodes to avoid silent global performance regressions.
-                    if errno == libc::EPERM
-                        || errno == libc::EOPNOTSUPP
-                        || errno == libc::ENOTTY
-                    {
+                    if errno == libc::EPERM || errno == libc::EOPNOTSUPP || errno == libc::ENOTTY {
                         self.passthrough_runtime = false;
                     }
                 }
