@@ -571,6 +571,7 @@ struct IndexState {
     journal_file: Option<File>,
     pending: usize,
     last_flush: Instant,
+    flushing: bool,
     journal_size_bytes: u64,
     journal_ops_since_compact: u64,
 }
@@ -666,6 +667,7 @@ impl IndexCache {
             journal_file: None,
             pending: 0,
             last_flush: Instant::now(),
+            flushing: false,
             journal_size_bytes,
             journal_ops_since_compact,
         }));
@@ -1065,19 +1067,34 @@ fn get_internal_rawname(fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
         return Err(io::Error::last_os_error().into());
     }
     let mut buf = vec![0u8; res as usize];
-    let res = unsafe {
-        libc::fgetxattr(
-            fd.as_raw_fd(),
-            name.as_ptr(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
-        )
-    };
-    if res < 0 {
-        return Err(io::Error::last_os_error().into());
+    let mut did_retry = false;
+    loop {
+        let res = unsafe {
+            libc::fgetxattr(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if res >= 0 {
+            buf.truncate(res as usize);
+            return Ok(buf);
+        }
+
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ERANGE) && !did_retry {
+            did_retry = true;
+            let size =
+                unsafe { libc::fgetxattr(fd.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+            if size < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            buf.resize(size as usize, 0u8);
+            continue;
+        }
+        return Err(err.into());
     }
-    buf.truncate(res as usize);
-    Ok(buf)
 }
 
 fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
@@ -1256,130 +1273,172 @@ fn maybe_flush_index(
     strategy: IndexSync,
     force_sync: bool,
 ) -> CoreResult<()> {
-    let plan = {
-        let mut guard = state.index.write();
-        let should_flush = match strategy {
-            IndexSync::Always => guard.index.is_dirty() || guard.index.has_pending_ops(),
-            IndexSync::Batch {
-                max_pending,
-                max_age,
-            } => {
-                guard.index.is_dirty()
-                    && (guard.pending >= max_pending || guard.last_flush.elapsed() >= max_age)
+    let mut backoff_us = 0u64;
+    loop {
+        let plan = {
+            let mut guard = state.index.write();
+            if guard.flushing {
+                if force_sync {
+                    None
+                } else {
+                    return Ok(());
+                }
+            } else {
+                let should_flush = match strategy {
+                    IndexSync::Always => guard.index.is_dirty() || guard.index.has_pending_ops(),
+                    IndexSync::Batch {
+                        max_pending,
+                        max_age,
+                    } => {
+                        guard.index.is_dirty()
+                            && (guard.pending >= max_pending
+                                || guard.last_flush.elapsed() >= max_age)
+                    }
+                    IndexSync::Off => false,
+                };
+                let should_compact = guard.journal_size_bytes > JOURNAL_MAX_BYTES
+                    || guard.journal_ops_since_compact > JOURNAL_MAX_OPS;
+                let need_force_sync_only =
+                    force_sync && !should_flush && !should_compact && guard.journal_size_bytes > 0;
+
+                if !(should_flush || should_compact || need_force_sync_only) {
+                    return Ok(());
+                }
+
+                guard.flushing = true;
+                let pending_ops = guard.index.take_pending_ops();
+                let snapshot = guard.index.clone();
+                let pending_before = guard.pending;
+                let journal_size = guard.journal_size_bytes;
+                let journal_ops_since_compact = guard.journal_ops_since_compact;
+                Some((
+                    pending_ops,
+                    snapshot,
+                    pending_before,
+                    journal_size,
+                    journal_ops_since_compact,
+                    should_compact,
+                    need_force_sync_only,
+                    guard.journal_file.take(),
+                ))
             }
-            IndexSync::Off => false,
         };
-        let should_compact = guard.journal_size_bytes > JOURNAL_MAX_BYTES
-            || guard.journal_ops_since_compact > JOURNAL_MAX_OPS;
-        let need_force_sync_only =
-            force_sync && !should_flush && !should_compact && guard.journal_size_bytes > 0;
 
-        if !(should_flush || should_compact || need_force_sync_only) {
-            return Ok(());
-        }
+        let Some(plan) = plan else {
+            if backoff_us == 0 {
+                backoff_us = 50;
+                thread::yield_now();
+            } else {
+                thread::sleep(Duration::from_micros(backoff_us));
+                backoff_us = (backoff_us.saturating_mul(2)).min(1000);
+            }
+            continue;
+        };
 
-        let pending_ops = guard.index.take_pending_ops();
-        let snapshot = guard.index.clone();
-        let pending_before = guard.pending;
-        let journal_size = guard.journal_size_bytes;
-        let journal_ops_since_compact = guard.journal_ops_since_compact;
-        (
+        let (
             pending_ops,
             snapshot,
             pending_before,
-            journal_size,
-            journal_ops_since_compact,
-            should_compact,
+            mut journal_size_bytes,
+            mut journal_ops_since_compact,
+            mut should_compact,
             need_force_sync_only,
-            guard.journal_file.take(),
-        )
-    };
+            mut journal_file,
+        ) = plan;
 
-    let (
-        pending_ops,
-        snapshot,
-        pending_before,
-        mut journal_size_bytes,
-        mut journal_ops_since_compact,
-        mut should_compact,
-        need_force_sync_only,
-        mut journal_file,
-    ) = plan;
+        let restore_ops = pending_ops.clone();
 
-    let restore_ops = pending_ops.clone();
-
-    let flush_res: CoreResult<(u64, u64, Option<File>)> = (|| {
-        if !pending_ops.is_empty() {
-            if journal_file.is_none() {
-                let name = core_string_to_cstring(JOURNAL_NAME)?;
-                let fd = nix::fcntl::openat(
-                    dir_fd,
-                    name.as_c_str(),
-                    OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_CLOEXEC,
-                    nix::sys::stat::Mode::from_bits_truncate(0o600),
-                )
-                .map_err(core_errno_from_nix)?;
-                journal_file = Some(File::from(fd));
-            }
-            if let Some(file) = journal_file.as_mut() {
-                let (_added_bytes, added_ops, size_after) =
-                    append_to_journal_file(file, &pending_ops, force_sync)?;
-                journal_size_bytes = size_after;
-                journal_ops_since_compact = journal_ops_since_compact.saturating_add(added_ops);
-                if journal_size_bytes > JOURNAL_MAX_BYTES {
-                    should_compact = true;
+        let flush_res: CoreResult<(u64, u64, Option<File>)> = (|| {
+            if !pending_ops.is_empty() {
+                if journal_file.is_none() {
+                    let name = core_string_to_cstring(JOURNAL_NAME)?;
+                    let fd = nix::fcntl::openat(
+                        dir_fd,
+                        name.as_c_str(),
+                        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_CLOEXEC,
+                        nix::sys::stat::Mode::from_bits_truncate(0o600),
+                    )
+                    .map_err(core_errno_from_nix)?;
+                    journal_file = Some(File::from(fd));
+                }
+                if let Some(file) = journal_file.as_mut() {
+                    let (_added_bytes, added_ops, size_after) =
+                        append_to_journal_file(file, &pending_ops, force_sync)?;
+                    journal_size_bytes = size_after;
+                    journal_ops_since_compact = journal_ops_since_compact.saturating_add(added_ops);
+                    if journal_size_bytes > JOURNAL_MAX_BYTES {
+                        should_compact = true;
+                    }
                 }
             }
-        }
-        if need_force_sync_only && journal_size_bytes > 0 {
-            if journal_file.is_none() {
-                let name = core_string_to_cstring(JOURNAL_NAME)?;
-                let fd = nix::fcntl::openat(
-                    dir_fd,
-                    name.as_c_str(),
-                    OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_CLOEXEC,
-                    nix::sys::stat::Mode::from_bits_truncate(0o600),
-                )
-                .map_err(core_errno_from_nix)?;
-                journal_file = Some(File::from(fd));
+            if need_force_sync_only && journal_size_bytes > 0 {
+                if journal_file.is_none() {
+                    let name = core_string_to_cstring(JOURNAL_NAME)?;
+                    let fd = nix::fcntl::openat(
+                        dir_fd,
+                        name.as_c_str(),
+                        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_CLOEXEC,
+                        nix::sys::stat::Mode::from_bits_truncate(0o600),
+                    )
+                    .map_err(core_errno_from_nix)?;
+                    journal_file = Some(File::from(fd));
+                }
+                if let Some(file) = journal_file.as_mut() {
+                    file.sync_all().map_err(CoreError::from)?;
+                }
             }
-            if let Some(file) = journal_file.as_mut() {
-                file.sync_all().map_err(CoreError::from)?;
+
+            if should_compact || journal_ops_since_compact > JOURNAL_MAX_OPS {
+                journal_file = None;
+                write_dir_index(dir_fd, &snapshot)?;
+                reset_journal(dir_fd)?;
+                journal_size_bytes = 0;
+                journal_ops_since_compact = 0;
             }
-        }
+            Ok((journal_size_bytes, journal_ops_since_compact, journal_file))
+        })();
 
-        if should_compact || journal_ops_since_compact > JOURNAL_MAX_OPS {
-            journal_file = None;
-            write_dir_index(dir_fd, &snapshot)?;
-            reset_journal(dir_fd)?;
-            journal_size_bytes = 0;
-            journal_ops_since_compact = 0;
-        }
-        Ok((journal_size_bytes, journal_ops_since_compact, journal_file))
-    })();
+        if let Err(err) = flush_res {
+            let journal_size_on_err = core_string_to_cstring(JOURNAL_NAME)
+                .ok()
+                .and_then(|name| {
+                    nix::fcntl::openat(
+                        dir_fd,
+                        name.as_c_str(),
+                        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                        Mode::empty(),
+                    )
+                    .ok()
+                })
+                .and_then(|fd| fstat(fd.as_fd()).ok())
+                .map(|st| st.st_size as u64);
 
-    if let Err(err) = flush_res {
+            let mut guard = state.index.write();
+            guard.index.extend_pending_ops(restore_ops);
+            if let Some(size) = journal_size_on_err {
+                guard.journal_size_bytes = size;
+            }
+            guard.journal_file = None;
+            guard.flushing = false;
+            return Err(err);
+        }
+        let (journal_size_bytes, journal_ops_since_compact, journal_file) = flush_res.unwrap();
+
         let mut guard = state.index.write();
-        guard.index.extend_pending_ops(restore_ops);
-        guard.pending = pending_before;
-        guard.journal_file = None;
-        return Err(err);
+        if guard.pending == pending_before {
+            guard.index.clear_dirty();
+            guard.index.clear_pending_ops();
+            guard.pending = 0;
+            guard.last_flush = Instant::now();
+        } else {
+            guard.pending = guard.pending.saturating_sub(pending_before);
+        }
+        guard.journal_size_bytes = journal_size_bytes;
+        guard.journal_ops_since_compact = journal_ops_since_compact;
+        guard.journal_file = journal_file;
+        guard.flushing = false;
+        return Ok(());
     }
-    let (journal_size_bytes, journal_ops_since_compact, journal_file) = flush_res.unwrap();
-
-    let mut guard = state.index.write();
-    if guard.pending == pending_before {
-        guard.index.clear_dirty();
-        guard.index.clear_pending_ops();
-        guard.pending = 0;
-        guard.last_flush = Instant::now();
-    } else {
-        guard.pending = guard.pending.saturating_sub(pending_before);
-    }
-    guard.journal_size_bytes = journal_size_bytes;
-    guard.journal_ops_since_compact = journal_ops_since_compact;
-    guard.journal_file = journal_file;
-    Ok(())
 }
 
 fn list_logical_entries(
@@ -1695,6 +1754,9 @@ fn map_segment_for_create(
     if is_internal_meta(raw) {
         return Err(CoreError::InternalMeta);
     }
+    if is_reserved_prefix(raw) {
+        return Err(CoreError::ReservedPrefix);
+    }
     let kind = classify_segment(raw, max_name_len)?;
     match kind {
         SegmentKind::Short => Ok((BackendName::Short(raw.to_vec()), kind)),
@@ -1809,22 +1871,30 @@ fn refresh_dir_index_from_backend(
     Ok(raw)
 }
 
-fn path_segments(path: &OsStr) -> Vec<Vec<u8>> {
+fn path_segments(path: &OsStr) -> CoreResult<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     let bytes = path.as_bytes();
     let mut start = 0usize;
     for (idx, b) in bytes.iter().enumerate() {
         if *b == b'/' {
             if idx > start {
-                out.push(bytes[start..idx].to_vec());
+                let seg = &bytes[start..idx];
+                if seg == b"." || seg == b".." {
+                    return Err(CoreError::InternalMeta);
+                }
+                out.push(seg.to_vec());
             }
             start = idx + 1;
         }
     }
     if start < bytes.len() {
-        out.push(bytes[start..].to_vec());
+        let seg = &bytes[start..];
+        if seg == b"." || seg == b".." {
+            return Err(CoreError::InternalMeta);
+        }
+        out.push(seg.to_vec());
     }
-    out
+    Ok(out)
 }
 
 fn open_backend_root(config: &Config) -> CoreResult<OwnedFd> {
@@ -1936,25 +2006,21 @@ impl LongNameFsCore {
         backend: &BackendName,
     ) -> CoreResult<Arc<OwnedFd>> {
         let c_name = backend.as_cstring()?;
-        let stat = fstatat(parent_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
-            .map_err(core_errno_from_nix)?;
-        if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
-            return Err(CoreError::NotDir);
-        }
+        let fd = nix::fcntl::openat(
+            parent_fd,
+            c_name.as_c_str(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(core_errno_from_nix)?;
+        let stat = fstat(fd.as_fd()).map_err(core_errno_from_nix)?;
         let key = DirCacheKey {
             dev: stat.st_dev,
             ino: stat.st_ino,
         };
-        if let Some(fd) = self.dir_fd_cache.get(key) {
-            return Ok(fd);
+        if let Some(cached) = self.dir_fd_cache.get(key) {
+            return Ok(cached);
         }
-        let fd = nix::fcntl::openat(
-            parent_fd,
-            c_name.as_c_str(),
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(core_errno_from_nix)?;
         Ok(self.dir_fd_cache.insert(key, fd))
     }
 
@@ -2031,7 +2097,7 @@ impl LongNameFsCore {
             let state = load_dir_state(&self.index_cache, dir_fd.as_fd())?;
             return Ok(ParentCtx { dir_fd, state });
         }
-        let mut segs = path_segments(path);
+        let mut segs = path_segments(path)?;
         if segs.is_empty() {
             return Err(CoreError::NotFound);
         }
@@ -2054,7 +2120,7 @@ impl LongNameFsCore {
             return Err(CoreError::from_errno(libc::EFAULT));
         }
 
-        let segments = path_segments(path);
+        let segments = path_segments(path)?;
         if segments.is_empty() {
             return Err(CoreError::NotFound);
         }
@@ -4758,16 +4824,19 @@ impl FuserFilesystem for LongNameFsV2Fuser {
 
     fn statfs(&mut self, _req: &FuserRequest<'_>, _ino: u64, reply: FuserReplyStatfs) {
         match fstatvfs(self.core.config.backend_fd()) {
-            Ok(stats) => reply.statfs(
-                stats.blocks(),
-                stats.blocks_free(),
-                stats.blocks_available(),
-                stats.files(),
-                stats.files_free(),
-                stats.block_size() as u32,
-                stats.name_max() as u32,
-                stats.fragment_size() as u32,
-            ),
+            Ok(stats) => {
+                let name_max = (self.core.max_name_len.min(u32::MAX as usize)) as u32;
+                reply.statfs(
+                    stats.blocks(),
+                    stats.blocks_free(),
+                    stats.blocks_available(),
+                    stats.files(),
+                    stats.files_free(),
+                    stats.block_size() as u32,
+                    name_max,
+                    stats.fragment_size() as u32,
+                )
+            }
             Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
         }
     }
@@ -4840,6 +4909,7 @@ mod tests {
                 journal_file: None,
                 pending: 0,
                 last_flush: Instant::now(),
+                flushing: false,
                 journal_size_bytes: 0,
                 journal_ops_since_compact: 0,
             })),
