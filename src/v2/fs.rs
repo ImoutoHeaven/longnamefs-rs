@@ -57,7 +57,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const PARALLEL_REBUILD_THRESHOLD: usize = 64;
 const PARALLEL_REBUILD_WORKERS: usize = 4;
-const TMP_INTERNAL_PREFIX: &str = ".__ln2_tmp_";
+const CREATE_TMP_INTERNAL_PREFIX: &str = ".__ln2_ctmp_";
+const RENAME_TMP_INTERNAL_PREFIX: &str = ".__ln2_rtmp_";
 static TMP_INTERNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1266,11 +1267,15 @@ fn openat_nofollow_for_xattr(dir_fd: BorrowedFd<'_>, name: &CStr) -> CoreResult<
     .map_err(core_errno_from_nix)
 }
 
-fn is_tmp_internal_name(name: &[u8]) -> bool {
-    name.starts_with(TMP_INTERNAL_PREFIX.as_bytes())
+fn is_create_tmp_internal_name(name: &[u8]) -> bool {
+    name.starts_with(CREATE_TMP_INTERNAL_PREFIX.as_bytes())
 }
 
-fn best_effort_remove_tmp_entry(dir_fd: BorrowedFd<'_>, name: &[u8]) {
+fn is_rename_tmp_internal_name(name: &[u8]) -> bool {
+    name.starts_with(RENAME_TMP_INTERNAL_PREFIX.as_bytes())
+}
+
+fn best_effort_remove_create_tmp_entry(dir_fd: BorrowedFd<'_>, name: &[u8]) {
     let c_name = match cstring_from_bytes(name) {
         Ok(v) => v,
         Err(_) => return,
@@ -1284,10 +1289,25 @@ fn best_effort_remove_tmp_entry(dir_fd: BorrowedFd<'_>, name: &[u8]) {
     }
 }
 
-fn select_tmp_internal_name(dir_fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
+fn select_create_tmp_internal_name(dir_fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
     for _ in 0..256 {
         let n = TMP_INTERNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = format!("{INTERNAL_PREFIX}tmp_{n:x}");
+        let candidate = format!("{CREATE_TMP_INTERNAL_PREFIX}{n:x}");
+        let bytes = candidate.into_bytes();
+        let c = cstring_from_bytes(&bytes)?;
+        match fstatat(dir_fd, c.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(_) => continue,
+            Err(nix::errno::Errno::ENOENT) => return Ok(bytes),
+            Err(err) => return Err(core_errno_from_nix(err)),
+        }
+    }
+    Err(CoreError::NoSpace)
+}
+
+fn select_rename_tmp_internal_name(dir_fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
+    for _ in 0..256 {
+        let n = TMP_INTERNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("{RENAME_TMP_INTERNAL_PREFIX}{n:x}");
         let bytes = candidate.into_bytes();
         let c = cstring_from_bytes(&bytes)?;
         match fstatat(dir_fd, c.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
@@ -1308,6 +1328,7 @@ fn rename_noreplace_same_dir(
     if core.supports_renameat2 {
         return core.do_backend_rename(dir_fd, src, dir_fd, dst, libc::RENAME_NOREPLACE);
     }
+    let _lock = core.tmp_rename_lock.lock();
     let dst_c = dst.as_cstring()?;
     match fstatat(dir_fd, dst_c.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
         Ok(_) => return Err(CoreError::AlreadyExists),
@@ -1442,9 +1463,27 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
         {
             continue;
         }
-        if is_tmp_internal_name(&name_bytes) {
-            best_effort_remove_tmp_entry(dir_fd, &name_bytes);
-            continue;
+        if is_create_tmp_internal_name(&name_bytes) {
+            let c_name = match cstring_from_bytes(&name_bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let fd = match nix::fcntl::openat(
+                dir_fd,
+                c_name.as_c_str(),
+                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
+                    continue;
+                }
+            };
+            if get_internal_rawname(fd.as_fd()).is_err() {
+                best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
+                continue;
+            }
         }
         if name_bytes.starts_with(INTERNAL_PREFIX.as_bytes()) {
             internal.push(name_bytes);
@@ -1790,9 +1829,27 @@ fn list_logical_entries(
         {
             continue;
         }
-        if is_tmp_internal_name(&name_bytes) {
-            best_effort_remove_tmp_entry(dir_fd, &name_bytes);
-            continue;
+        if is_create_tmp_internal_name(&name_bytes) {
+            let c_name = match cstring_from_bytes(&name_bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let fd = match nix::fcntl::openat(
+                dir_fd,
+                c_name.as_c_str(),
+                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
+                    continue;
+                }
+            };
+            if get_internal_rawname(fd.as_fd()).is_err() {
+                best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
+                continue;
+            }
         }
         let is_internal = name_bytes.starts_with(INTERNAL_PREFIX.as_bytes());
         let kind_hint = map_dirent_type(&entry);
@@ -2249,6 +2306,7 @@ pub struct LongNameFsCore {
     dir_cache: DirCache,
     dir_fd_cache: DirFdCache,
     index_cache: IndexCache,
+    tmp_rename_lock: Mutex<()>,
     max_name_len: usize,
     index_sync: IndexSync,
     supports_renameat2: bool,
@@ -2268,6 +2326,7 @@ impl LongNameFsCore {
             dir_cache: DirCache::new(dir_cache_ttl),
             dir_fd_cache: DirFdCache::new(dir_cache_ttl),
             index_cache: IndexCache::new(),
+            tmp_rename_lock: Mutex::new(()),
             max_name_len,
             index_sync,
             supports_renameat2,
@@ -2698,7 +2757,7 @@ impl LongNameFsCore {
         let old_raw =
             get_internal_rawname(src_fd.as_fd()).unwrap_or_else(|_| src.path.logical_name.clone());
 
-        let tmp_internal = select_tmp_internal_name(dst.ctx.dir_fd.as_fd())?;
+        let tmp_internal = select_rename_tmp_internal_name(dst.ctx.dir_fd.as_fd())?;
         let tmp_backend = BackendName::Internal(tmp_internal.clone());
         let tmp_flags = if self.supports_renameat2 {
             libc::RENAME_NOREPLACE
@@ -3622,7 +3681,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         }
 
-        let tmp_bytes = match select_tmp_internal_name(ctx.dir_fd.as_fd()) {
+        let tmp_bytes = match select_create_tmp_internal_name(ctx.dir_fd.as_fd()) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -3909,7 +3968,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         }
 
-        let tmp_bytes = match select_tmp_internal_name(ctx.dir_fd.as_fd()) {
+        let tmp_bytes = match select_create_tmp_internal_name(ctx.dir_fd.as_fd()) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -4627,7 +4686,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         }
 
-        let tmp_bytes = match select_tmp_internal_name(ctx.dir_fd.as_fd()) {
+        let tmp_bytes = match select_create_tmp_internal_name(ctx.dir_fd.as_fd()) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -4882,7 +4941,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         }
 
-        let tmp_bytes = match select_tmp_internal_name(ctx.dir_fd.as_fd()) {
+        let tmp_bytes = match select_create_tmp_internal_name(ctx.dir_fd.as_fd()) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
