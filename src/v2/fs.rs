@@ -1449,13 +1449,62 @@ fn dup_cloexec(fd: BorrowedFd<'_>) -> CoreResult<OwnedFd> {
 }
 
 fn openat_nofollow_for_xattr(dir_fd: BorrowedFd<'_>, name: &CStr) -> CoreResult<OwnedFd> {
-    nix::fcntl::openat(
+    // Prefer a normal O_RDONLY fd for xattr operations: some kernels return EBADF for
+    // fgetxattr/fsetxattr on O_PATH. Fall back to O_PATH for symlinks (ELOOP) to preserve
+    // "no-follow" semantics.
+    match nix::fcntl::openat(
         dir_fd,
         name,
-        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
-    )
-    .map_err(core_errno_from_nix)
+    ) {
+        Ok(fd) => Ok(fd),
+        Err(nix::errno::Errno::EISDIR) => nix::fcntl::openat(
+            dir_fd,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(core_errno_from_nix),
+        Err(nix::errno::Errno::ELOOP) => nix::fcntl::openat(
+            dir_fd,
+            name,
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(core_errno_from_nix),
+        Err(err) => Err(core_errno_from_nix(err)),
+    }
+}
+
+fn set_internal_rawname_at(dir_fd: BorrowedFd<'_>, name: &CStr, raw: &[u8]) -> CoreResult<()> {
+    let fd = openat_nofollow_for_xattr(dir_fd, name)?;
+    match set_internal_rawname(fd.as_fd(), raw) {
+        Ok(()) => Ok(()),
+        Err(CoreError::Io(ref ioe)) if ioe.raw_os_error() == Some(libc::EBADF) => {
+            // Some kernels reject certain operations on O_PATH fds; reopen with a normal
+            // access mode and retry (similar to v1's O_PATH fsync workaround).
+            let reopened = match nix::fcntl::openat(
+                dir_fd,
+                name,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::ELOOP) => return Err(CoreError::from_errno(libc::EBADF)),
+                Err(nix::errno::Errno::EISDIR) => nix::fcntl::openat(
+                    dir_fd,
+                    name,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(core_errno_from_nix)?,
+                Err(err) => return Err(core_errno_from_nix(err)),
+            };
+            set_internal_rawname(reopened.as_fd(), raw)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn is_create_tmp_internal_name(name: &[u8]) -> bool {
@@ -2974,8 +3023,11 @@ impl LongNameFsCore {
         )?;
 
         let tmp_c = tmp_backend.as_cstring()?;
-        let tmp_fd = openat_nofollow_for_xattr(dst.ctx.dir_fd.as_fd(), tmp_c.as_c_str())?;
-        if let Err(err) = set_internal_rawname(tmp_fd.as_fd(), &dst.path.logical_name) {
+        if let Err(err) = set_internal_rawname_at(
+            dst.ctx.dir_fd.as_fd(),
+            tmp_c.as_c_str(),
+            &dst.path.logical_name,
+        ) {
             if self.supports_renameat2 {
                 let _ = self.do_backend_rename(
                     dst.ctx.dir_fd.as_fd(),
@@ -3015,7 +3067,11 @@ impl LongNameFsCore {
                 Ok(()) => break,
                 Err(err @ CoreError::AlreadyExists) => {
                     if attempt > 0 {
-                        let _ = set_internal_rawname(tmp_fd.as_fd(), &old_raw);
+                        let _ = set_internal_rawname_at(
+                            dst.ctx.dir_fd.as_fd(),
+                            tmp_c.as_c_str(),
+                            &old_raw,
+                        );
                         if self.supports_renameat2 {
                             let _ = self.do_backend_rename(
                                 dst.ctx.dir_fd.as_fd(),
@@ -3053,7 +3109,8 @@ impl LongNameFsCore {
                     attempt += 1;
                 }
                 Err(err) => {
-                    let _ = set_internal_rawname(tmp_fd.as_fd(), &old_raw);
+                    let _ =
+                        set_internal_rawname_at(dst.ctx.dir_fd.as_fd(), tmp_c.as_c_str(), &old_raw);
                     if self.supports_renameat2 {
                         let _ = self.do_backend_rename(
                             dst.ctx.dir_fd.as_fd(),
@@ -3148,7 +3205,7 @@ impl LongNameFsCore {
                     0,
                 );
             }
-            let _ = set_internal_rawname(tmp_fd.as_fd(), &old_raw);
+            let _ = set_internal_rawname_at(dst.ctx.dir_fd.as_fd(), tmp_c.as_c_str(), &old_raw);
             return Err(err);
         }
         if src.path.parent_key != dst.path.parent_key
@@ -3182,7 +3239,7 @@ impl LongNameFsCore {
                     0,
                 );
             }
-            let _ = set_internal_rawname(tmp_fd.as_fd(), &old_raw);
+            let _ = set_internal_rawname_at(dst.ctx.dir_fd.as_fd(), tmp_c.as_c_str(), &old_raw);
             return Err(err);
         }
         let inv = DirInvalidation::for_move(src.path.parent_key, dst.path.parent_key);
@@ -4467,15 +4524,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
         }
 
-        let tmp_fd = match openat_nofollow_for_xattr(ctx.dir_fd.as_fd(), tmp_c.as_c_str()) {
-            Ok(fd) => fd,
-            Err(err) => {
-                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
-                reply.error(core_err_to_errno(&err));
-                return;
-            }
-        };
-        if let Err(err) = set_internal_rawname(tmp_fd.as_fd(), &raw) {
+        if let Err(err) = set_internal_rawname_at(ctx.dir_fd.as_fd(), tmp_c.as_c_str(), &raw) {
             best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
             reply.error(core_err_to_errno(&err));
             return;
@@ -5483,15 +5532,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(core_err_to_errno(&core_errno_from_nix(err)));
             return;
         }
-        let tmp_fd = match openat_nofollow_for_xattr(ctx.dir_fd.as_fd(), tmp_c.as_c_str()) {
-            Ok(fd) => fd,
-            Err(err) => {
-                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
-                reply.error(core_err_to_errno(&err));
-                return;
-            }
-        };
-        if let Err(err) = set_internal_rawname(tmp_fd.as_fd(), &raw) {
+        if let Err(err) = set_internal_rawname_at(ctx.dir_fd.as_fd(), tmp_c.as_c_str(), &raw) {
             best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
             reply.error(core_err_to_errno(&err));
             return;
@@ -5745,15 +5786,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(core_err_to_errno(&core_errno_from_nix(err)));
             return;
         }
-        let tmp_fd = match openat_nofollow_for_xattr(ctx.dir_fd.as_fd(), tmp_c.as_c_str()) {
-            Ok(fd) => fd,
-            Err(err) => {
-                best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
-                reply.error(core_err_to_errno(&err));
-                return;
-            }
-        };
-        if let Err(err) = set_internal_rawname(tmp_fd.as_fd(), &raw) {
+        if let Err(err) = set_internal_rawname_at(ctx.dir_fd.as_fd(), tmp_c.as_c_str(), &raw) {
             best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
             reply.error(core_err_to_errno(&err));
             return;
@@ -6693,7 +6726,7 @@ mod tests {
     use crate::v2::path::MAX_SEGMENT_ON_DISK;
     use parking_lot::RwLock;
     use std::collections::HashMap;
-    use std::ffi::OsStr;
+    use std::ffi::{CString, OsStr};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -6786,6 +6819,42 @@ mod tests {
         let duped = dup_cloexec(fd.as_fd()).unwrap();
         let flags = nix::fcntl::fcntl(duped.as_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn set_internal_rawname_at_sets_xattr_on_regular_file() {
+        let tmp = TempDir::new();
+        let dir_fd = nix::fcntl::open(
+            tmp.path(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let name = CString::new("xattr-probe").unwrap();
+        let _file_fd = nix::fcntl::openat(
+            dir_fd.as_fd(),
+            name.as_c_str(),
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+
+        let raw = b"hello-xattr".to_vec();
+        if let Err(err) = set_internal_rawname_at(dir_fd.as_fd(), name.as_c_str(), &raw) {
+            if let CoreError::Io(ref ioe) = err
+                && matches!(
+                    ioe.raw_os_error(),
+                    Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EPERM)
+                )
+            {
+                return;
+            }
+            panic!("set_internal_rawname_at failed: {err:?}");
+        }
+
+        let fd = openat_nofollow_for_xattr(dir_fd.as_fd(), name.as_c_str()).unwrap();
+        let got = get_internal_rawname(fd.as_fd()).unwrap();
+        assert_eq!(got, raw);
     }
 
     #[test]
