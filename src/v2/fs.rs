@@ -1123,20 +1123,35 @@ impl PassthroughHandleInner {
 #[cfg(feature = "abi-7-40")]
 #[derive(Debug)]
 struct PassthroughHandleTable {
-    handles: RwLock<HashMap<u64, Arc<PassthroughHandleInner>>>,
+    shards: Vec<RwLock<HashMap<u64, Arc<PassthroughHandleInner>>>>,
 }
 
 #[cfg(feature = "abi-7-40")]
 impl Default for PassthroughHandleTable {
     fn default() -> Self {
+        const PASSTHROUGH_SHARD_COUNT: usize = 64;
         Self {
-            handles: RwLock::new(HashMap::new()),
+            shards: (0..PASSTHROUGH_SHARD_COUNT)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
         }
     }
 }
 
 #[cfg(feature = "abi-7-40")]
 impl PassthroughHandleTable {
+    const PASSTHROUGH_SHARD_MASK: usize = 64 - 1;
+
+    #[inline]
+    fn shard_index(fh: u64) -> usize {
+        (fh as usize) & Self::PASSTHROUGH_SHARD_MASK
+    }
+
+    #[inline]
+    fn shard(&self, fh: u64) -> &RwLock<HashMap<u64, Arc<PassthroughHandleInner>>> {
+        &self.shards[Self::shard_index(fh)]
+    }
+
     fn insert(&self, fh: u64, id: BackingId, meta_fd: Option<Arc<OwnedFd>>) -> Arc<BackingId> {
         let backing = Arc::new(id);
         let handle = Arc::new(PassthroughHandleInner {
@@ -1146,20 +1161,20 @@ impl PassthroughHandleTable {
             promotion_inflight: AtomicBool::new(false),
             meta_fd: RwLock::new(meta_fd),
         });
-        self.handles.write().insert(fh, handle);
+        self.shard(fh).write().insert(fh, handle);
         backing
     }
 
     fn contains(&self, fh: u64) -> bool {
-        self.handles.read().contains_key(&fh)
+        self.shard(fh).read().contains_key(&fh)
     }
 
     fn get(&self, fh: u64) -> Option<Arc<PassthroughHandleInner>> {
-        self.handles.read().get(&fh).cloned()
+        self.shard(fh).read().get(&fh).cloned()
     }
 
     fn remove(&self, fh: u64) -> Option<Arc<PassthroughHandleInner>> {
-        self.handles.write().remove(&fh)
+        self.shard(fh).write().remove(&fh)
     }
 }
 
@@ -3341,19 +3356,22 @@ impl LongNameFsV2Fuser {
     }
 
     #[cfg(feature = "abi-7-40")]
-    fn open_passthrough_meta_fd(&self, entry: &InodeEntry) -> CoreResult<OwnedFd> {
+    fn prepare_passthrough_meta_open(&self, entry: &InodeEntry) -> Option<(Arc<OwnedFd>, CString)> {
         if entry.ino == ROOT_INODE || entry.backend_name.is_empty() {
-            return Err(CoreError::NotFound);
+            return None;
         }
-        let parent_entry = self
-            .inode_store
-            .get(entry.parent)
-            .ok_or(CoreError::NotFound)?;
-        let parent_dirfd = self
-            .core
-            .try_dir_fd_by_backend_key(parent_entry.backend)
-            .ok_or(CoreError::NotFound)?;
-        let fname = cstring_from_bytes(&entry.backend_name)?;
+        let parent_entry = self.inode_store.get(entry.parent)?;
+        let parent_dirfd = self.core.try_dir_fd_by_backend_key(parent_entry.backend)?;
+        let fname = cstring_from_bytes(&entry.backend_name).ok()?;
+        Some((parent_dirfd, fname))
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn open_passthrough_meta_fd_prepared(
+        &self,
+        parent_dirfd: &Arc<OwnedFd>,
+        fname: &CString,
+    ) -> CoreResult<OwnedFd> {
         nix::fcntl::openat(
             parent_dirfd.as_fd(),
             fname.as_c_str(),
@@ -3361,6 +3379,14 @@ impl LongNameFsV2Fuser {
             Mode::empty(),
         )
         .map_err(core_errno_from_nix)
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn open_passthrough_meta_fd(&self, entry: &InodeEntry) -> CoreResult<OwnedFd> {
+        let Some((parent_dirfd, fname)) = self.prepare_passthrough_meta_open(entry) else {
+            return Err(CoreError::NotFound);
+        };
+        self.open_passthrough_meta_fd_prepared(&parent_dirfd, &fname)
     }
 
     #[cfg(feature = "abi-7-40")]
@@ -3385,10 +3411,15 @@ impl LongNameFsV2Fuser {
             return;
         }
 
+        let Some((parent_dirfd, fname)) = self.prepare_passthrough_meta_open(entry) else {
+            handle.promotion_inflight.store(false, Ordering::Release);
+            return;
+        };
+
         let mut acquired_slot = false;
         let opened = if self.passthrough_meta_policy.try_acquire_slot() {
             acquired_slot = true;
-            self.open_passthrough_meta_fd(entry)
+            self.open_passthrough_meta_fd_prepared(&parent_dirfd, &fname)
         } else {
             Err(CoreError::NotFound)
         };
@@ -3415,8 +3446,11 @@ impl LongNameFsV2Fuser {
     }
 
     #[cfg(feature = "abi-7-40")]
-    fn passthrough_attr_via_meta_fd(&self, fh: u64, entry: &InodeEntry) -> Option<FuserFileAttr> {
-        let handle = self.get_passthrough_handle(fh)?;
+    fn passthrough_attr_via_meta_fd(
+        &self,
+        handle: &PassthroughHandleInner,
+        entry: &InodeEntry,
+    ) -> Option<FuserFileAttr> {
         let meta_ops = handle
             .meta_ops
             .fetch_add(1, Ordering::Relaxed)
@@ -3426,16 +3460,16 @@ impl LongNameFsV2Fuser {
             if let Ok(stat) = fstat(meta_fd.as_fd()) {
                 return Some(fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino));
             }
-            self.clear_passthrough_meta_fd(handle.as_ref());
+            self.clear_passthrough_meta_fd(handle);
         }
 
-        self.maybe_promote_passthrough_meta_fd(entry, handle.as_ref(), meta_ops);
+        self.maybe_promote_passthrough_meta_fd(entry, handle, meta_ops);
 
         if let Some(meta_fd) = handle.meta_fd() {
             if let Ok(stat) = fstat(meta_fd.as_fd()) {
                 return Some(fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino));
             }
-            self.clear_passthrough_meta_fd(handle.as_ref());
+            self.clear_passthrough_meta_fd(handle);
         }
         None
     }
@@ -3814,21 +3848,27 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             return;
         };
         let result = if let Some(fh) = fh {
-            if self.passthrough_active() && self.is_passthrough_fh(fh) {
-                #[cfg(feature = "abi-7-40")]
-                if let Some(attr) = self.passthrough_attr_via_meta_fd(fh, &entry) {
+            #[cfg(feature = "abi-7-40")]
+            if self.passthrough_active()
+                && let Some(handle) = self.get_passthrough_handle(fh)
+            {
+                if let Some(attr) = self.passthrough_attr_via_meta_fd(handle.as_ref(), &entry) {
                     Ok(attr)
                 } else {
                     self.getattr_via_parent_dirfd(&entry)
                         .ok_or(CoreError::NotFound)
                         .or_else(|_| self.attr_for_entry(&entry))
                 }
-
-                #[cfg(not(feature = "abi-7-40"))]
-                self.getattr_via_parent_dirfd(&entry)
-                    .ok_or(CoreError::NotFound)
-                    .or_else(|_| self.attr_for_entry(&entry))
             } else {
+                self.handles
+                    .get_file(fh)
+                    .and_then(|fd| fstat(fd.as_fd()).ok())
+                    .map(|stat| fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino))
+                    .ok_or(CoreError::NotFound)
+            }
+
+            #[cfg(not(feature = "abi-7-40"))]
+            {
                 self.handles
                     .get_file(fh)
                     .and_then(|fd| fstat(fd.as_fd()).ok())
@@ -3923,7 +3963,6 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         }
 
         if let Some(fh) = fh
-            && !(self.passthrough_active() && self.is_passthrough_fh(fh))
             && let Some(fd) = self.handles.get_file(fh)
         {
             if let Some(mode) = mode
@@ -3978,7 +4017,6 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         #[cfg(feature = "abi-7-40")]
         if let Some(fh) = fh
             && self.passthrough_active()
-            && self.is_passthrough_fh(fh)
             && size.is_none()
             && (mode.is_some()
                 || uid.is_some()
@@ -6548,7 +6586,6 @@ impl FuserFilesystem for LongNameFsV2Fuser {
     ) {
         #[cfg(feature = "abi-7-40")]
         if self.passthrough_active()
-            && self.is_passthrough_fh(fh)
             && let Some(handle) = self.remove_passthrough_handle(fh)
         {
             self.clear_passthrough_meta_fd(handle.as_ref());
