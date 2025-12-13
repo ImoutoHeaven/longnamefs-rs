@@ -57,6 +57,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const PARALLEL_REBUILD_THRESHOLD: usize = 64;
 const PARALLEL_REBUILD_WORKERS: usize = 4;
+const TMP_INTERNAL_PREFIX: &str = ".__ln2_tmp_";
 static TMP_INTERNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1265,6 +1266,24 @@ fn openat_nofollow_for_xattr(dir_fd: BorrowedFd<'_>, name: &CStr) -> CoreResult<
     .map_err(core_errno_from_nix)
 }
 
+fn is_tmp_internal_name(name: &[u8]) -> bool {
+    name.starts_with(TMP_INTERNAL_PREFIX.as_bytes())
+}
+
+fn best_effort_remove_tmp_entry(dir_fd: BorrowedFd<'_>, name: &[u8]) {
+    let c_name = match cstring_from_bytes(name) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    match unlinkat(dir_fd, c_name.as_c_str(), UnlinkatFlags::NoRemoveDir) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EISDIR) => {
+            let _ = unlinkat(dir_fd, c_name.as_c_str(), UnlinkatFlags::RemoveDir);
+        }
+        Err(_) => {}
+    }
+}
+
 fn select_tmp_internal_name(dir_fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
     for _ in 0..256 {
         let n = TMP_INTERNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1278,6 +1297,24 @@ fn select_tmp_internal_name(dir_fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
         }
     }
     Err(CoreError::NoSpace)
+}
+
+fn rename_noreplace_same_dir(
+    core: &LongNameFsCore,
+    dir_fd: BorrowedFd<'_>,
+    src: &BackendName,
+    dst: &BackendName,
+) -> CoreResult<()> {
+    if core.supports_renameat2 {
+        return core.do_backend_rename(dir_fd, src, dir_fd, dst, libc::RENAME_NOREPLACE);
+    }
+    let dst_c = dst.as_cstring()?;
+    match fstatat(dir_fd, dst_c.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(_) => return Err(CoreError::AlreadyExists),
+        Err(nix::errno::Errno::ENOENT) => {}
+        Err(err) => return Err(core_errno_from_nix(err)),
+    }
+    core.do_backend_rename(dir_fd, src, dir_fd, dst, 0)
 }
 
 fn set_internal_rawname(fd: BorrowedFd<'_>, raw: &[u8]) -> CoreResult<()> {
@@ -1403,6 +1440,10 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
         if name_bytes.starts_with(INDEX_NAME.as_bytes())
             || name_bytes.starts_with(JOURNAL_NAME.as_bytes())
         {
+            continue;
+        }
+        if is_tmp_internal_name(&name_bytes) {
+            best_effort_remove_tmp_entry(dir_fd, &name_bytes);
             continue;
         }
         if name_bytes.starts_with(INTERNAL_PREFIX.as_bytes()) {
@@ -1747,6 +1788,10 @@ fn list_logical_entries(
         if name_bytes.starts_with(INDEX_NAME.as_bytes())
             || name_bytes.starts_with(JOURNAL_NAME.as_bytes())
         {
+            continue;
+        }
+        if is_tmp_internal_name(&name_bytes) {
+            best_effort_remove_tmp_entry(dir_fd, &name_bytes);
             continue;
         }
         let is_internal = name_bytes.starts_with(INTERNAL_PREFIX.as_bytes());
@@ -2711,6 +2756,29 @@ impl LongNameFsCore {
                 Err(err @ CoreError::AlreadyExists) => {
                     if attempt > 0 {
                         let _ = set_internal_rawname(tmp_fd.as_fd(), &old_raw);
+                        if self.supports_renameat2 {
+                            let _ = self.do_backend_rename(
+                                dst.ctx.dir_fd.as_fd(),
+                                &tmp_backend,
+                                src.ctx.dir_fd.as_fd(),
+                                src_backend,
+                                libc::RENAME_NOREPLACE,
+                            );
+                        } else if fstatat(
+                            src.ctx.dir_fd.as_fd(),
+                            src_c.as_c_str(),
+                            AtFlags::AT_SYMLINK_NOFOLLOW,
+                        )
+                        .is_err()
+                        {
+                            let _ = self.do_backend_rename(
+                                dst.ctx.dir_fd.as_fd(),
+                                &tmp_backend,
+                                src.ctx.dir_fd.as_fd(),
+                                src_backend,
+                                0,
+                            );
+                        }
                         return Err(err);
                     }
                     let raw =
@@ -3485,8 +3553,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
         };
 
-        let mut attempt = 0;
-        loop {
+        let sflag = nix::sys::stat::SFlag::from_bits_truncate(mode);
+        let perm = Mode::from_bits_truncate(mode);
+
+        if matches!(backend.1, SegmentKind::Short) {
             let fname = match backend.0.as_cstring() {
                 Ok(v) => v,
                 Err(err) => {
@@ -3495,8 +3565,6 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 }
             };
             let backend_bytes = backend.0.display_bytes();
-            let sflag = nix::sys::stat::SFlag::from_bits_truncate(mode);
-            let perm = Mode::from_bits_truncate(mode);
             match mknodat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
@@ -3504,39 +3572,133 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 perm,
                 rdev as u64,
             ) {
+                Ok(()) => {}
+                Err(nix::errno::Errno::EEXIST) => {
+                    reply.error(libc::EEXIST);
+                    return;
+                }
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+
+            let stat = match fstatat(
+                ctx.dir_fd.as_fd(),
+                fname.as_c_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(st) => st,
+                Err(err) => {
+                    best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            };
+            let core_attr = core_attr_from_stat(&stat);
+            let backend_key = backend_key_from_stat(&stat);
+            ctx.state.attr_cache.insert(
+                backend_bytes.clone(),
+                CachedAttr {
+                    attr: core_attr_from_stat(&stat),
+                    backend: backend_key,
+                },
+            );
+            self.patch_dir_cache(
+                ctx.dir_fd.as_fd(),
+                CacheOp::Add(DirEntryInfo {
+                    name: name.to_os_string(),
+                    kind: core_attr.kind,
+                    attr: Some(core_attr),
+                    backend_name: backend_bytes.clone(),
+                    backend_key: Some(backend_key),
+                }),
+            );
+            let child = self.ensure_child_entry(parent, name, stat, 1);
+            let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+            self.notify_entry_change(parent, name);
+            self.notify_inode(child.ino);
+            reply.entry(&self.entry_ttl, &attr, 0);
+            return;
+        }
+
+        let tmp_bytes = match select_tmp_internal_name(ctx.dir_fd.as_fd()) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let tmp_backend = BackendName::Internal(tmp_bytes);
+        let tmp_c = match tmp_backend.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        match mknodat(
+            ctx.dir_fd.as_fd(),
+            tmp_c.as_c_str(),
+            sflag,
+            perm,
+            rdev as u64,
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::EEXIST) => {
+                reply.error(libc::EEXIST);
+                return;
+            }
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        }
+
+        let tmp_fd = match openat_nofollow_for_xattr(ctx.dir_fd.as_fd(), tmp_c.as_c_str()) {
+            Ok(fd) => fd,
+            Err(err) => {
+                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        if let Err(err) = set_internal_rawname(tmp_fd.as_fd(), &raw) {
+            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+            reply.error(core_err_to_errno(&err));
+            return;
+        }
+
+        let mut attempt = 0;
+        loop {
+            let backend_bytes = backend.0.display_bytes();
+            let rename_res = rename_noreplace_same_dir(
+                self.core.as_ref(),
+                ctx.dir_fd.as_fd(),
+                &tmp_backend,
+                &backend.0,
+            );
+            match rename_res {
                 Ok(()) => {
-                    if matches!(backend.1, SegmentKind::Long) {
-                        let fd = match nix::fcntl::openat(
-                            ctx.dir_fd.as_fd(),
-                            fname.as_c_str(),
-                            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                            Mode::empty(),
-                        ) {
-                            Ok(fd) => fd,
-                            Err(err) => {
-                                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
-                                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                                return;
-                            }
-                        };
-                        if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
-                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
+                    {
+                        let mut guard = ctx.state.index.write();
+                        guard.index.upsert(backend_bytes.clone(), raw.clone());
+                        guard.pending = guard.pending.saturating_add(1);
+                    }
+                    ctx.state.attr_cache.clear();
+                    let _ = maybe_flush_index(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        self.core.index_sync,
+                        false,
+                    );
+                    let fname = match backend.0.as_cstring() {
+                        Ok(v) => v,
+                        Err(err) => {
                             reply.error(core_err_to_errno(&err));
                             return;
                         }
-                        {
-                            let mut guard = ctx.state.index.write();
-                            guard.index.upsert(backend_bytes.clone(), raw.clone());
-                            guard.pending = guard.pending.saturating_add(1);
-                        }
-                        ctx.state.attr_cache.clear();
-                        let _ = maybe_flush_index(
-                            ctx.dir_fd.as_fd(),
-                            &mut ctx.state,
-                            self.core.index_sync,
-                            false,
-                        );
-                    }
+                    };
                     let stat = match fstatat(
                         ctx.dir_fd.as_fd(),
                         fname.as_c_str(),
@@ -3544,15 +3706,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     ) {
                         Ok(st) => st,
                         Err(err) => {
-                            if matches!(backend.1, SegmentKind::Long) {
-                                rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
-                                let _ = maybe_flush_index(
-                                    ctx.dir_fd.as_fd(),
-                                    &mut ctx.state,
-                                    IndexSync::Always,
-                                    false,
-                                );
-                            }
+                            rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
+                            let _ = maybe_flush_index(
+                                ctx.dir_fd.as_fd(),
+                                &mut ctx.state,
+                                IndexSync::Always,
+                                false,
+                            );
                             best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                             reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                             return;
@@ -3584,9 +3744,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     reply.entry(&self.entry_ttl, &attr, 0);
                     return;
                 }
-                Err(nix::errno::Errno::EEXIST) => {
-                    if matches!(backend.1, SegmentKind::Short) || attempt > MAX_COLLISION_SUFFIX {
-                        reply.error(libc::EEXIST);
+                Err(err @ CoreError::AlreadyExists) => {
+                    if attempt > MAX_COLLISION_SUFFIX {
+                        best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                        reply.error(core_err_to_errno(&err));
                         return;
                     }
                     let decision = match handle_backend_eexist_index_missing(
@@ -3597,6 +3758,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     ) {
                         Ok(v) => v,
                         Err(err) => {
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
                             reply.error(core_err_to_errno(&err));
                             return;
                         }
@@ -3609,6 +3771,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     );
                     match decision {
                         CreateDecision::AlreadyExistsSameName => {
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
                             reply.error(libc::EEXIST);
                             return;
                         }
@@ -3620,6 +3783,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                             ) {
                                 Ok(v) => v,
                                 Err(err) => {
+                                    best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
                                     reply.error(core_err_to_errno(&err));
                                     return;
                                 }
@@ -3630,7 +3794,8 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     }
                 }
                 Err(err) => {
-                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                    reply.error(core_err_to_errno(&err));
                     return;
                 }
             }
@@ -3681,8 +3846,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
         };
 
-        let mut attempt = 0;
-        loop {
+        if matches!(backend.1, SegmentKind::Short) {
             let fname = match backend.0.as_cstring() {
                 Ok(v) => v,
                 Err(err) => {
@@ -3691,45 +3855,135 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 }
             };
             let backend_bytes = backend.0.display_bytes();
-            match nix::fcntl::openat(
+            let fd = match nix::fcntl::openat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
                 oflag_from_bits(flags as u32) | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_EXCL,
                 Mode::from_bits_truncate(mode & 0o777),
             ) {
-                Ok(fd) => {
-                    if matches!(backend.1, SegmentKind::Long) {
-                        if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
-                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
-                            reply.error(core_err_to_errno(&err));
-                            return;
-                        }
-                        {
-                            let mut guard = ctx.state.index.write();
-                            guard.index.upsert(backend_bytes.clone(), raw.clone());
-                            guard.pending = guard.pending.saturating_add(1);
-                        }
-                        ctx.state.attr_cache.clear();
-                        let _ = maybe_flush_index(
-                            ctx.dir_fd.as_fd(),
-                            &mut ctx.state,
-                            self.core.index_sync,
-                            false,
-                        );
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::EEXIST) => {
+                    reply.error(libc::EEXIST);
+                    return;
+                }
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            };
+
+            let stat = match fstat(fd.as_fd()) {
+                Ok(st) => st,
+                Err(err) => {
+                    best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            };
+            let core_attr = core_attr_from_stat(&stat);
+            let backend_key = backend_key_from_stat(&stat);
+            ctx.state.attr_cache.insert(
+                backend_bytes.clone(),
+                CachedAttr {
+                    attr: core_attr_from_stat(&stat),
+                    backend: backend_key,
+                },
+            );
+            self.patch_dir_cache(
+                ctx.dir_fd.as_fd(),
+                CacheOp::Add(DirEntryInfo {
+                    name: name.to_os_string(),
+                    kind: core_attr.kind,
+                    attr: Some(core_attr),
+                    backend_name: backend_bytes.clone(),
+                    backend_key: Some(backend_key),
+                }),
+            );
+            let child = self.ensure_child_entry(parent, name, stat, 1);
+            let fh = self.handles.insert_file(fd);
+            let _ = self.inode_store.inc_open(child.ino);
+            let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+            self.notify_entry_change(parent, name);
+            self.notify_inode(child.ino);
+            reply.created(&self.entry_ttl, &attr, 0, fh, 0);
+            return;
+        }
+
+        let tmp_bytes = match select_tmp_internal_name(ctx.dir_fd.as_fd()) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let tmp_backend = BackendName::Internal(tmp_bytes);
+        let tmp_c = match tmp_backend.as_cstring() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let fd = match nix::fcntl::openat(
+            ctx.dir_fd.as_fd(),
+            tmp_c.as_c_str(),
+            oflag_from_bits(flags as u32) | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_EXCL,
+            Mode::from_bits_truncate(mode & 0o777),
+        ) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::EEXIST) => {
+                reply.error(libc::EEXIST);
+                return;
+            }
+            Err(err) => {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+        };
+
+        if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+            reply.error(core_err_to_errno(&err));
+            return;
+        }
+
+        let mut attempt = 0;
+        loop {
+            let backend_bytes = backend.0.display_bytes();
+            let rename_res = rename_noreplace_same_dir(
+                self.core.as_ref(),
+                ctx.dir_fd.as_fd(),
+                &tmp_backend,
+                &backend.0,
+            );
+            match rename_res {
+                Ok(()) => {
+                    {
+                        let mut guard = ctx.state.index.write();
+                        guard.index.upsert(backend_bytes.clone(), raw.clone());
+                        guard.pending = guard.pending.saturating_add(1);
                     }
+                    ctx.state.attr_cache.clear();
+                    let _ = maybe_flush_index(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        self.core.index_sync,
+                        false,
+                    );
+
                     let stat = match fstat(fd.as_fd()) {
                         Ok(st) => st,
                         Err(err) => {
-                            if matches!(backend.1, SegmentKind::Long) {
-                                rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
-                                let _ = maybe_flush_index(
-                                    ctx.dir_fd.as_fd(),
-                                    &mut ctx.state,
-                                    IndexSync::Always,
-                                    false,
-                                );
+                            rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
+                            let _ = maybe_flush_index(
+                                ctx.dir_fd.as_fd(),
+                                &mut ctx.state,
+                                IndexSync::Always,
+                                false,
+                            );
+                            if let Ok(fname) = backend.0.as_cstring() {
+                                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                             }
-                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                             reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                             return;
                         }
@@ -3762,9 +4016,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     reply.created(&self.entry_ttl, &attr, 0, fh, 0);
                     return;
                 }
-                Err(nix::errno::Errno::EEXIST) => {
-                    if matches!(backend.1, SegmentKind::Short) || attempt > MAX_COLLISION_SUFFIX {
-                        reply.error(libc::EEXIST);
+                Err(err @ CoreError::AlreadyExists) => {
+                    if attempt > MAX_COLLISION_SUFFIX {
+                        best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                        reply.error(core_err_to_errno(&err));
                         return;
                     }
                     let decision = match handle_backend_eexist_index_missing(
@@ -3775,6 +4030,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     ) {
                         Ok(v) => v,
                         Err(err) => {
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
                             reply.error(core_err_to_errno(&err));
                             return;
                         }
@@ -3787,6 +4043,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     );
                     match decision {
                         CreateDecision::AlreadyExistsSameName => {
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
                             reply.error(libc::EEXIST);
                             return;
                         }
@@ -3798,6 +4055,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                             ) {
                                 Ok(v) => v,
                                 Err(err) => {
+                                    best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
                                     reply.error(core_err_to_errno(&err));
                                     return;
                                 }
@@ -3808,7 +4066,8 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     }
                 }
                 Err(err) => {
-                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                    reply.error(core_err_to_errno(&err));
                     return;
                 }
             }
@@ -4309,103 +4568,229 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
         };
         let raw = normalize_osstr(link_name);
-        let (backend, kind) = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len)
-        {
+        let mut backend = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
                 return;
             }
         };
-        let backend_bytes = backend.display_bytes();
-        let fname = match backend.as_cstring() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(core_err_to_errno(&err));
+        if matches!(backend.1, SegmentKind::Short) {
+            let backend_bytes = backend.0.display_bytes();
+            let fname = match backend.0.as_cstring() {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            if let Err(err) = symlinkat(target.as_os_str(), ctx.dir_fd.as_fd(), fname.as_c_str()) {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                 return;
             }
-        };
-        if let Err(err) = symlinkat(target.as_os_str(), ctx.dir_fd.as_fd(), fname.as_c_str()) {
-            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-            return;
-        }
-        if matches!(kind, SegmentKind::Long) {
-            let fd = match nix::fcntl::openat(
+            let stat = match fstatat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
             ) {
-                Ok(fd) => fd,
+                Ok(st) => st,
                 Err(err) => {
                     best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                     reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                     return;
                 }
             };
-            if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
-                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
+            let core_attr = core_attr_from_stat(&stat);
+            let backend_key = backend_key_from_stat(&stat);
+            ctx.state.attr_cache.insert(
+                backend_bytes.clone(),
+                CachedAttr {
+                    attr: core_attr_from_stat(&stat),
+                    backend: backend_key,
+                },
+            );
+            self.patch_dir_cache(
+                ctx.dir_fd.as_fd(),
+                CacheOp::Add(DirEntryInfo {
+                    name: link_name.to_os_string(),
+                    kind: core_attr.kind,
+                    attr: Some(core_attr),
+                    backend_name: backend_bytes.clone(),
+                    backend_key: Some(backend_key),
+                }),
+            );
+            let child = self.ensure_child_entry(parent, link_name, stat, 1);
+            let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+            self.notify_entry_change(parent, link_name);
+            self.notify_inode(child.ino);
+            reply.entry(&self.entry_ttl, &attr, 0);
+            return;
+        }
+
+        let tmp_bytes = match select_tmp_internal_name(ctx.dir_fd.as_fd()) {
+            Ok(v) => v,
+            Err(err) => {
                 reply.error(core_err_to_errno(&err));
                 return;
             }
-            {
-                let mut guard = ctx.state.index.write();
-                guard.index.upsert(backend.display_bytes(), raw.clone());
-                guard.pending = guard.pending.saturating_add(1);
-            }
-            ctx.state.attr_cache.clear();
-            let _ = maybe_flush_index(
-                ctx.dir_fd.as_fd(),
-                &mut ctx.state,
-                self.core.index_sync,
-                false,
-            );
-        }
-        let stat = match fstatat(
-            ctx.dir_fd.as_fd(),
-            fname.as_c_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        ) {
-            Ok(st) => st,
+        };
+        let tmp_backend = BackendName::Internal(tmp_bytes);
+        let tmp_c = match tmp_backend.as_cstring() {
+            Ok(v) => v,
             Err(err) => {
-                if matches!(kind, SegmentKind::Long) {
-                    rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
-                    let _ = maybe_flush_index(
-                        ctx.dir_fd.as_fd(),
-                        &mut ctx.state,
-                        IndexSync::Always,
-                        false,
-                    );
-                }
-                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
-                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                reply.error(core_err_to_errno(&err));
                 return;
             }
         };
-        let core_attr = core_attr_from_stat(&stat);
-        let backend_key = backend_key_from_stat(&stat);
-        ctx.state.attr_cache.insert(
-            backend_bytes.clone(),
-            CachedAttr {
-                attr: core_attr_from_stat(&stat),
-                backend: backend_key,
-            },
-        );
-        self.patch_dir_cache(
-            ctx.dir_fd.as_fd(),
-            CacheOp::Add(DirEntryInfo {
-                name: link_name.to_os_string(),
-                kind: core_attr.kind,
-                attr: Some(core_attr),
-                backend_name: backend_bytes.clone(),
-                backend_key: Some(backend_key),
-            }),
-        );
-        let child = self.ensure_child_entry(parent, link_name, stat, 1);
-        let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
-        self.notify_entry_change(parent, link_name);
-        self.notify_inode(child.ino);
-        reply.entry(&self.entry_ttl, &attr, 0);
+        if let Err(err) = symlinkat(target.as_os_str(), ctx.dir_fd.as_fd(), tmp_c.as_c_str()) {
+            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+            return;
+        }
+        let tmp_fd = match openat_nofollow_for_xattr(ctx.dir_fd.as_fd(), tmp_c.as_c_str()) {
+            Ok(fd) => fd,
+            Err(err) => {
+                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        if let Err(err) = set_internal_rawname(tmp_fd.as_fd(), &raw) {
+            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+            reply.error(core_err_to_errno(&err));
+            return;
+        }
+
+        let mut attempt = 0;
+        loop {
+            let backend_bytes = backend.0.display_bytes();
+            let rename_res = rename_noreplace_same_dir(
+                self.core.as_ref(),
+                ctx.dir_fd.as_fd(),
+                &tmp_backend,
+                &backend.0,
+            );
+            match rename_res {
+                Ok(()) => {
+                    {
+                        let mut guard = ctx.state.index.write();
+                        guard.index.upsert(backend_bytes.clone(), raw.clone());
+                        guard.pending = guard.pending.saturating_add(1);
+                    }
+                    ctx.state.attr_cache.clear();
+                    let _ = maybe_flush_index(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        self.core.index_sync,
+                        false,
+                    );
+                    let fname = match backend.0.as_cstring() {
+                        Ok(v) => v,
+                        Err(err) => {
+                            reply.error(core_err_to_errno(&err));
+                            return;
+                        }
+                    };
+                    let stat = match fstatat(
+                        ctx.dir_fd.as_fd(),
+                        fname.as_c_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(st) => st,
+                        Err(err) => {
+                            rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
+                            let _ = maybe_flush_index(
+                                ctx.dir_fd.as_fd(),
+                                &mut ctx.state,
+                                IndexSync::Always,
+                                false,
+                            );
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
+                            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                            return;
+                        }
+                    };
+                    let core_attr = core_attr_from_stat(&stat);
+                    let backend_key = backend_key_from_stat(&stat);
+                    ctx.state.attr_cache.insert(
+                        backend_bytes.clone(),
+                        CachedAttr {
+                            attr: core_attr_from_stat(&stat),
+                            backend: backend_key,
+                        },
+                    );
+                    self.patch_dir_cache(
+                        ctx.dir_fd.as_fd(),
+                        CacheOp::Add(DirEntryInfo {
+                            name: link_name.to_os_string(),
+                            kind: core_attr.kind,
+                            attr: Some(core_attr),
+                            backend_name: backend_bytes.clone(),
+                            backend_key: Some(backend_key),
+                        }),
+                    );
+                    let child = self.ensure_child_entry(parent, link_name, stat, 1);
+                    let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+                    self.notify_entry_change(parent, link_name);
+                    self.notify_inode(child.ino);
+                    reply.entry(&self.entry_ttl, &attr, 0);
+                    return;
+                }
+                Err(err @ CoreError::AlreadyExists) => {
+                    if attempt > MAX_COLLISION_SUFFIX {
+                        best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                        reply.error(core_err_to_errno(&err));
+                        return;
+                    }
+                    let decision = match handle_backend_eexist_index_missing(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        &backend_bytes,
+                        &raw,
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                            reply.error(core_err_to_errno(&err));
+                            return;
+                        }
+                    };
+                    let _ = maybe_flush_index(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        self.core.index_sync,
+                        false,
+                    );
+                    match decision {
+                        CreateDecision::AlreadyExistsSameName => {
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                            reply.error(libc::EEXIST);
+                            return;
+                        }
+                        CreateDecision::NeedNewSuffix => {
+                            backend = match map_segment_for_create(
+                                &ctx.state,
+                                &raw,
+                                self.core.max_name_len,
+                            ) {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                                    reply.error(core_err_to_errno(&err));
+                                    return;
+                                }
+                            };
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+                }
+                Err(err) => {
+                    best_effort_unlinkat_file(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            }
+        }
     }
 
     fn mkdir(
@@ -4436,16 +4821,76 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
         };
         let raw = normalize_osstr(name);
-        let (backend, kind) = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len)
-        {
+        let mut backend = match map_segment_for_create(&ctx.state, &raw, self.core.max_name_len) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
                 return;
             }
         };
-        let backend_bytes = backend.display_bytes();
-        let fname = match backend.as_cstring() {
+        if matches!(backend.1, SegmentKind::Short) {
+            let backend_bytes = backend.0.display_bytes();
+            let fname = match backend.0.as_cstring() {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            if let Err(err) = mkdirat(
+                ctx.dir_fd.as_fd(),
+                fname.as_c_str(),
+                Mode::from_bits_truncate(mode),
+            ) {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+            let stat = match fstatat(
+                ctx.dir_fd.as_fd(),
+                fname.as_c_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(st) => st,
+                Err(err) => {
+                    best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), fname.as_c_str());
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            };
+            let core_attr = core_attr_from_stat(&stat);
+            let backend_key = backend_key_from_stat(&stat);
+            ctx.state.attr_cache.insert(
+                backend_bytes.clone(),
+                CachedAttr {
+                    attr: core_attr_from_stat(&stat),
+                    backend: backend_key,
+                },
+            );
+            self.patch_dir_cache(
+                ctx.dir_fd.as_fd(),
+                CacheOp::Add(DirEntryInfo {
+                    name: name.to_os_string(),
+                    kind: core_attr.kind,
+                    attr: Some(core_attr),
+                    backend_name: backend_bytes.clone(),
+                    backend_key: Some(backend_key),
+                }),
+            );
+            let child = self.ensure_child_entry(parent, name, stat, 1);
+            let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+            reply.entry(&self.entry_ttl, &attr, 0);
+            return;
+        }
+
+        let tmp_bytes = match select_tmp_internal_name(ctx.dir_fd.as_fd()) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
+        let tmp_backend = BackendName::Internal(tmp_bytes);
+        let tmp_c = match tmp_backend.as_cstring() {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
@@ -4454,87 +4899,155 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         };
         if let Err(err) = mkdirat(
             ctx.dir_fd.as_fd(),
-            fname.as_c_str(),
+            tmp_c.as_c_str(),
             Mode::from_bits_truncate(mode),
         ) {
             reply.error(core_err_to_errno(&core_errno_from_nix(err)));
             return;
         }
-        if matches!(kind, SegmentKind::Long) {
-            let fd = match nix::fcntl::openat(
-                ctx.dir_fd.as_fd(),
-                fname.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(err) => {
-                    best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), fname.as_c_str());
-                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                    return;
-                }
-            };
-            if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
-                best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), fname.as_c_str());
+        let tmp_fd = match openat_nofollow_for_xattr(ctx.dir_fd.as_fd(), tmp_c.as_c_str()) {
+            Ok(fd) => fd,
+            Err(err) => {
+                best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
                 reply.error(core_err_to_errno(&err));
                 return;
             }
-            {
-                let mut guard = ctx.state.index.write();
-                guard.index.upsert(backend_bytes.clone(), raw.clone());
-                guard.pending = guard.pending.saturating_add(1);
-            }
-            ctx.state.attr_cache.clear();
-            let _ = maybe_flush_index(
-                ctx.dir_fd.as_fd(),
-                &mut ctx.state,
-                self.core.index_sync,
-                false,
-            );
+        };
+        if let Err(err) = set_internal_rawname(tmp_fd.as_fd(), &raw) {
+            best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+            reply.error(core_err_to_errno(&err));
+            return;
         }
-        let stat = match fstatat(
-            ctx.dir_fd.as_fd(),
-            fname.as_c_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        ) {
-            Ok(st) => st,
-            Err(err) => {
-                if matches!(kind, SegmentKind::Long) {
-                    rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
+
+        let mut attempt = 0;
+        loop {
+            let backend_bytes = backend.0.display_bytes();
+            let rename_res = rename_noreplace_same_dir(
+                self.core.as_ref(),
+                ctx.dir_fd.as_fd(),
+                &tmp_backend,
+                &backend.0,
+            );
+            match rename_res {
+                Ok(()) => {
+                    {
+                        let mut guard = ctx.state.index.write();
+                        guard.index.upsert(backend_bytes.clone(), raw.clone());
+                        guard.pending = guard.pending.saturating_add(1);
+                    }
+                    ctx.state.attr_cache.clear();
                     let _ = maybe_flush_index(
                         ctx.dir_fd.as_fd(),
                         &mut ctx.state,
-                        IndexSync::Always,
+                        self.core.index_sync,
                         false,
                     );
+                    let fname = match backend.0.as_cstring() {
+                        Ok(v) => v,
+                        Err(err) => {
+                            reply.error(core_err_to_errno(&err));
+                            return;
+                        }
+                    };
+                    let stat = match fstatat(
+                        ctx.dir_fd.as_fd(),
+                        fname.as_c_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(st) => st,
+                        Err(err) => {
+                            rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
+                            let _ = maybe_flush_index(
+                                ctx.dir_fd.as_fd(),
+                                &mut ctx.state,
+                                IndexSync::Always,
+                                false,
+                            );
+                            best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), fname.as_c_str());
+                            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                            return;
+                        }
+                    };
+                    let core_attr = core_attr_from_stat(&stat);
+                    let backend_key = backend_key_from_stat(&stat);
+                    ctx.state.attr_cache.insert(
+                        backend_bytes.clone(),
+                        CachedAttr {
+                            attr: core_attr_from_stat(&stat),
+                            backend: backend_key,
+                        },
+                    );
+                    self.patch_dir_cache(
+                        ctx.dir_fd.as_fd(),
+                        CacheOp::Add(DirEntryInfo {
+                            name: name.to_os_string(),
+                            kind: core_attr.kind,
+                            attr: Some(core_attr),
+                            backend_name: backend_bytes.clone(),
+                            backend_key: Some(backend_key),
+                        }),
+                    );
+                    let child = self.ensure_child_entry(parent, name, stat, 1);
+                    let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
+                    reply.entry(&self.entry_ttl, &attr, 0);
+                    return;
                 }
-                best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), fname.as_c_str());
-                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
-                return;
+                Err(err @ CoreError::AlreadyExists) => {
+                    if attempt > MAX_COLLISION_SUFFIX {
+                        best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                        reply.error(core_err_to_errno(&err));
+                        return;
+                    }
+                    let decision = match handle_backend_eexist_index_missing(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        &backend_bytes,
+                        &raw,
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                            reply.error(core_err_to_errno(&err));
+                            return;
+                        }
+                    };
+                    let _ = maybe_flush_index(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        self.core.index_sync,
+                        false,
+                    );
+                    match decision {
+                        CreateDecision::AlreadyExistsSameName => {
+                            best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                            reply.error(libc::EEXIST);
+                            return;
+                        }
+                        CreateDecision::NeedNewSuffix => {
+                            backend = match map_segment_for_create(
+                                &ctx.state,
+                                &raw,
+                                self.core.max_name_len,
+                            ) {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                                    reply.error(core_err_to_errno(&err));
+                                    return;
+                                }
+                            };
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+                }
+                Err(err) => {
+                    best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), tmp_c.as_c_str());
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
             }
-        };
-        let core_attr = core_attr_from_stat(&stat);
-        let backend_key = backend_key_from_stat(&stat);
-        ctx.state.attr_cache.insert(
-            backend_bytes.clone(),
-            CachedAttr {
-                attr: core_attr_from_stat(&stat),
-                backend: backend_key,
-            },
-        );
-        self.patch_dir_cache(
-            ctx.dir_fd.as_fd(),
-            CacheOp::Add(DirEntryInfo {
-                name: name.to_os_string(),
-                kind: core_attr.kind,
-                attr: Some(core_attr),
-                backend_name: backend_bytes.clone(),
-                backend_key: Some(backend_key),
-            }),
-        );
-        let child = self.ensure_child_entry(parent, name, stat, 1);
-        let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
-        reply.entry(&self.entry_ttl, &attr, 0);
+        }
     }
 
     fn opendir(&mut self, _req: &FuserRequest<'_>, ino: u64, flags: i32, reply: FuserReplyOpen) {
