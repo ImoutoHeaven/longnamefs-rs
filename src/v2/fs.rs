@@ -49,7 +49,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -133,6 +133,35 @@ pub enum IndexSync {
         max_age: Duration,
     },
     Off,
+}
+
+#[derive(Clone, Debug)]
+pub struct PassthroughMetaFdConfig {
+    pub enabled: bool,
+    pub max_meta_fds: usize,
+    pub min_open_count: u32,
+    pub min_lifetime: Duration,
+    pub min_meta_ops: u32,
+    pub cooldown: Duration,
+}
+
+impl PassthroughMetaFdConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            max_meta_fds: 0,
+            min_open_count: 0,
+            min_lifetime: Duration::ZERO,
+            min_meta_ops: 0,
+            cooldown: Duration::ZERO,
+        }
+    }
+}
+
+impl Default for PassthroughMetaFdConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -1068,8 +1097,33 @@ impl V2HandleTable {
 
 #[cfg(feature = "abi-7-40")]
 #[derive(Debug)]
+struct PassthroughHandleInner {
+    backing: Arc<BackingId>,
+    opened_at: Instant,
+    meta_ops: AtomicU32,
+    promotion_inflight: AtomicBool,
+    meta_fd: RwLock<Option<Arc<OwnedFd>>>,
+}
+
+#[cfg(feature = "abi-7-40")]
+impl PassthroughHandleInner {
+    fn meta_fd(&self) -> Option<Arc<OwnedFd>> {
+        self.meta_fd.read().clone()
+    }
+
+    fn set_meta_fd(&self, fd: Arc<OwnedFd>) {
+        *self.meta_fd.write() = Some(fd);
+    }
+
+    fn take_meta_fd(&self) -> Option<Arc<OwnedFd>> {
+        self.meta_fd.write().take()
+    }
+}
+
+#[cfg(feature = "abi-7-40")]
+#[derive(Debug)]
 struct PassthroughHandleTable {
-    handles: RwLock<HashMap<u64, Arc<BackingId>>>,
+    handles: RwLock<HashMap<u64, Arc<PassthroughHandleInner>>>,
 }
 
 #[cfg(feature = "abi-7-40")]
@@ -1083,9 +1137,16 @@ impl Default for PassthroughHandleTable {
 
 #[cfg(feature = "abi-7-40")]
 impl PassthroughHandleTable {
-    fn insert(&self, fh: u64, id: BackingId) -> Arc<BackingId> {
+    fn insert(&self, fh: u64, id: BackingId, meta_fd: Option<Arc<OwnedFd>>) -> Arc<BackingId> {
         let backing = Arc::new(id);
-        self.handles.write().insert(fh, backing.clone());
+        let handle = Arc::new(PassthroughHandleInner {
+            backing: backing.clone(),
+            opened_at: Instant::now(),
+            meta_ops: AtomicU32::new(0),
+            promotion_inflight: AtomicBool::new(false),
+            meta_fd: RwLock::new(meta_fd),
+        });
+        self.handles.write().insert(fh, handle);
         backing
     }
 
@@ -1093,8 +1154,107 @@ impl PassthroughHandleTable {
         self.handles.read().contains_key(&fh)
     }
 
-    fn remove(&self, fh: u64) -> Option<Arc<BackingId>> {
+    fn get(&self, fh: u64) -> Option<Arc<PassthroughHandleInner>> {
+        self.handles.read().get(&fh).cloned()
+    }
+
+    fn remove(&self, fh: u64) -> Option<Arc<PassthroughHandleInner>> {
         self.handles.write().remove(&fh)
+    }
+}
+
+#[cfg(feature = "abi-7-40")]
+#[derive(Debug)]
+struct PassthroughMetaFdPolicy {
+    cfg: PassthroughMetaFdConfig,
+    meta_fd_count: AtomicUsize,
+    cooldown_until_ms: AtomicU64,
+}
+
+#[cfg(feature = "abi-7-40")]
+impl PassthroughMetaFdPolicy {
+    fn new(cfg: PassthroughMetaFdConfig) -> Self {
+        Self {
+            cfg,
+            meta_fd_count: AtomicUsize::new(0),
+            cooldown_until_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.cfg.enabled && self.cfg.max_meta_fds > 0
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    fn in_cooldown(&self) -> bool {
+        if !self.enabled() {
+            return true;
+        }
+        Self::now_ms() < self.cooldown_until_ms.load(Ordering::Relaxed)
+    }
+
+    fn enter_cooldown(&self) {
+        if !self.enabled() {
+            return;
+        }
+        let until = Self::now_ms().saturating_add(self.cfg.cooldown.as_millis() as u64);
+        self.cooldown_until_ms.store(until, Ordering::Relaxed);
+    }
+
+    fn try_acquire_slot(&self) -> bool {
+        if !self.enabled() || self.in_cooldown() {
+            return false;
+        }
+        loop {
+            let current = self.meta_fd_count.load(Ordering::Relaxed);
+            if current >= self.cfg.max_meta_fds {
+                return false;
+            }
+            if self
+                .meta_fd_count
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn release_slot(&self) {
+        if !self.enabled() {
+            return;
+        }
+        let _ = self
+            .meta_fd_count
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    fn should_keep_on_open(&self, open_count: u32) -> bool {
+        self.enabled() && !self.in_cooldown() && open_count >= self.cfg.min_open_count
+    }
+
+    fn should_promote(&self, open_count: u32, opened_at: Instant, meta_ops: u32) -> bool {
+        if !self.enabled() || self.in_cooldown() {
+            return false;
+        }
+        if open_count < self.cfg.min_open_count {
+            return false;
+        }
+        if meta_ops < self.cfg.min_meta_ops {
+            return false;
+        }
+        if Instant::now().duration_since(opened_at) < self.cfg.min_lifetime {
+            return false;
+        }
+        true
     }
 }
 
@@ -3061,6 +3221,8 @@ pub struct LongNameFsV2Fuser {
     passthrough_runtime: bool,
     #[cfg(feature = "abi-7-40")]
     passthrough_handles: PassthroughHandleTable,
+    #[cfg(feature = "abi-7-40")]
+    passthrough_meta_policy: PassthroughMetaFdPolicy,
     writeback_cache_cfg: bool,
     max_write: NonZeroU32,
     attr_ttl: Duration,
@@ -3082,7 +3244,11 @@ impl LongNameFsV2Fuser {
         open_ttl: Duration,
         enable_passthrough: bool,
         enable_writeback_cache: bool,
+        passthrough_meta_fd: PassthroughMetaFdConfig,
     ) -> CoreResult<Self> {
+        #[cfg(not(feature = "abi-7-40"))]
+        let _ = passthrough_meta_fd;
+
         let core = Arc::new(LongNameFsCore::new(
             config,
             max_name_len,
@@ -3106,6 +3272,8 @@ impl LongNameFsV2Fuser {
             passthrough_runtime: false,
             #[cfg(feature = "abi-7-40")]
             passthrough_handles: PassthroughHandleTable::default(),
+            #[cfg(feature = "abi-7-40")]
+            passthrough_meta_policy: PassthroughMetaFdPolicy::new(passthrough_meta_fd),
             writeback_cache_cfg: enable_writeback_cache,
             max_write,
             attr_ttl,
@@ -3165,6 +3333,113 @@ impl LongNameFsV2Fuser {
         .map(|stat| fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino))
     }
 
+    #[cfg(feature = "abi-7-40")]
+    fn clear_passthrough_meta_fd(&self, handle: &PassthroughHandleInner) {
+        if handle.take_meta_fd().is_some() {
+            self.passthrough_meta_policy.release_slot();
+        }
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn open_passthrough_meta_fd(&self, entry: &InodeEntry) -> CoreResult<OwnedFd> {
+        if entry.ino == ROOT_INODE || entry.backend_name.is_empty() {
+            return Err(CoreError::NotFound);
+        }
+        let parent_entry = self
+            .inode_store
+            .get(entry.parent)
+            .ok_or(CoreError::NotFound)?;
+        let parent_dirfd = self
+            .core
+            .try_dir_fd_by_backend_key(parent_entry.backend)
+            .ok_or(CoreError::NotFound)?;
+        let fname = cstring_from_bytes(&entry.backend_name)?;
+        nix::fcntl::openat(
+            parent_dirfd.as_fd(),
+            fname.as_c_str(),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(core_errno_from_nix)
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn maybe_promote_passthrough_meta_fd(
+        &self,
+        entry: &InodeEntry,
+        handle: &PassthroughHandleInner,
+        meta_ops: u32,
+    ) {
+        if !self.passthrough_meta_policy.should_promote(
+            entry.open_count,
+            handle.opened_at,
+            meta_ops,
+        ) {
+            return;
+        }
+        if handle
+            .promotion_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let mut acquired_slot = false;
+        let opened = if self.passthrough_meta_policy.try_acquire_slot() {
+            acquired_slot = true;
+            self.open_passthrough_meta_fd(entry)
+        } else {
+            Err(CoreError::NotFound)
+        };
+        handle.promotion_inflight.store(false, Ordering::Release);
+
+        match opened {
+            Ok(fd) => {
+                handle.set_meta_fd(Arc::new(fd));
+            }
+            Err(CoreError::Io(ioe))
+                if matches!(ioe.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE)) =>
+            {
+                self.passthrough_meta_policy.enter_cooldown();
+                if acquired_slot {
+                    self.passthrough_meta_policy.release_slot();
+                }
+            }
+            Err(_) => {
+                if acquired_slot {
+                    self.passthrough_meta_policy.release_slot();
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn passthrough_attr_via_meta_fd(&self, fh: u64, entry: &InodeEntry) -> Option<FuserFileAttr> {
+        let handle = self.get_passthrough_handle(fh)?;
+        let meta_ops = handle
+            .meta_ops
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+
+        if let Some(meta_fd) = handle.meta_fd() {
+            if let Ok(stat) = fstat(meta_fd.as_fd()) {
+                return Some(fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino));
+            }
+            self.clear_passthrough_meta_fd(handle.as_ref());
+        }
+
+        self.maybe_promote_passthrough_meta_fd(entry, handle.as_ref(), meta_ops);
+
+        if let Some(meta_fd) = handle.meta_fd() {
+            if let Ok(stat) = fstat(meta_fd.as_fd()) {
+                return Some(fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino));
+            }
+            self.clear_passthrough_meta_fd(handle.as_ref());
+        }
+        None
+    }
+
     fn passthrough_active(&self) -> bool {
         #[cfg(feature = "abi-7-40")]
         {
@@ -3187,13 +3462,23 @@ impl LongNameFsV2Fuser {
     }
 
     #[cfg(feature = "abi-7-40")]
-    fn remove_passthrough_fh(&self, fh: u64) -> bool {
-        self.passthrough_handles.remove(fh).is_some()
+    fn get_passthrough_handle(&self, fh: u64) -> Option<Arc<PassthroughHandleInner>> {
+        self.passthrough_handles.get(fh)
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn remove_passthrough_handle(&self, fh: u64) -> Option<Arc<PassthroughHandleInner>> {
+        self.passthrough_handles.remove(fh)
     }
 
     #[cfg(not(feature = "abi-7-40"))]
-    fn remove_passthrough_fh(&self, _fh: u64) -> bool {
-        false
+    fn get_passthrough_handle(&self, _fh: u64) -> Option<()> {
+        None
+    }
+
+    #[cfg(not(feature = "abi-7-40"))]
+    fn remove_passthrough_handle(&self, _fh: u64) -> Option<()> {
+        None
     }
 
     fn invalidate_dir(&self, dir_fd: BorrowedFd<'_>) {
@@ -3530,6 +3815,16 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         };
         let result = if let Some(fh) = fh {
             if self.passthrough_active() && self.is_passthrough_fh(fh) {
+                #[cfg(feature = "abi-7-40")]
+                if let Some(attr) = self.passthrough_attr_via_meta_fd(fh, &entry) {
+                    Ok(attr)
+                } else {
+                    self.getattr_via_parent_dirfd(&entry)
+                        .ok_or(CoreError::NotFound)
+                        .or_else(|_| self.attr_for_entry(&entry))
+                }
+
+                #[cfg(not(feature = "abi-7-40"))]
                 self.getattr_via_parent_dirfd(&entry)
                     .ok_or(CoreError::NotFound)
                     .or_else(|_| self.attr_for_entry(&entry))
@@ -3678,6 +3973,111 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 Err(err) => reply.error(core_err_to_errno(&err)),
             }
             return;
+        }
+
+        #[cfg(feature = "abi-7-40")]
+        if let Some(fh) = fh
+            && self.passthrough_active()
+            && self.is_passthrough_fh(fh)
+            && size.is_none()
+            && (mode.is_some()
+                || uid.is_some()
+                || gid.is_some()
+                || atime.is_some()
+                || mtime.is_some())
+            && let Some(handle) = self.get_passthrough_handle(fh)
+        {
+            let meta_ops = handle
+                .meta_ops
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if handle.meta_fd().is_none() {
+                self.maybe_promote_passthrough_meta_fd(&entry, handle.as_ref(), meta_ops);
+            }
+            if let Some(meta_fd) = handle.meta_fd() {
+                let mut invalid_fd = false;
+                if let Some(mode) = mode
+                    && let Err(err) =
+                        nix::sys::stat::fchmod(meta_fd.as_fd(), Mode::from_bits_truncate(mode))
+                {
+                    let err = core_errno_from_nix(err);
+                    if matches!(err, CoreError::Io(ref ioe) if ioe.raw_os_error() == Some(libc::EBADF))
+                    {
+                        invalid_fd = true;
+                    } else {
+                        self.clear_passthrough_meta_fd(handle.as_ref());
+                        reply.error(core_err_to_errno(&err));
+                        return;
+                    }
+                }
+                if (uid.is_some() || gid.is_some())
+                    && let Err(err) = nix::unistd::fchown(
+                        meta_fd.as_fd(),
+                        uid.map(Uid::from_raw),
+                        gid.map(Gid::from_raw),
+                    )
+                {
+                    let err = core_errno_from_nix(err);
+                    if matches!(err, CoreError::Io(ref ioe) if ioe.raw_os_error() == Some(libc::EBADF))
+                    {
+                        invalid_fd = true;
+                    } else {
+                        self.clear_passthrough_meta_fd(handle.as_ref());
+                        reply.error(core_err_to_errno(&err));
+                        return;
+                    }
+                }
+                if atime.is_some() || mtime.is_some() {
+                    let at = timespec_from_time_or_now(atime);
+                    let mt = timespec_from_time_or_now(mtime);
+                    let times = [*at.as_ref(), *mt.as_ref()];
+                    let res =
+                        unsafe { libc::futimens(meta_fd.as_ref().as_raw_fd(), times.as_ptr()) };
+                    if res < 0 {
+                        let err: CoreError = io::Error::last_os_error().into();
+                        if matches!(err, CoreError::Io(ref ioe) if ioe.raw_os_error() == Some(libc::EBADF))
+                        {
+                            invalid_fd = true;
+                        } else {
+                            self.clear_passthrough_meta_fd(handle.as_ref());
+                            reply.error(core_err_to_errno(&err));
+                            return;
+                        }
+                    }
+                }
+
+                if invalid_fd {
+                    self.clear_passthrough_meta_fd(handle.as_ref());
+                } else {
+                    if let Some(parent_entry) = self.inode_store.get(entry.parent)
+                        && let Some(parent_dirfd) =
+                            self.core.try_dir_fd_by_backend_key(parent_entry.backend)
+                    {
+                        self.invalidate_dir(parent_dirfd.as_fd());
+                    }
+                    self.notify_inode(ino);
+
+                    match fstat(meta_fd.as_fd()).map_err(core_errno_from_nix) {
+                        Ok(stat) => {
+                            let attr = fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino);
+                            let (_, attr_ttl) = self.ttl_for_entry(&entry);
+                            reply.attr(&attr_ttl, &attr);
+                        }
+                        Err(_) => match self
+                            .getattr_via_parent_dirfd(&entry)
+                            .ok_or(CoreError::NotFound)
+                            .or_else(|_| self.attr_for_entry(&entry))
+                        {
+                            Ok(attr) => {
+                                let (_, attr_ttl) = self.ttl_for_entry(&entry);
+                                reply.attr(&attr_ttl, &attr);
+                            }
+                            Err(err) => reply.error(core_err_to_errno(&err)),
+                        },
+                    }
+                    return;
+                }
+            }
         }
 
         if entry.ino != ROOT_INODE
@@ -5661,12 +6061,21 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let mut fd_opt = Some(fd);
         #[cfg(feature = "abi-7-40")]
         if self.passthrough_active() && entry.kind == InodeKind::File {
-            match reply.open_backing(fd.as_fd()) {
+            match reply.open_backing(fd_opt.as_ref().expect("fd present").as_fd()) {
                 Ok(backing_id) => {
                     let fh = self.handles.allocate_fh();
-                    let backing = self.passthrough_handles.insert(fh, backing_id);
+                    let open_count = entry.open_count.saturating_add(1);
+                    let meta_fd = if self.passthrough_meta_policy.should_keep_on_open(open_count)
+                        && self.passthrough_meta_policy.try_acquire_slot()
+                    {
+                        Some(Arc::new(fd_opt.take().expect("fd present")))
+                    } else {
+                        None
+                    };
+                    let backing = self.passthrough_handles.insert(fh, backing_id, meta_fd);
                     let _ = self.inode_store.inc_open(ino);
                     reply.opened_passthrough(fh, 0, &backing);
                     return;
@@ -5685,7 +6094,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 }
             }
         }
-        let fh = self.handles.insert_file(fd);
+        let fh = self.handles.insert_file(fd_opt.take().expect("fd present"));
         let _ = self.inode_store.inc_open(ino);
         reply.opened(fh, 0);
     }
@@ -6137,7 +6546,12 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         _flush: bool,
         reply: FuserReplyEmpty,
     ) {
-        if self.passthrough_active() && self.remove_passthrough_fh(fh) {
+        #[cfg(feature = "abi-7-40")]
+        if self.passthrough_active()
+            && self.is_passthrough_fh(fh)
+            && let Some(handle) = self.remove_passthrough_handle(fh)
+        {
+            self.clear_passthrough_meta_fd(handle.as_ref());
             let _ = self.inode_store.dec_open(ino);
             if let Some(entry) = self.inode_store.get(ino)
                 && entry.ino != ROOT_INODE
@@ -6360,6 +6774,26 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "abi-7-40")]
+    #[test]
+    fn passthrough_meta_policy_respects_budget_and_cooldown() {
+        let policy = PassthroughMetaFdPolicy::new(PassthroughMetaFdConfig {
+            enabled: true,
+            max_meta_fds: 1,
+            min_open_count: 0,
+            min_lifetime: Duration::ZERO,
+            min_meta_ops: 0,
+            cooldown: Duration::from_secs(60),
+        });
+
+        assert!(policy.try_acquire_slot());
+        assert!(!policy.try_acquire_slot());
+        policy.release_slot();
+        assert!(policy.try_acquire_slot());
+        policy.enter_cooldown();
+        assert!(!policy.try_acquire_slot());
+    }
+
     #[test]
     fn getattr_via_parent_dirfd_uses_cached_parent_dir() {
         let tmp = TempDir::new();
@@ -6376,6 +6810,7 @@ mod tests {
             Duration::from_secs(1),
             false,
             false,
+            PassthroughMetaFdConfig::disabled(),
         )
         .unwrap();
 
@@ -6402,6 +6837,7 @@ mod tests {
             Duration::from_secs(1),
             false,
             false,
+            PassthroughMetaFdConfig::disabled(),
         )
         .unwrap();
 

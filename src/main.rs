@@ -6,7 +6,7 @@ mod pathmap;
 mod util;
 mod v2;
 
-use crate::v2::{IndexSync, LongNameFsV2Fuser};
+use crate::v2::{IndexSync, LongNameFsV2Fuser, PassthroughMetaFdConfig};
 use clap::{Parser, ValueEnum};
 use config::Config;
 use fs::LongNameFs;
@@ -123,6 +123,30 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     enable_writeback_cache: bool,
 
+    /// Enable passthrough meta_fd caching (v2 + abi-7-40 only; reduces metadata overhead at the cost of extra fds).
+    #[arg(long, default_value_t = false)]
+    enable_passthrough_meta_fd: bool,
+
+    /// Maximum number of passthrough meta_fds to keep (v2 + abi-7-40 only).
+    #[arg(long, default_value_t = 1024)]
+    passthrough_meta_fd_max: usize,
+
+    /// Minimum open_count required before considering meta_fd promotion (v2 + abi-7-40 only).
+    #[arg(long, default_value_t = 4)]
+    passthrough_meta_fd_min_open_count: u32,
+
+    /// Minimum handle lifetime in milliseconds before considering meta_fd promotion (v2 + abi-7-40 only).
+    #[arg(long, default_value_t = 1000)]
+    passthrough_meta_fd_min_lifetime_ms: u64,
+
+    /// Minimum number of metadata ops before considering meta_fd promotion (v2 + abi-7-40 only).
+    #[arg(long, default_value_t = 8)]
+    passthrough_meta_fd_min_meta_ops: u32,
+
+    /// Cooldown in milliseconds after EMFILE/ENFILE while promoting meta_fds (v2 + abi-7-40 only).
+    #[arg(long, default_value_t = 5000)]
+    passthrough_meta_fd_cooldown_ms: u64,
+
     /// v2 index flush strategy: always sync, batch by time/ops, or off (no flush).
     #[arg(long, value_enum, default_value_t = IndexSyncCli::Batch)]
     index_sync: IndexSyncCli,
@@ -189,6 +213,18 @@ async fn main() -> anyhow::Result<()> {
         .open_ttl_ms
         .map(Duration::from_millis)
         .unwrap_or(attr_ttl);
+    let passthrough_meta_fd = if cli.enable_passthrough_meta_fd {
+        PassthroughMetaFdConfig {
+            enabled: true,
+            max_meta_fds: cli.passthrough_meta_fd_max,
+            min_open_count: cli.passthrough_meta_fd_min_open_count,
+            min_lifetime: Duration::from_millis(cli.passthrough_meta_fd_min_lifetime_ms),
+            min_meta_ops: cli.passthrough_meta_fd_min_meta_ops,
+            cooldown: Duration::from_millis(cli.passthrough_meta_fd_cooldown_ms),
+        }
+    } else {
+        PassthroughMetaFdConfig::disabled()
+    };
 
     let mut mount_opts = MountOptions::default();
     mount_opts.fs_name("longnamefs-rs");
@@ -228,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
                 open_ttl,
                 cli.enable_passthrough,
                 cli.enable_writeback_cache,
+                passthrough_meta_fd,
             )
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             run_mount_fuser_with_signals(fs, mountpoint, cli.allow_other, cli.nonempty).await

@@ -12,4 +12,4 @@ pub mod inode_store;
 pub mod path;
 
 #[allow(unused_imports)]
-pub use fs::{IndexSync, LongNameFsCore, LongNameFsV2Fuser};
+pub use fs::{IndexSync, LongNameFsCore, LongNameFsV2Fuser, PassthroughMetaFdConfig};
