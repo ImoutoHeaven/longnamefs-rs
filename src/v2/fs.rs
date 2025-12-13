@@ -3149,6 +3149,22 @@ impl LongNameFsV2Fuser {
             .unwrap_or((self.entry_ttl, self.attr_ttl))
     }
 
+    fn getattr_via_parent_dirfd(&self, entry: &InodeEntry) -> Option<FuserFileAttr> {
+        if entry.ino == ROOT_INODE || entry.backend_name.is_empty() {
+            return None;
+        }
+        let parent_entry = self.inode_store.get(entry.parent)?;
+        let parent_dirfd = self.core.try_dir_fd_by_backend_key(parent_entry.backend)?;
+        let fname = cstring_from_bytes(&entry.backend_name).ok()?;
+        fstatat(
+            parent_dirfd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .ok()
+        .map(|stat| fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino))
+    }
+
     fn passthrough_active(&self) -> bool {
         #[cfg(feature = "abi-7-40")]
         {
@@ -3514,7 +3530,9 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         };
         let result = if let Some(fh) = fh {
             if self.passthrough_active() && self.is_passthrough_fh(fh) {
-                self.attr_for_entry(&entry)
+                self.getattr_via_parent_dirfd(&entry)
+                    .ok_or(CoreError::NotFound)
+                    .or_else(|_| self.attr_for_entry(&entry))
             } else {
                 self.handles
                     .get_file(fh)
@@ -3522,22 +3540,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     .map(|stat| fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino))
                     .ok_or(CoreError::NotFound)
             }
-        } else if entry.ino != ROOT_INODE
-            && !entry.backend_name.is_empty()
-            && let Some(parent_entry) = self.inode_store.get(entry.parent)
-            && let Some(parent_dirfd) = self.core.try_dir_fd_by_backend_key(parent_entry.backend)
-            && let Ok(fname) = cstring_from_bytes(&entry.backend_name)
-        {
-            match fstatat(
-                parent_dirfd.as_fd(),
-                fname.as_c_str(),
-                AtFlags::AT_SYMLINK_NOFOLLOW,
-            ) {
-                Ok(stat) => Ok(fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino)),
-                Err(_) => self.attr_for_entry(&entry),
-            }
         } else {
-            self.attr_for_entry(&entry)
+            self.getattr_via_parent_dirfd(&entry)
+                .ok_or(CoreError::NotFound)
+                .or_else(|_| self.attr_for_entry(&entry))
         };
         match result {
             Ok(attr) => {
@@ -3666,6 +3672,84 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             match fstat(fd.as_fd()).map_err(core_errno_from_nix) {
                 Ok(stat) => {
                     let attr = fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino);
+                    let (_, attr_ttl) = self.ttl_for_entry(&entry);
+                    reply.attr(&attr_ttl, &attr);
+                }
+                Err(err) => reply.error(core_err_to_errno(&err)),
+            }
+            return;
+        }
+
+        if entry.ino != ROOT_INODE
+            && !entry.backend_name.is_empty()
+            && let Some(parent_entry) = self.inode_store.get(entry.parent)
+            && let Some(parent_dirfd) = self.core.try_dir_fd_by_backend_key(parent_entry.backend)
+            && let Ok(fname) = cstring_from_bytes(&entry.backend_name)
+        {
+            if let Some(mode) = mode
+                && let Err(err) = fchmodat(
+                    parent_dirfd.as_fd(),
+                    fname.as_c_str(),
+                    Mode::from_bits_truncate(mode),
+                    FchmodatFlags::FollowSymlink,
+                )
+            {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+            if (uid.is_some() || gid.is_some())
+                && let Err(err) = fchownat(
+                    parent_dirfd.as_fd(),
+                    fname.as_c_str(),
+                    uid.map(Uid::from_raw),
+                    gid.map(Gid::from_raw),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+            {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+            if let Some(size) = size {
+                let file = match nix::fcntl::openat(
+                    parent_dirfd.as_fd(),
+                    fname.as_c_str(),
+                    OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => fd,
+                    Err(err) => {
+                        reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                        return;
+                    }
+                };
+                if let Err(err) = nix::unistd::ftruncate(&file, size as i64) {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+            if atime.is_some() || mtime.is_some() {
+                let at = timespec_from_time_or_now(atime);
+                let mt = timespec_from_time_or_now(mtime);
+                if let Err(err) = utimensat(
+                    parent_dirfd.as_fd(),
+                    fname.as_c_str(),
+                    &at,
+                    &mt,
+                    UtimensatFlags::NoFollowSymlink,
+                ) {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            }
+
+            self.invalidate_dir(parent_dirfd.as_fd());
+            self.notify_inode(ino);
+            match self
+                .getattr_via_parent_dirfd(&entry)
+                .ok_or(CoreError::NotFound)
+                .or_else(|_| self.attr_for_entry(&entry))
+            {
+                Ok(attr) => {
                     let (_, attr_ttl) = self.ttl_for_entry(&entry);
                     reply.attr(&attr_ttl, &attr);
                 }
@@ -5705,6 +5789,12 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
         }
         if let Some(entry) = self.inode_store.get(ino)
+            && entry.ino != ROOT_INODE
+            && let Some(parent_entry) = self.inode_store.get(entry.parent)
+            && let Some(parent_dirfd) = self.core.try_dir_fd_by_backend_key(parent_entry.backend)
+        {
+            self.invalidate_dir(parent_dirfd.as_fd());
+        } else if let Some(entry) = self.inode_store.get(ino)
             && let Ok(path) = self.entry_path(&entry)
             && path != OsStr::new("/")
             && let Ok(mapped) = self.core.resolve_path(&path)
@@ -6050,6 +6140,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         if self.passthrough_active() && self.remove_passthrough_fh(fh) {
             let _ = self.inode_store.dec_open(ino);
             if let Some(entry) = self.inode_store.get(ino)
+                && entry.ino != ROOT_INODE
+                && let Some(parent_entry) = self.inode_store.get(entry.parent)
+                && let Some(parent_dirfd) =
+                    self.core.try_dir_fd_by_backend_key(parent_entry.backend)
+            {
+                self.invalidate_dir(parent_dirfd.as_fd());
+            } else if let Some(entry) = self.inode_store.get(ino)
                 && let Ok(path) = self.entry_path(&entry)
                 && path != OsStr::new("/")
                 && let Ok(mapped) = self.core.resolve_path(&path)
@@ -6233,6 +6330,19 @@ mod tests {
     }
 
     #[test]
+    fn dup_cloexec_preserves_cloexec_semantics() {
+        let tmp = TempDir::new();
+        let file = tmp.path().join("f");
+        fs::write(&file, b"x").unwrap();
+        let fd =
+            nix::fcntl::open(&file, OFlag::O_RDONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+
+        let duped = dup_cloexec(fd.as_fd()).unwrap();
+        let flags = nix::fcntl::fcntl(duped.as_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
     fn ttl_for_open_count_prefers_open_ttl_only_for_open_files() {
         let base = Duration::from_secs(1);
         let open = Duration::from_millis(50);
@@ -6248,6 +6358,33 @@ mod tests {
             LongNameFsV2Fuser::ttl_for_open_count(base, open, false, 1),
             base
         );
+    }
+
+    #[test]
+    fn getattr_via_parent_dirfd_uses_cached_parent_dir() {
+        let tmp = TempDir::new();
+        let file = tmp.path().join("a");
+        fs::write(&file, b"hello").unwrap();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+        let fs = LongNameFsV2Fuser::new(
+            config,
+            MAX_SEGMENT_ON_DISK,
+            Some(Duration::from_secs(60)),
+            1024,
+            IndexSync::Off,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let root_fd = fs.core.cached_root_fd().unwrap();
+        let stat = fstatat(root_fd.as_fd(), c"a", AtFlags::AT_SYMLINK_NOFOLLOW).unwrap();
+        let child = fs.ensure_child_entry(ROOT_INODE, OsStr::new("a"), b"a".to_vec(), stat, 1);
+        let attr = fs.getattr_via_parent_dirfd(&child).unwrap();
+        assert_eq!(attr.ino, child.ino);
+        assert_eq!(attr.kind, FuserFileType::RegularFile);
     }
 
     #[test]
