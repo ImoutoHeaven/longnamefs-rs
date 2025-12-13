@@ -2364,6 +2364,13 @@ impl LongNameFsCore {
         Ok(self.dir_fd_cache.insert(key, fd))
     }
 
+    pub(crate) fn try_dir_fd_by_backend_key(&self, backend: BackendKey) -> Option<Arc<OwnedFd>> {
+        self.dir_fd_cache.get(DirCacheKey {
+            dev: backend.dev,
+            ino: backend.ino,
+        })
+    }
+
     pub(crate) fn open_dir_cached(
         &self,
         parent_fd: BorrowedFd<'_>,
@@ -3042,6 +3049,8 @@ pub struct LongNameFsV2Fuser {
     max_write: NonZeroU32,
     attr_ttl: Duration,
     entry_ttl: Duration,
+    open_attr_ttl: Duration,
+    open_entry_ttl: Duration,
     notifier: FsNotifier,
 }
 
@@ -3054,6 +3063,7 @@ impl LongNameFsV2Fuser {
         max_write_kb: u32,
         index_sync: IndexSync,
         attr_ttl: Duration,
+        open_ttl: Duration,
         enable_passthrough: bool,
         enable_writeback_cache: bool,
     ) -> CoreResult<Self> {
@@ -3084,8 +3094,43 @@ impl LongNameFsV2Fuser {
             max_write,
             attr_ttl,
             entry_ttl: attr_ttl,
+            open_attr_ttl: open_ttl,
+            open_entry_ttl: open_ttl,
             notifier,
         })
+    }
+
+    fn ttl_for_open_count(
+        base: Duration,
+        open: Duration,
+        is_file: bool,
+        open_count: u32,
+    ) -> Duration {
+        if is_file && open_count > 0 {
+            open
+        } else {
+            base
+        }
+    }
+
+    fn ttl_for_entry(&self, entry: &InodeEntry) -> (Duration, Duration) {
+        let is_file = entry.kind == InodeKind::File;
+        let entry_ttl = Self::ttl_for_open_count(
+            self.entry_ttl,
+            self.open_entry_ttl,
+            is_file,
+            entry.open_count,
+        );
+        let attr_ttl =
+            Self::ttl_for_open_count(self.attr_ttl, self.open_attr_ttl, is_file, entry.open_count);
+        (entry_ttl, attr_ttl)
+    }
+
+    fn ttl_for_ino(&self, ino: InodeId) -> (Duration, Duration) {
+        self.inode_store
+            .get(ino)
+            .map(|e| self.ttl_for_entry(&e))
+            .unwrap_or((self.entry_ttl, self.attr_ttl))
     }
 
     fn passthrough_active(&self) -> bool {
@@ -3187,6 +3232,7 @@ impl LongNameFsV2Fuser {
         &self,
         parent: InodeId,
         name: &OsStr,
+        backend_name: Vec<u8>,
         stat: nix::sys::stat::FileStat,
         lookup_inc: u64,
     ) -> InodeEntry {
@@ -3199,12 +3245,30 @@ impl LongNameFsV2Fuser {
             ParentName {
                 parent,
                 name: name.to_os_string(),
+                backend_name,
             },
             lookup_inc,
         )
     }
 
     fn open_backend_file(&self, entry: &InodeEntry, flags: u32) -> CoreResult<OwnedFd> {
+        if entry.ino != ROOT_INODE
+            && !entry.backend_name.is_empty()
+            && let Some(parent_entry) = self.inode_store.get(entry.parent)
+            && let Some(parent_dirfd) = self.core.try_dir_fd_by_backend_key(parent_entry.backend)
+            && let Ok(fname) = cstring_from_bytes(&entry.backend_name)
+        {
+            let oflag = oflag_from_bits(flags) | OFlag::O_CLOEXEC;
+            if let Ok(fd) = nix::fcntl::openat(
+                parent_dirfd.as_fd(),
+                fname.as_c_str(),
+                oflag,
+                Mode::from_bits_truncate(0o666),
+            ) {
+                return Ok(fd);
+            }
+        }
+
         let path = self.entry_path(entry)?;
         let mapped = self.core.resolve_path(&path)?;
         let oflag = oflag_from_bits(flags) | OFlag::O_CLOEXEC;
@@ -3309,6 +3373,63 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
+        let raw = normalize_osstr(name);
+
+        if let Some(parent_dirfd) = self.core.try_dir_fd_by_backend_key(parent_entry.backend) {
+            let mut state = match load_dir_state(&self.core.index_cache, parent_dirfd.as_fd()) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            let (backend, _kind) = match map_segment_for_lookup(
+                parent_dirfd.as_fd(),
+                &mut state,
+                &raw,
+                self.core.max_name_len,
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            if let Err(err) = maybe_flush_index(
+                parent_dirfd.as_fd(),
+                &mut state,
+                self.core.index_sync,
+                false,
+            ) {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+            let fname = match backend.as_cstring() {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            let stat = match fstatat(
+                parent_dirfd.as_fd(),
+                fname.as_c_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+            };
+            let child_entry =
+                self.ensure_child_entry(parent, name, backend.display_bytes(), stat, 1);
+            let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child_entry.ino);
+            let (entry_ttl, _) = self.ttl_for_entry(&child_entry);
+            reply.entry(&entry_ttl, &attr, 0);
+            return;
+        }
+
         let parent_path = match self.entry_path(&parent_entry) {
             Ok(path) => path,
             Err(err) => {
@@ -3324,6 +3445,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
+        let backend_bytes = mapped.backend_name.display_bytes();
         let fname = match mapped.backend_name.as_cstring() {
             Ok(v) => v,
             Err(err) => {
@@ -3342,9 +3464,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let child_entry = self.ensure_child_entry(parent, name, stat, 1);
+        let child_entry = self.ensure_child_entry(parent, name, backend_bytes, stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child_entry.ino);
-        reply.entry(&self.entry_ttl, &attr, 0);
+        let (entry_ttl, _) = self.ttl_for_entry(&child_entry);
+        reply.entry(&entry_ttl, &attr, 0);
     }
 
     fn getattr(
@@ -3368,11 +3491,28 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     .map(|stat| fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino))
                     .ok_or(CoreError::NotFound)
             }
+        } else if entry.ino != ROOT_INODE
+            && !entry.backend_name.is_empty()
+            && let Some(parent_entry) = self.inode_store.get(entry.parent)
+            && let Some(parent_dirfd) = self.core.try_dir_fd_by_backend_key(parent_entry.backend)
+            && let Ok(fname) = cstring_from_bytes(&entry.backend_name)
+        {
+            match fstatat(
+                parent_dirfd.as_fd(),
+                fname.as_c_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat) => Ok(fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino)),
+                Err(_) => self.attr_for_entry(&entry),
+            }
         } else {
             self.attr_for_entry(&entry)
         };
         match result {
-            Ok(attr) => reply.attr(&self.attr_ttl, &attr),
+            Ok(attr) => {
+                let (_, attr_ttl) = self.ttl_for_entry(&entry);
+                reply.attr(&attr_ttl, &attr)
+            }
             Err(err) => reply.error(core_err_to_errno(&err)),
         }
     }
@@ -3399,18 +3539,11 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
-        let path = match self.entry_path(&entry) {
-            Ok(p) => p,
-            Err(err) => {
-                reply.error(core_err_to_errno(&err));
-                return;
-            }
-        };
         if flags.unwrap_or(0) != 0 {
             reply.error(libc::EOPNOTSUPP);
             return;
         }
-        if path == OsStr::new("/") {
+        if entry.ino == ROOT_INODE {
             if let Some(mode) = mode
                 && let Err(err) = nix::sys::stat::fchmod(
                     self.core.config.backend_fd(),
@@ -3448,12 +3581,75 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
             self.notify_inode(ino);
             match self.attr_for_entry(&entry) {
-                Ok(attr) => reply.attr(&self.attr_ttl, &attr),
+                Ok(attr) => {
+                    let (_, attr_ttl) = self.ttl_for_entry(&entry);
+                    reply.attr(&attr_ttl, &attr)
+                }
                 Err(err) => reply.error(core_err_to_errno(&err)),
             }
             return;
         }
 
+        if let Some(fh) = fh
+            && !(self.passthrough_active() && self.is_passthrough_fh(fh))
+            && let Some(fd) = self.handles.get_file(fh)
+        {
+            if let Some(mode) = mode
+                && let Err(err) = nix::sys::stat::fchmod(fd.as_fd(), Mode::from_bits_truncate(mode))
+            {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+            if (uid.is_some() || gid.is_some())
+                && let Err(err) =
+                    nix::unistd::fchown(fd.as_fd(), uid.map(Uid::from_raw), gid.map(Gid::from_raw))
+            {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+            if let Some(size) = size
+                && let Err(err) = nix::unistd::ftruncate(fd.as_fd(), size as i64)
+            {
+                reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                return;
+            }
+            if atime.is_some() || mtime.is_some() {
+                let at = timespec_from_time_or_now(atime);
+                let mt = timespec_from_time_or_now(mtime);
+                let times = [*at.as_ref(), *mt.as_ref()];
+                let res = unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) };
+                if res < 0 {
+                    reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+                    return;
+                }
+            }
+
+            if let Some(parent_entry) = self.inode_store.get(entry.parent)
+                && let Some(parent_dirfd) =
+                    self.core.try_dir_fd_by_backend_key(parent_entry.backend)
+            {
+                self.invalidate_dir(parent_dirfd.as_fd());
+            }
+            self.notify_inode(ino);
+
+            match fstat(fd.as_fd()).map_err(core_errno_from_nix) {
+                Ok(stat) => {
+                    let attr = fuser_attr_from_core(core_attr_from_stat(&stat), entry.ino);
+                    let (_, attr_ttl) = self.ttl_for_entry(&entry);
+                    reply.attr(&attr_ttl, &attr);
+                }
+                Err(err) => reply.error(core_err_to_errno(&err)),
+            }
+            return;
+        }
+
+        let path = match self.entry_path(&entry) {
+            Ok(p) => p,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
         let mapped = match self.core.resolve_path(&path) {
             Ok(v) => v,
             Err(err) => {
@@ -3541,7 +3737,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         self.invalidate_dir(mapped.dir_fd.as_fd());
         self.notify_inode(ino);
         match self.attr_for_entry(&entry) {
-            Ok(attr) => reply.attr(&self.attr_ttl, &attr),
+            Ok(attr) => {
+                let (_, attr_ttl) = self.ttl_for_entry(&entry);
+                reply.attr(&attr_ttl, &attr)
+            }
             Err(err) => reply.error(core_err_to_errno(&err)),
         }
     }
@@ -3676,11 +3875,12 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     backend_key: Some(backend_key),
                 }),
             );
-            let child = self.ensure_child_entry(parent, name, stat, 1);
+            let child = self.ensure_child_entry(parent, name, backend_bytes.clone(), stat, 1);
             let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
             self.notify_entry_change(parent, name);
             self.notify_inode(child.ino);
-            reply.entry(&self.entry_ttl, &attr, 0);
+            let (entry_ttl, _) = self.ttl_for_entry(&child);
+            reply.entry(&entry_ttl, &attr, 0);
             return;
         }
 
@@ -3799,11 +3999,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                             backend_key: Some(backend_key),
                         }),
                     );
-                    let child = self.ensure_child_entry(parent, name, stat, 1);
+                    let child =
+                        self.ensure_child_entry(parent, name, backend_bytes.clone(), stat, 1);
                     let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
                     self.notify_entry_change(parent, name);
                     self.notify_inode(child.ino);
-                    reply.entry(&self.entry_ttl, &attr, 0);
+                    let (entry_ttl, _) = self.ttl_for_entry(&child);
+                    reply.entry(&entry_ttl, &attr, 0);
                     return;
                 }
                 Err(err @ CoreError::AlreadyExists) => {
@@ -3961,13 +4163,20 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     backend_key: Some(backend_key),
                 }),
             );
-            let child = self.ensure_child_entry(parent, name, stat, 1);
+            let child = self.ensure_child_entry(parent, name, backend_bytes.clone(), stat, 1);
             let fh = self.handles.insert_file(fd);
             let _ = self.inode_store.inc_open(child.ino);
             let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
             self.notify_entry_change(parent, name);
             self.notify_inode(child.ino);
-            reply.created(&self.entry_ttl, &attr, 0, fh, 0);
+            let open_count = child.open_count.saturating_add(1);
+            let entry_ttl = Self::ttl_for_open_count(
+                self.entry_ttl,
+                self.open_entry_ttl,
+                child.kind == InodeKind::File,
+                open_count,
+            );
+            reply.created(&entry_ttl, &attr, 0, fh, 0);
             return;
         }
 
@@ -4069,13 +4278,21 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                             backend_key: Some(backend_key),
                         }),
                     );
-                    let child = self.ensure_child_entry(parent, name, stat, 1);
+                    let child =
+                        self.ensure_child_entry(parent, name, backend_bytes.clone(), stat, 1);
                     let fh = self.handles.insert_file(fd);
                     let _ = self.inode_store.inc_open(child.ino);
                     let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
                     self.notify_entry_change(parent, name);
                     self.notify_inode(child.ino);
-                    reply.created(&self.entry_ttl, &attr, 0, fh, 0);
+                    let open_count = child.open_count.saturating_add(1);
+                    let entry_ttl = Self::ttl_for_open_count(
+                        self.entry_ttl,
+                        self.open_entry_ttl,
+                        child.kind == InodeKind::File,
+                        open_count,
+                    );
+                    reply.created(&entry_ttl, &attr, 0, fh, 0);
                     return;
                 }
                 Err(err @ CoreError::AlreadyExists) => {
@@ -4222,18 +4439,21 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             fname.as_c_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         ) {
-            let child = self.ensure_child_entry(newparent, newname, stat, 0);
+            let child =
+                self.ensure_child_entry(newparent, newname, backend.display_bytes(), stat, 0);
             renamed_child = Some(child.ino);
             let _ = self.inode_store.remove_parent_name(
                 child.ino,
                 &ParentName {
                     parent,
                     name: name.to_os_string(),
+                    backend_name: Vec::new(),
                 },
             );
             let new_parent_name = ParentName {
                 parent: newparent,
                 name: newname.to_os_string(),
+                backend_name: backend.display_bytes(),
             };
             let _ = self
                 .inode_store
@@ -4364,12 +4584,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 backend_key: Some(backend_key),
             }),
         );
-        let child = self.ensure_child_entry(newparent, newname, stat, 1);
+        let child =
+            self.ensure_child_entry(newparent, newname, dest_backend.display_bytes(), stat, 1);
         let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
         self.notify_entry_change(newparent, newname);
         self.notify_inode(ino);
         self.notify_inode(child.ino);
-        reply.entry(&self.entry_ttl, &attr, 0);
+        let (entry_ttl, _) = self.ttl_for_entry(&child);
+        reply.entry(&entry_ttl, &attr, 0);
     }
 
     fn unlink(
@@ -4453,13 +4675,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             self.core.index_sync,
             false,
         );
-        let child = self.ensure_child_entry(parent, name, existing_stat, 0);
-        self.patch_dir_cache(ctx.dir_fd.as_fd(), CacheOp::Remove(backend_bytes));
+        let child = self.ensure_child_entry(parent, name, backend_bytes.clone(), existing_stat, 0);
+        self.patch_dir_cache(ctx.dir_fd.as_fd(), CacheOp::Remove(backend_bytes.clone()));
         let _ = self.inode_store.remove_parent_name(
             child.ino,
             &ParentName {
                 parent,
                 name: name.to_os_string(),
+                backend_name: backend_bytes.clone(),
             },
         );
         self.notify_delete(parent, child.ino, name);
@@ -4578,7 +4801,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(core_err_to_errno(&err));
             return;
         }
-        self.patch_dir_cache(ctx.dir_fd.as_fd(), CacheOp::Remove(backend_bytes));
+        self.patch_dir_cache(ctx.dir_fd.as_fd(), CacheOp::Remove(backend_bytes.clone()));
         if let Some(stat) = existing_stat {
             let child_key = DirCacheKey {
                 dev: stat.st_dev,
@@ -4588,12 +4811,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             self.handles.clear_dir_attr_cache(child_key);
         }
         if let Some(stat) = existing_stat {
-            let child = self.ensure_child_entry(parent, name, stat, 0);
+            let child = self.ensure_child_entry(parent, name, backend_bytes.clone(), stat, 0);
             let _ = self.inode_store.remove_parent_name(
                 child.ino,
                 &ParentName {
                     parent,
                     name: name.to_os_string(),
+                    backend_name: backend_bytes.clone(),
                 },
             );
             self.notify_delete(parent, child.ino, name);
@@ -4681,11 +4905,12 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     backend_key: Some(backend_key),
                 }),
             );
-            let child = self.ensure_child_entry(parent, link_name, stat, 1);
+            let child = self.ensure_child_entry(parent, link_name, backend_bytes.clone(), stat, 1);
             let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
             self.notify_entry_change(parent, link_name);
             self.notify_inode(child.ino);
-            reply.entry(&self.entry_ttl, &attr, 0);
+            let (entry_ttl, _) = self.ttl_for_entry(&child);
+            reply.entry(&entry_ttl, &attr, 0);
             return;
         }
 
@@ -4790,11 +5015,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                             backend_key: Some(backend_key),
                         }),
                     );
-                    let child = self.ensure_child_entry(parent, link_name, stat, 1);
+                    let child =
+                        self.ensure_child_entry(parent, link_name, backend_bytes.clone(), stat, 1);
                     let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
                     self.notify_entry_change(parent, link_name);
                     self.notify_inode(child.ino);
-                    reply.entry(&self.entry_ttl, &attr, 0);
+                    let (entry_ttl, _) = self.ttl_for_entry(&child);
+                    reply.entry(&entry_ttl, &attr, 0);
                     return;
                 }
                 Err(err @ CoreError::AlreadyExists) => {
@@ -4938,9 +5165,10 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     backend_key: Some(backend_key),
                 }),
             );
-            let child = self.ensure_child_entry(parent, name, stat, 1);
+            let child = self.ensure_child_entry(parent, name, backend_bytes.clone(), stat, 1);
             let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
-            reply.entry(&self.entry_ttl, &attr, 0);
+            let (entry_ttl, _) = self.ttl_for_entry(&child);
+            reply.entry(&entry_ttl, &attr, 0);
             return;
         }
 
@@ -5049,9 +5277,11 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                             backend_key: Some(backend_key),
                         }),
                     );
-                    let child = self.ensure_child_entry(parent, name, stat, 1);
+                    let child =
+                        self.ensure_child_entry(parent, name, backend_bytes.clone(), stat, 1);
                     let attr = fuser_attr_from_core(core_attr_from_stat(&stat), child.ino);
-                    reply.entry(&self.entry_ttl, &attr, 0);
+                    let (entry_ttl, _) = self.ttl_for_entry(&child);
+                    reply.entry(&entry_ttl, &attr, 0);
                     return;
                 }
                 Err(err @ CoreError::AlreadyExists) => {
@@ -5195,6 +5425,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 ParentName {
                     parent: ino,
                     name: info.name.clone(),
+                    backend_name: info.backend_name.clone(),
                 },
                 0,
             );
@@ -5238,18 +5469,17 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             }
         };
 
-        let mut entries: Vec<(InodeId, OsString, FuserFileAttr)> = Vec::new();
-        entries.push((ino, OsString::from("."), dir_attr));
+        let mut entries: Vec<(InodeId, OsString, FuserFileAttr, Duration)> = Vec::new();
+        let (dot_ttl, _) = self.ttl_for_ino(ino);
+        entries.push((ino, OsString::from("."), dir_attr, dot_ttl));
         let parent_attr = self
             .inode_store
             .get(self.parent_ino_for(&dir_entry))
             .and_then(|p| self.attr_for_entry(&p).ok())
             .unwrap_or(dir_attr);
-        entries.push((
-            self.parent_ino_for(&dir_entry),
-            OsString::from(".."),
-            parent_attr,
-        ));
+        let parent_ino = self.parent_ino_for(&dir_entry);
+        let (dotdot_ttl, _) = self.ttl_for_ino(parent_ino);
+        entries.push((parent_ino, OsString::from(".."), parent_attr, dotdot_ttl));
 
         let dir_listing = match self.core.load_dir_entries_snapshot(&handle, true, offset) {
             Ok(v) => v,
@@ -5283,18 +5513,20 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 ParentName {
                     parent: ino,
                     name: info.name.clone(),
+                    backend_name: info.backend_name.clone(),
                 },
                 0,
             );
             let attr = fuser_attr_from_core(attr, child_entry.ino);
-            entries.push((child_entry.ino, info.name.clone(), attr));
+            let (entry_ttl, _) = self.ttl_for_entry(&child_entry);
+            entries.push((child_entry.ino, info.name.clone(), attr, entry_ttl));
         }
 
         let mut index = offset.max(0) as usize;
         while index < entries.len() {
-            let (child_ino, name, attr) = &entries[index];
+            let (child_ino, name, attr, entry_ttl) = &entries[index];
             let next = (index + 1) as i64;
-            if reply.add(*child_ino, next, name, &self.entry_ttl, attr, 0) {
+            if reply.add(*child_ino, next, name, entry_ttl, attr, 0) {
                 break;
             }
             index += 1;
@@ -5970,6 +6202,24 @@ mod tests {
     }
 
     #[test]
+    fn ttl_for_open_count_prefers_open_ttl_only_for_open_files() {
+        let base = Duration::from_secs(1);
+        let open = Duration::from_millis(50);
+        assert_eq!(
+            LongNameFsV2Fuser::ttl_for_open_count(base, open, true, 0),
+            base
+        );
+        assert_eq!(
+            LongNameFsV2Fuser::ttl_for_open_count(base, open, true, 1),
+            open
+        );
+        assert_eq!(
+            LongNameFsV2Fuser::ttl_for_open_count(base, open, false, 1),
+            base
+        );
+    }
+
+    #[test]
     fn dir_fd_name_index_tracks_parent_name_to_child_key() {
         let tmp = TempDir::new();
         fs::create_dir(tmp.path().join("a")).unwrap();
@@ -5980,6 +6230,7 @@ mod tests {
             Some(Duration::from_secs(60)),
             1024,
             IndexSync::Off,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             false,
             false,

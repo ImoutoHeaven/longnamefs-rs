@@ -30,6 +30,7 @@ pub enum InodeKind {
 pub struct ParentName {
     pub parent: InodeId,
     pub name: OsString,
+    pub backend_name: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,7 @@ pub struct InodeEntry {
     pub backend: BackendKey,
     pub parent: InodeId,
     pub name: OsString,
+    pub backend_name: Vec<u8>,
     pub parents: Vec<ParentName>,
     pub lookup_count: u64,
     pub open_count: u32,
@@ -95,6 +97,7 @@ impl InodeStore {
             backend,
             parent: ROOT_INODE,
             name: OsString::from("/"),
+            backend_name: Vec::new(),
             parents: Vec::new(),
             lookup_count: 1,
             open_count: 0,
@@ -205,6 +208,7 @@ impl InodeStore {
             backend,
             parent: parent.parent,
             name: parent.name.clone(),
+            backend_name: parent.backend_name.clone(),
             parents: vec![parent],
             lookup_count: lookup_inc,
             open_count: 0,
@@ -291,13 +295,16 @@ impl InodeStore {
         let mut shard = self.shard(ino).write();
         let entry = shard.entries.get_mut(&ino)?;
         let removing_primary = entry.parent == parent.parent && entry.name == parent.name;
-        entry.parents.retain(|p| p != parent);
+        entry
+            .parents
+            .retain(|p| !(p.parent == parent.parent && p.name == parent.name));
         if removing_primary {
             if let Some(new_primary) = entry.parents.first().cloned() {
                 Self::set_primary_parent(entry, &new_primary);
             } else if ino != ROOT_INODE {
                 entry.parent = ROOT_INODE;
                 entry.name = OsString::new();
+                entry.backend_name = Vec::new();
             }
         }
 
@@ -305,12 +312,18 @@ impl InodeStore {
     }
 
     fn push_parent(entry: &mut InodeEntry, parent: ParentName) {
-        if entry.parents.iter().any(|p| p == &parent) {
+        if let Some(existing) = entry
+            .parents
+            .iter_mut()
+            .find(|p| p.parent == parent.parent && p.name == parent.name)
+        {
+            existing.backend_name = parent.backend_name;
             return;
         }
         if entry.parents.is_empty() {
             entry.parent = parent.parent;
             entry.name = parent.name.clone();
+            entry.backend_name = parent.backend_name.clone();
         }
         entry.parents.push(parent);
     }
@@ -318,7 +331,13 @@ impl InodeStore {
     fn set_primary_parent(entry: &mut InodeEntry, parent: &ParentName) {
         entry.parent = parent.parent;
         entry.name = parent.name.clone();
-        if let Some(pos) = entry.parents.iter().position(|p| p == parent) {
+        entry.backend_name = parent.backend_name.clone();
+        if let Some(pos) = entry
+            .parents
+            .iter()
+            .position(|p| p.parent == parent.parent && p.name == parent.name)
+        {
+            entry.parents[pos].backend_name = parent.backend_name.clone();
             entry.parents.swap(0, pos);
         } else {
             entry.parents.insert(0, parent.clone());
@@ -347,6 +366,7 @@ mod tests {
             ParentName {
                 parent: ROOT_INODE,
                 name: OsString::from("old"),
+                backend_name: b"old".to_vec(),
             },
         );
         let child = store.lookup_or_create(
@@ -355,6 +375,7 @@ mod tests {
             ParentName {
                 parent: dir.ino,
                 name: OsString::from("file"),
+                backend_name: b"file".to_vec(),
             },
         );
 
@@ -375,6 +396,7 @@ mod tests {
             ParentName {
                 parent: ROOT_INODE,
                 name: OsString::from("old"),
+                backend_name: b"old".to_vec(),
             },
         );
         let child = store.lookup_or_create(
@@ -383,6 +405,7 @@ mod tests {
             ParentName {
                 parent: dir.ino,
                 name: OsString::from("file"),
+                backend_name: b"file".to_vec(),
             },
         );
 
@@ -391,6 +414,7 @@ mod tests {
             ParentName {
                 parent: ROOT_INODE,
                 name: OsString::from("new"),
+                backend_name: b"new".to_vec(),
             },
         );
 
@@ -398,6 +422,129 @@ mod tests {
         assert_eq!(
             store.get_path(child.ino).unwrap(),
             OsString::from("/new/file")
+        );
+    }
+
+    #[test]
+    fn get_or_insert_sets_backend_name() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let child = store.lookup_or_create(
+            BackendKey { dev: 1, ino: 2 },
+            InodeKind::File,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("x"),
+                backend_name: b"bx".to_vec(),
+            },
+        );
+        assert_eq!(child.backend_name, b"bx".to_vec());
+        assert_eq!(child.parents.len(), 1);
+        assert_eq!(child.parents[0].backend_name, b"bx".to_vec());
+    }
+
+    #[test]
+    fn move_entry_updates_backend_name() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let dir = store.lookup_or_create(
+            BackendKey { dev: 1, ino: 2 },
+            InodeKind::Directory,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("a"),
+                backend_name: b"ba".to_vec(),
+            },
+        );
+
+        let moved = store
+            .move_entry(
+                dir.ino,
+                ParentName {
+                    parent: ROOT_INODE,
+                    name: OsString::from("b"),
+                    backend_name: b"bb".to_vec(),
+                },
+            )
+            .unwrap();
+        assert_eq!(moved.backend_name, b"bb".to_vec());
+    }
+
+    #[test]
+    fn remove_parent_name_switches_primary_and_backend_name() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let file = store.lookup_or_create(
+            BackendKey { dev: 1, ino: 2 },
+            InodeKind::File,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("p1"),
+                backend_name: b"bp1".to_vec(),
+            },
+        );
+        let _ = store.add_parent_name(
+            file.ino,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("p2"),
+                backend_name: b"bp2".to_vec(),
+            },
+        );
+
+        let updated = store
+            .remove_parent_name(
+                file.ino,
+                &ParentName {
+                    parent: ROOT_INODE,
+                    name: OsString::from("p1"),
+                    backend_name: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.name, OsString::from("p2"));
+        assert_eq!(updated.backend_name, b"bp2".to_vec());
+    }
+
+    #[test]
+    fn multiple_parents_track_distinct_backend_names() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let file = store.lookup_or_create(
+            BackendKey { dev: 1, ino: 2 },
+            InodeKind::File,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("a"),
+                backend_name: b"ba".to_vec(),
+            },
+        );
+        let _ = store.add_parent_name(
+            file.ino,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("b"),
+                backend_name: b"bb".to_vec(),
+            },
+        );
+
+        let fetched = store.get(file.ino).unwrap();
+        assert_eq!(fetched.parents.len(), 2);
+        assert!(
+            fetched
+                .parents
+                .iter()
+                .any(|p| p.name == "a" && p.backend_name == b"ba".to_vec())
+        );
+        assert!(
+            fetched
+                .parents
+                .iter()
+                .any(|p| p.name == "b" && p.backend_name == b"bb".to_vec())
         );
     }
 }

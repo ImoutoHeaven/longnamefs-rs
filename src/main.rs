@@ -110,6 +110,11 @@ struct Cli {
     #[arg(long)]
     attr_ttl_ms: Option<u64>,
 
+    /// TTL for attr/entry replies of open regular files in milliseconds (v2 only).
+    /// Defaults to --attr-ttl-ms when omitted.
+    #[arg(long)]
+    open_ttl_ms: Option<u64>,
+
     /// Enable v2 passthrough IO (requires fuser abi-7-40 and kernel support).
     #[arg(long, default_value_t = false)]
     enable_passthrough: bool,
@@ -180,6 +185,10 @@ async fn main() -> anyhow::Result<()> {
         .attr_ttl_ms
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_secs(1));
+    let open_ttl = cli
+        .open_ttl_ms
+        .map(Duration::from_millis)
+        .unwrap_or(attr_ttl);
 
     let mut mount_opts = MountOptions::default();
     mount_opts.fs_name("longnamefs-rs");
@@ -216,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.max_write_kb,
                 cli.index_sync.into(),
                 attr_ttl,
+                open_ttl,
                 cli.enable_passthrough,
                 cli.enable_writeback_cache,
             )
