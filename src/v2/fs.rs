@@ -1271,10 +1271,6 @@ fn is_create_tmp_internal_name(name: &[u8]) -> bool {
     name.starts_with(CREATE_TMP_INTERNAL_PREFIX.as_bytes())
 }
 
-fn is_rename_tmp_internal_name(name: &[u8]) -> bool {
-    name.starts_with(RENAME_TMP_INTERNAL_PREFIX.as_bytes())
-}
-
 fn best_effort_remove_create_tmp_entry(dir_fd: BorrowedFd<'_>, name: &[u8]) {
     let c_name = match cstring_from_bytes(name) {
         Ok(v) => v,
@@ -1286,6 +1282,13 @@ fn best_effort_remove_create_tmp_entry(dir_fd: BorrowedFd<'_>, name: &[u8]) {
             let _ = unlinkat(dir_fd, c_name.as_c_str(), UnlinkatFlags::RemoveDir);
         }
         Err(_) => {}
+    }
+}
+
+fn is_missing_rawname_xattr(err: &CoreError) -> bool {
+    match err {
+        CoreError::Io(ioe) => matches!(ioe.raw_os_error(), Some(libc::ENODATA)),
+        _ => false,
     }
 }
 
@@ -1475,12 +1478,12 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
-                Err(_) => {
-                    best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
-                    continue;
-                }
+                Err(nix::errno::Errno::ENOENT) => continue,
+                Err(_) => continue,
             };
-            if get_internal_rawname(fd.as_fd()).is_err() {
+            if let Err(err) = get_internal_rawname(fd.as_fd())
+                && is_missing_rawname_xattr(&err)
+            {
                 best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
                 continue;
             }
@@ -1841,12 +1844,12 @@ fn list_logical_entries(
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
-                Err(_) => {
-                    best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
-                    continue;
-                }
+                Err(nix::errno::Errno::ENOENT) => continue,
+                Err(_) => continue,
             };
-            if get_internal_rawname(fd.as_fd()).is_err() {
+            if let Err(err) = get_internal_rawname(fd.as_fd())
+                && is_missing_rawname_xattr(&err)
+            {
                 best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
                 continue;
             }
