@@ -1257,6 +1257,22 @@ fn cstring_from_bytes(bytes: &[u8]) -> CoreResult<CString> {
     CString::new(bytes.to_vec()).map_err(|_| CoreError::from_errno(libc::EINVAL))
 }
 
+fn dup_cloexec(fd: BorrowedFd<'_>) -> CoreResult<OwnedFd> {
+    // `dup()` does not preserve `FD_CLOEXEC`, so explicitly set it to avoid leaking
+    // directory fds across `execve`.
+    //
+    // Note: `dup()` shares the open file description (including offsets). Today v2 treats
+    // these as "dirfd bases" (openat/fstatat), not as iterated `getdents` streams; if we
+    // later start iterating directly on these fds, keep this in mind.
+    let new_fd = nix::unistd::dup(fd).map_err(core_errno_from_nix)?;
+    nix::fcntl::fcntl(
+        new_fd.as_fd(),
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .map_err(core_errno_from_nix)?;
+    Ok(new_fd)
+}
+
 fn openat_nofollow_for_xattr(dir_fd: BorrowedFd<'_>, name: &CStr) -> CoreResult<OwnedFd> {
     nix::fcntl::openat(
         dir_fd,
@@ -3211,7 +3227,7 @@ impl LongNameFsV2Fuser {
     fn open_dir_handle(&self, entry: &InodeEntry) -> CoreResult<DirHandle> {
         if entry.ino == ROOT_INODE {
             let cached = self.core.cached_root_fd()?;
-            let fd = nix::unistd::dup(cached.as_fd()).map_err(core_errno_from_nix)?;
+            let fd = dup_cloexec(cached.as_fd())?;
             let index = load_dir_state(&self.core.index_cache, fd.as_fd())?;
             return Ok(DirHandle::new(fd, index));
         }
@@ -3226,7 +3242,7 @@ impl LongNameFsV2Fuser {
                 BackendName::Short(entry.backend_name.clone())
             };
             if let Ok(cached) = self.core.open_dir_cached(parent_dirfd.as_fd(), &backend)
-                && let Ok(fd) = nix::unistd::dup(cached.as_fd())
+                && let Ok(fd) = dup_cloexec(cached.as_fd())
             {
                 let index = load_dir_state(&self.core.index_cache, fd.as_fd())?;
                 return Ok(DirHandle::new(fd, index));
@@ -3238,7 +3254,7 @@ impl LongNameFsV2Fuser {
         let cached = self
             .core
             .open_dir_cached(mapped.dir_fd.as_fd(), &mapped.backend_name)?;
-        let fd = nix::unistd::dup(cached.as_fd()).map_err(core_errno_from_nix)?;
+        let fd = dup_cloexec(cached.as_fd())?;
         let index = load_dir_state(&self.core.index_cache, fd.as_fd())?;
         Ok(DirHandle::new(fd, index))
     }
