@@ -37,9 +37,9 @@ use nix::unistd::{
     Gid, LinkatFlags, Uid, UnlinkatFlags, faccessat, fchownat, fdatasync, fsync, linkat, symlinkat,
     unlinkat,
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::num::NonZeroU32;
@@ -49,7 +49,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -57,6 +57,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const PARALLEL_REBUILD_THRESHOLD: usize = 64;
 const PARALLEL_REBUILD_WORKERS: usize = 4;
+static TMP_INTERNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoreFileType {
@@ -95,6 +96,31 @@ fn core_string_to_cstring(value: &str) -> CoreResult<CString> {
 
 fn is_internal_meta(raw: &[u8]) -> bool {
     raw == INDEX_NAME.as_bytes() || raw == JOURNAL_NAME.as_bytes()
+}
+
+fn dir_is_only_ln2_meta(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
+    let mut dir = Dir::openat(
+        dir_fd,
+        ".",
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(core_errno_from_nix)?;
+    for entry in dir.iter() {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(err) => return Err(core_errno_from_nix(err)),
+        };
+        let name_bytes = entry.file_name().to_bytes();
+        if name_bytes.is_empty() || name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        if name_bytes == INDEX_NAME.as_bytes() || name_bytes == JOURNAL_NAME.as_bytes() {
+            continue;
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -285,7 +311,7 @@ impl DirCache {
         let Some(entry) = guard.entries.get_mut(&key) else {
             return;
         };
-        let mut vec = (*entry.entries).clone();
+        let vec = Arc::make_mut(&mut entry.entries);
         match op {
             CacheOp::Add(info) => {
                 if !vec.iter().any(|e| e.backend_name == info.backend_name) {
@@ -301,7 +327,6 @@ impl DirCache {
                 }
             }
         }
-        entry.entries = Arc::new(vec);
         entry.has_attrs = entry.entries.iter().all(|e| e.attr.is_some());
         entry.expires_at = Instant::now() + self.ttl;
         Self::touch_lru(&mut guard, key);
@@ -720,6 +745,18 @@ fn map_dirent_type(entry: &nix::dir::Entry) -> Option<CoreFileType> {
     })
 }
 
+#[derive(Default)]
+struct FlushWait {
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl std::fmt::Debug for FlushWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlushWait").finish()
+    }
+}
+
 #[derive(Debug)]
 struct IndexState {
     index: DirIndex,
@@ -729,6 +766,7 @@ struct IndexState {
     flushing: bool,
     journal_size_bytes: u64,
     journal_ops_since_compact: u64,
+    flush_wait: Arc<FlushWait>,
 }
 
 #[derive(Debug)]
@@ -778,21 +816,22 @@ impl IndexCache {
     }
 
     fn evict_if_needed(shard: &mut IndexCacheShard) {
-        while shard.entries.len() > INDEX_CACHE_MAX_DIRS_PER_SHARD {
-            if let Some(old) = shard.lru.pop_front() {
-                let can_drop = shard
-                    .entries
-                    .get(&old)
-                    .map(|entry| Arc::strong_count(&entry.value) == 1)
-                    .unwrap_or(true);
-                if can_drop {
-                    shard.entries.remove(&old);
-                    continue;
-                }
-                shard.lru.push_back(old);
+        let mut scanned = 0usize;
+        const MAX_SCAN: usize = 64;
+        while shard.entries.len() > INDEX_CACHE_MAX_DIRS_PER_SHARD && scanned < MAX_SCAN {
+            let Some(old) = shard.lru.pop_front() else {
                 break;
+            };
+            scanned += 1;
+            let can_drop = shard
+                .entries
+                .get(&old)
+                .map(|entry| Arc::strong_count(&entry.value) == 1)
+                .unwrap_or(true);
+            if can_drop {
+                shard.entries.remove(&old);
             } else {
-                break;
+                shard.lru.push_back(old);
             }
         }
     }
@@ -825,6 +864,7 @@ impl IndexCache {
             flushing: false,
             journal_size_bytes,
             journal_ops_since_compact,
+            flush_wait: Arc::new(FlushWait::default()),
         }));
 
         let mut guard = shard.lock();
@@ -890,6 +930,7 @@ impl DirHandle {
     }
 
     fn clear_cached_attrs(&self) {
+        *self.snapshot.lock() = None;
         self.state.write().attr_cache.clear();
     }
 }
@@ -986,24 +1027,38 @@ impl V2HandleTable {
 
     fn clear_dir_attr_cache(&self, key: DirCacheKey) {
         for shard in &self.shards {
-            let guard = shard.read();
-            for handle in guard.entries.values() {
-                if let Handle::Dir(dir) = handle
-                    && dir.cache_key == Some(key)
-                {
-                    dir.clear_cached_attrs();
-                }
+            let dirs: Vec<Arc<DirHandle>> = {
+                let guard = shard.read();
+                guard
+                    .entries
+                    .values()
+                    .filter_map(|handle| match handle {
+                        Handle::Dir(dir) if dir.cache_key == Some(key) => Some(dir.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            for dir in dirs {
+                dir.clear_cached_attrs();
             }
         }
     }
 
     fn clear_all_dir_attr_cache(&self) {
         for shard in &self.shards {
-            let guard = shard.read();
-            for handle in guard.entries.values() {
-                if let Handle::Dir(dir) = handle {
-                    dir.clear_cached_attrs();
-                }
+            let dirs: Vec<Arc<DirHandle>> = {
+                let guard = shard.read();
+                guard
+                    .entries
+                    .values()
+                    .filter_map(|handle| match handle {
+                        Handle::Dir(dir) => Some(dir.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            for dir in dirs {
+                dir.clear_cached_attrs();
             }
         }
     }
@@ -1041,7 +1096,7 @@ impl PassthroughHandleTable {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BackendName {
     Short(Vec<u8>),
     Internal(Vec<u8>),
@@ -1200,6 +1255,31 @@ fn cstring_from_bytes(bytes: &[u8]) -> CoreResult<CString> {
     CString::new(bytes.to_vec()).map_err(|_| CoreError::from_errno(libc::EINVAL))
 }
 
+fn openat_nofollow_for_xattr(dir_fd: BorrowedFd<'_>, name: &CStr) -> CoreResult<OwnedFd> {
+    nix::fcntl::openat(
+        dir_fd,
+        name,
+        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(core_errno_from_nix)
+}
+
+fn select_tmp_internal_name(dir_fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
+    for _ in 0..256 {
+        let n = TMP_INTERNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("{INTERNAL_PREFIX}tmp_{n:x}");
+        let bytes = candidate.into_bytes();
+        let c = cstring_from_bytes(&bytes)?;
+        match fstatat(dir_fd, c.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(_) => continue,
+            Err(nix::errno::Errno::ENOENT) => return Ok(bytes),
+            Err(err) => return Err(core_errno_from_nix(err)),
+        }
+    }
+    Err(CoreError::NoSpace)
+}
+
 fn set_internal_rawname(fd: BorrowedFd<'_>, raw: &[u8]) -> CoreResult<()> {
     let name = CString::new(RAWNAME_XATTR.as_bytes()).unwrap();
     let res = unsafe {
@@ -1340,7 +1420,7 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
             let fd = match nix::fcntl::openat(
                 dir_fd,
                 c_name.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
@@ -1355,28 +1435,26 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
         return Ok(index);
     }
 
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let (res_tx, res_rx) = mpsc::channel::<(Vec<u8>, Vec<u8>)>();
     let workers = PARALLEL_REBUILD_WORKERS.max(1);
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(Vec<u8>, Vec<u8>)>> = Mutex::new(Vec::new());
 
     thread::scope(|scope| {
-        let shared_rx = Arc::new(Mutex::new(rx));
         for _ in 0..workers {
-            let rx = Arc::clone(&shared_rx);
-            let res_tx = res_tx.clone();
             let dup_fd = match nix::unistd::dup(dir_fd) {
                 Ok(fd) => fd,
                 Err(_) => continue,
             };
+            let internal = &internal;
+            let next = &next;
+            let results = &results;
             scope.spawn(move || {
                 loop {
-                    let name_bytes = {
-                        let guard = rx.lock();
-                        match guard.recv() {
-                            Ok(v) => v,
-                            Err(_) => break,
-                        }
-                    };
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= internal.len() {
+                        break;
+                    }
+                    let name_bytes = internal[idx].clone();
                     let c_name = match cstring_from_bytes(&name_bytes) {
                         Ok(v) => v,
                         Err(_) => continue,
@@ -1384,7 +1462,7 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
                     let fd = match nix::fcntl::openat(
                         dup_fd.as_fd(),
                         c_name.as_c_str(),
-                        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                         Mode::empty(),
                     ) {
                         Ok(fd) => fd,
@@ -1394,19 +1472,13 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let _ = res_tx.send((name_bytes, raw_name));
+                    results.lock().push((name_bytes, raw_name));
                 }
             });
         }
-
-        for name in internal {
-            let _ = tx.send(name);
-        }
-        drop(tx);
     });
-    drop(res_tx);
 
-    for (backend_name, raw_name) in res_rx {
+    for (backend_name, raw_name) in results.into_inner() {
         index.upsert(backend_name, raw_name);
     }
     index.clear_pending_ops();
@@ -1429,13 +1501,29 @@ fn mark_dirty(state: &mut DirState) {
     guard.pending = guard.pending.saturating_add(1);
 }
 
+fn rollback_dir_index_entry(state: &mut DirState, backend_name: &[u8]) {
+    state.attr_cache.remove(backend_name);
+    let mut guard = state.index.write();
+    if guard.index.remove(backend_name).is_some() {
+        guard.pending = guard.pending.saturating_add(1);
+    }
+}
+
+fn best_effort_unlinkat_file(dir_fd: BorrowedFd<'_>, name: &CStr) {
+    let _ = unlinkat(dir_fd, name, UnlinkatFlags::NoRemoveDir);
+}
+
+fn best_effort_unlinkat_dir(dir_fd: BorrowedFd<'_>, name: &CStr) {
+    let _ = unlinkat(dir_fd, name, UnlinkatFlags::RemoveDir);
+}
+
 fn maybe_flush_index(
     dir_fd: BorrowedFd<'_>,
     state: &mut DirState,
     strategy: IndexSync,
     force_sync: bool,
 ) -> CoreResult<()> {
-    let mut backoff_us = 0u64;
+    let flush_wait = { state.index.read().flush_wait.clone() };
     loop {
         let plan = {
             let mut guard = state.index.write();
@@ -1487,12 +1575,9 @@ fn maybe_flush_index(
         };
 
         let Some(plan) = plan else {
-            if backoff_us == 0 {
-                backoff_us = 50;
-                thread::yield_now();
-            } else {
-                thread::sleep(Duration::from_micros(backoff_us));
-                backoff_us = (backoff_us.saturating_mul(2)).min(1000);
+            let mut wait_guard = flush_wait.lock.lock();
+            while state.index.read().flushing {
+                flush_wait.cv.wait(&mut wait_guard);
             }
             continue;
         };
@@ -1575,6 +1660,7 @@ fn maybe_flush_index(
                 .and_then(|fd| fstat(fd.as_fd()).ok())
                 .map(|st| st.st_size as u64);
 
+            let wait_guard = flush_wait.lock.lock();
             let mut guard = state.index.write();
             guard.index.extend_pending_ops(restore_ops);
             if let Some(size) = journal_size_on_err {
@@ -1582,10 +1668,14 @@ fn maybe_flush_index(
             }
             guard.journal_file = None;
             guard.flushing = false;
+            drop(guard);
+            flush_wait.cv.notify_all();
+            drop(wait_guard);
             return Err(err);
         }
         let (journal_size_bytes, journal_ops_since_compact, journal_file) = flush_res.unwrap();
 
+        let wait_guard = flush_wait.lock.lock();
         let mut guard = state.index.write();
         if guard.pending == pending_before {
             guard.index.clear_dirty();
@@ -1599,6 +1689,9 @@ fn maybe_flush_index(
         guard.journal_ops_since_compact = journal_ops_since_compact;
         guard.journal_file = journal_file;
         guard.flushing = false;
+        drop(guard);
+        flush_wait.cv.notify_all();
+        drop(wait_guard);
         return Ok(());
     }
 }
@@ -1731,7 +1824,7 @@ fn list_logical_entries(
         let fd = match nix::fcntl::openat(
             dir_fd,
             c_name.as_c_str(),
-            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
@@ -1862,7 +1955,7 @@ fn map_long_for_lookup(
                 let fd = nix::fcntl::openat(
                     dir_fd,
                     c_name.as_c_str(),
-                    OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                    OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                     Mode::empty(),
                 )
                 .map_err(core_errno_from_nix)?;
@@ -1997,7 +2090,7 @@ fn handle_backend_eexist_index_missing(
     let fd = nix::fcntl::openat(
         dir_fd,
         c_name.as_c_str(),
-        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
     )
     .map_err(core_errno_from_nix)?;
@@ -2025,7 +2118,7 @@ fn refresh_dir_index_from_backend(
     let fd = nix::fcntl::openat(
         dir_fd,
         c_name.as_c_str(),
-        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
     )
     .map_err(core_errno_from_nix)?;
@@ -2206,46 +2299,48 @@ impl LongNameFsCore {
         &self,
         handle: &Arc<DirHandle>,
         need_attr: bool,
-    ) -> Arc<Vec<DirEntryInfo>> {
+    ) -> CoreResult<Arc<Vec<DirEntryInfo>>> {
         let key = dir_cache_key(handle.as_fd());
         if let Some(cache_key) = key
             && let Some(hit) = self.dir_cache.get(cache_key)
             && (!need_attr || hit.has_attrs)
         {
-            return hit.entries;
+            return Ok(hit.entries);
         }
 
-        let logical = list_logical_entries(handle, self.max_name_len, self.index_sync, need_attr)
-            .unwrap_or_default();
+        let logical = list_logical_entries(handle, self.max_name_len, self.index_sync, need_attr)?;
         let has_attrs = logical.iter().all(|e| e.attr.is_some());
         if let Some(cache_key) = key {
-            return self.dir_cache.insert(cache_key, logical, has_attrs);
+            return Ok(self.dir_cache.insert(cache_key, logical, has_attrs));
         }
-        Arc::new(logical)
+        Ok(Arc::new(logical))
     }
 
     pub(crate) fn load_dir_entries_snapshot(
         &self,
         handle: &Arc<DirHandle>,
         need_attr: bool,
-    ) -> Arc<Vec<DirEntryInfo>> {
-        {
+        offset: i64,
+    ) -> CoreResult<Arc<Vec<DirEntryInfo>>> {
+        if offset <= 0 {
+            *handle.snapshot.lock() = None;
+        } else {
             let guard = handle.snapshot.lock();
             if let Some(snapshot) = guard.as_ref()
                 && (!need_attr || snapshot.has_attrs)
             {
-                return snapshot.entries.clone();
+                return Ok(snapshot.entries.clone());
             }
         }
 
-        let entries = self.load_dir_entries(handle, need_attr);
+        let entries = self.load_dir_entries(handle, need_attr)?;
         let snapshot = DirSnapshot {
             entries: entries.clone(),
             has_attrs: entries.iter().all(|e| e.attr.is_some()),
         };
         let mut guard = handle.snapshot.lock();
         *guard = Some(snapshot);
-        entries
+        Ok(entries)
     }
 
     pub(crate) fn stat_path(&self, path: &OsStr) -> CoreResult<CoreFileAttr> {
@@ -2540,17 +2635,73 @@ impl LongNameFsCore {
         flags: u32,
     ) -> CoreResult<DirInvalidation> {
         let src_backend = src.path.backend_name.as_ref().ok_or(CoreError::NotFound)?;
+        if flags == libc::RENAME_NOREPLACE
+            && dst.path.exists
+            && !(src.path.parent_key == dst.path.parent_key
+                && dst.path.backend_name.as_ref() == Some(src_backend))
+        {
+            return Err(CoreError::AlreadyExists);
+        }
         let same_dir = src.path.parent_key == dst.path.parent_key;
         let mut dst_internal = {
             let mut guard = dst.ctx.state.index.write();
             select_backend_for_long_name(&mut guard.index, &dst.path.logical_name)?
         };
 
+        let src_c = src_backend.as_cstring()?;
+        let src_fd = openat_nofollow_for_xattr(src.ctx.dir_fd.as_fd(), src_c.as_c_str())?;
+        let old_raw =
+            get_internal_rawname(src_fd.as_fd()).unwrap_or_else(|_| src.path.logical_name.clone());
+
+        let tmp_internal = select_tmp_internal_name(dst.ctx.dir_fd.as_fd())?;
+        let tmp_backend = BackendName::Internal(tmp_internal.clone());
+        let tmp_flags = if self.supports_renameat2 {
+            libc::RENAME_NOREPLACE
+        } else {
+            0
+        };
+        self.do_backend_rename(
+            src.ctx.dir_fd.as_fd(),
+            src_backend,
+            dst.ctx.dir_fd.as_fd(),
+            &tmp_backend,
+            tmp_flags,
+        )?;
+
+        let tmp_c = tmp_backend.as_cstring()?;
+        let tmp_fd = openat_nofollow_for_xattr(dst.ctx.dir_fd.as_fd(), tmp_c.as_c_str())?;
+        if let Err(err) = set_internal_rawname(tmp_fd.as_fd(), &dst.path.logical_name) {
+            if self.supports_renameat2 {
+                let _ = self.do_backend_rename(
+                    dst.ctx.dir_fd.as_fd(),
+                    &tmp_backend,
+                    src.ctx.dir_fd.as_fd(),
+                    src_backend,
+                    libc::RENAME_NOREPLACE,
+                );
+            } else if fstatat(
+                src.ctx.dir_fd.as_fd(),
+                src_c.as_c_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .is_err()
+            {
+                let _ = self.do_backend_rename(
+                    dst.ctx.dir_fd.as_fd(),
+                    &tmp_backend,
+                    src.ctx.dir_fd.as_fd(),
+                    src_backend,
+                    0,
+                );
+            }
+            return Err(err);
+        }
+
         let mut attempt = 0;
         loop {
             let res = self.do_backend_rename(
-                src.ctx.dir_fd.as_fd(),
-                src_backend,
+                dst.ctx.dir_fd.as_fd(),
+                &tmp_backend,
                 dst.ctx.dir_fd.as_fd(),
                 &BackendName::Internal(dst_internal.clone()),
                 flags,
@@ -2559,6 +2710,7 @@ impl LongNameFsCore {
                 Ok(()) => break,
                 Err(err @ CoreError::AlreadyExists) => {
                     if attempt > 0 {
+                        let _ = set_internal_rawname(tmp_fd.as_fd(), &old_raw);
                         return Err(err);
                     }
                     let raw =
@@ -2572,19 +2724,35 @@ impl LongNameFsCore {
                     }
                     attempt += 1;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    let _ = set_internal_rawname(tmp_fd.as_fd(), &old_raw);
+                    if self.supports_renameat2 {
+                        let _ = self.do_backend_rename(
+                            dst.ctx.dir_fd.as_fd(),
+                            &tmp_backend,
+                            src.ctx.dir_fd.as_fd(),
+                            src_backend,
+                            libc::RENAME_NOREPLACE,
+                        );
+                    } else if fstatat(
+                        src.ctx.dir_fd.as_fd(),
+                        src_c.as_c_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    )
+                    .is_err()
+                    {
+                        let _ = self.do_backend_rename(
+                            dst.ctx.dir_fd.as_fd(),
+                            &tmp_backend,
+                            src.ctx.dir_fd.as_fd(),
+                            src_backend,
+                            0,
+                        );
+                    }
+                    return Err(err);
+                }
             }
         }
-
-        let dst_c = BackendName::Internal(dst_internal.clone()).as_cstring()?;
-        let dst_fd = nix::fcntl::openat(
-            dst.ctx.dir_fd.as_fd(),
-            dst_c.as_c_str(),
-            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(core_errno_from_nix)?;
-        set_internal_rawname(dst_fd.as_fd(), &dst.path.logical_name)?;
 
         let src_backend_name = src_backend.display_bytes();
         if same_dir {
@@ -2623,19 +2791,71 @@ impl LongNameFsCore {
         }
         src.ctx.state.attr_cache.clear();
         dst.ctx.state.attr_cache.clear();
-        maybe_flush_index(
+        if let Err(err) = maybe_flush_index(
             src.ctx.dir_fd.as_fd(),
             &mut src.ctx.state,
             self.index_sync,
             false,
-        )?;
-        if src.path.parent_key != dst.path.parent_key {
-            maybe_flush_index(
+        ) {
+            if self.supports_renameat2 {
+                let _ = self.do_backend_rename(
+                    dst.ctx.dir_fd.as_fd(),
+                    &BackendName::Internal(dst_internal.clone()),
+                    src.ctx.dir_fd.as_fd(),
+                    src_backend,
+                    libc::RENAME_NOREPLACE,
+                );
+            } else if fstatat(
+                src.ctx.dir_fd.as_fd(),
+                src_c.as_c_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .is_err()
+            {
+                let _ = self.do_backend_rename(
+                    dst.ctx.dir_fd.as_fd(),
+                    &BackendName::Internal(dst_internal.clone()),
+                    src.ctx.dir_fd.as_fd(),
+                    src_backend,
+                    0,
+                );
+            }
+            let _ = set_internal_rawname(tmp_fd.as_fd(), &old_raw);
+            return Err(err);
+        }
+        if src.path.parent_key != dst.path.parent_key
+            && let Err(err) = maybe_flush_index(
                 dst.ctx.dir_fd.as_fd(),
                 &mut dst.ctx.state,
                 self.index_sync,
                 false,
-            )?;
+            )
+        {
+            if self.supports_renameat2 {
+                let _ = self.do_backend_rename(
+                    dst.ctx.dir_fd.as_fd(),
+                    &BackendName::Internal(dst_internal.clone()),
+                    src.ctx.dir_fd.as_fd(),
+                    src_backend,
+                    libc::RENAME_NOREPLACE,
+                );
+            } else if fstatat(
+                src.ctx.dir_fd.as_fd(),
+                src_c.as_c_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .is_err()
+            {
+                let _ = self.do_backend_rename(
+                    dst.ctx.dir_fd.as_fd(),
+                    &BackendName::Internal(dst_internal.clone()),
+                    src.ctx.dir_fd.as_fd(),
+                    src_backend,
+                    0,
+                );
+            }
+            let _ = set_internal_rawname(tmp_fd.as_fd(), &old_raw);
+            return Err(err);
         }
         let inv = DirInvalidation::for_move(src.path.parent_key, dst.path.parent_key);
         self.invalidate_dirs(&inv);
@@ -3289,16 +3509,18 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                         let fd = match nix::fcntl::openat(
                             ctx.dir_fd.as_fd(),
                             fname.as_c_str(),
-                            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                             Mode::empty(),
                         ) {
                             Ok(fd) => fd,
                             Err(err) => {
+                                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                                 reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                                 return;
                             }
                         };
                         if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                             reply.error(core_err_to_errno(&err));
                             return;
                         }
@@ -3322,6 +3544,16 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     ) {
                         Ok(st) => st,
                         Err(err) => {
+                            if matches!(backend.1, SegmentKind::Long) {
+                                rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
+                                let _ = maybe_flush_index(
+                                    ctx.dir_fd.as_fd(),
+                                    &mut ctx.state,
+                                    IndexSync::Always,
+                                    false,
+                                );
+                            }
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                             reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                             return;
                         }
@@ -3468,6 +3700,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 Ok(fd) => {
                     if matches!(backend.1, SegmentKind::Long) {
                         if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                             reply.error(core_err_to_errno(&err));
                             return;
                         }
@@ -3487,6 +3720,16 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                     let stat = match fstat(fd.as_fd()) {
                         Ok(st) => st,
                         Err(err) => {
+                            if matches!(backend.1, SegmentKind::Long) {
+                                rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
+                                let _ = maybe_flush_index(
+                                    ctx.dir_fd.as_fd(),
+                                    &mut ctx.state,
+                                    IndexSync::Always,
+                                    false,
+                                );
+                            }
+                            best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                             reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                             return;
                         }
@@ -3960,35 +4203,41 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             UnlinkatFlags::RemoveDir,
         ) {
             Ok(()) => Ok(()),
-            Err(nix::errno::Errno::ENOTEMPTY) => {
-                if let Ok(target_dir_fd) = nix::fcntl::openat(
+            Err(nix::errno::Errno::ENOTEMPTY) => (|| {
+                let target_dir_fd = nix::fcntl::openat(
                     ctx.dir_fd.as_fd(),
                     fname.as_c_str(),
                     OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
                     Mode::empty(),
-                ) {
-                    if let Ok(index_cstr) = string_to_cstring(INDEX_NAME) {
-                        let _ = unlinkat(
-                            target_dir_fd.as_fd(),
-                            index_cstr.as_c_str(),
-                            UnlinkatFlags::NoRemoveDir,
-                        );
-                    }
-                    if let Ok(journal_cstr) = string_to_cstring(JOURNAL_NAME) {
-                        let _ = unlinkat(
-                            target_dir_fd.as_fd(),
-                            journal_cstr.as_c_str(),
-                            UnlinkatFlags::NoRemoveDir,
-                        );
-                    }
+                )
+                .map_err(core_errno_from_nix)?;
+
+                if !dir_is_only_ln2_meta(target_dir_fd.as_fd())? {
+                    return Err(CoreError::from_errno(libc::ENOTEMPTY));
                 }
+
+                if let Ok(index_cstr) = string_to_cstring(INDEX_NAME) {
+                    let _ = unlinkat(
+                        target_dir_fd.as_fd(),
+                        index_cstr.as_c_str(),
+                        UnlinkatFlags::NoRemoveDir,
+                    );
+                }
+                if let Ok(journal_cstr) = string_to_cstring(JOURNAL_NAME) {
+                    let _ = unlinkat(
+                        target_dir_fd.as_fd(),
+                        journal_cstr.as_c_str(),
+                        UnlinkatFlags::NoRemoveDir,
+                    );
+                }
+
                 unlinkat(
                     ctx.dir_fd.as_fd(),
                     fname.as_c_str(),
                     UnlinkatFlags::RemoveDir,
                 )
                 .map_err(core_errno_from_nix)
-            }
+            })(),
             Err(err) => Err(core_errno_from_nix(err)),
         };
         if let Err(err) = removal {
@@ -4084,16 +4333,18 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             let fd = match nix::fcntl::openat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
                 Err(err) => {
+                    best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                     reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                     return;
                 }
             };
             if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                 reply.error(core_err_to_errno(&err));
                 return;
             }
@@ -4117,6 +4368,16 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         ) {
             Ok(st) => st,
             Err(err) => {
+                if matches!(kind, SegmentKind::Long) {
+                    rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
+                    let _ = maybe_flush_index(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        IndexSync::Always,
+                        false,
+                    );
+                }
+                best_effort_unlinkat_file(ctx.dir_fd.as_fd(), fname.as_c_str());
                 reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                 return;
             }
@@ -4203,16 +4464,18 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             let fd = match nix::fcntl::openat(
                 ctx.dir_fd.as_fd(),
                 fname.as_c_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
                 Err(err) => {
+                    best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), fname.as_c_str());
                     reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                     return;
                 }
             };
             if let Err(err) = set_internal_rawname(fd.as_fd(), &raw) {
+                best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), fname.as_c_str());
                 reply.error(core_err_to_errno(&err));
                 return;
             }
@@ -4236,6 +4499,16 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         ) {
             Ok(st) => st,
             Err(err) => {
+                if matches!(kind, SegmentKind::Long) {
+                    rollback_dir_index_entry(&mut ctx.state, &backend_bytes);
+                    let _ = maybe_flush_index(
+                        ctx.dir_fd.as_fd(),
+                        &mut ctx.state,
+                        IndexSync::Always,
+                        false,
+                    );
+                }
+                best_effort_unlinkat_dir(ctx.dir_fd.as_fd(), fname.as_c_str());
                 reply.error(core_err_to_errno(&core_errno_from_nix(err)));
                 return;
             }
@@ -4312,7 +4585,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             .unwrap_or(FuserFileType::Directory);
         entries.push((parent_ino, parent_kind, OsString::from("..")));
 
-        let dir_listing = self.core.load_dir_entries_snapshot(&handle, false);
+        let dir_listing = match self.core.load_dir_entries_snapshot(&handle, false, offset) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
         for info in dir_listing.iter() {
             let mut backend_key = info.backend_key;
             let mut kind = Some(info.kind);
@@ -4397,7 +4676,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             parent_attr,
         ));
 
-        let dir_listing = self.core.load_dir_entries_snapshot(&handle, true);
+        let dir_listing = match self.core.load_dir_entries_snapshot(&handle, true, offset) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
         for info in dir_listing.iter() {
             let (attr, backend_key) = match (info.attr, info.backend_key) {
                 (Some(attr), Some(backend)) => (attr, backend),
@@ -5091,6 +5376,7 @@ mod tests {
                 flushing: false,
                 journal_size_bytes: 0,
                 journal_ops_since_compact: 0,
+                flush_wait: Arc::new(FlushWait::default()),
             })),
             attr_cache: HashMap::new(),
         };

@@ -3,6 +3,7 @@
 use crate::util::{core_begin_temp_file, core_sync_and_commit, retry_eintr};
 use crate::v2::error::{CoreError, CoreResult};
 use nix::sys::stat::fstat;
+use nix::unistd::ftruncate;
 use nix::unistd::write;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -155,9 +156,17 @@ fn read_index_bytes(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<Vec<u8>>> {
         Err(err) => return Err(CoreError::from(err)),
     };
 
-    let mut file = std::fs::File::from(fd);
+    let size = fstat(fd.as_fd())
+        .map(|st| st.st_size as u64)
+        .unwrap_or(MAX_INDEX_BYTES as u64 + 1);
+    if size > MAX_INDEX_BYTES as u64 {
+        return Ok(None);
+    }
+
+    let file = std::fs::File::from(fd);
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).map_err(CoreError::from)?;
+    let mut limited = file.take((MAX_INDEX_BYTES + 1) as u64);
+    limited.read_to_end(&mut buf).map_err(CoreError::from)?;
     if buf.len() > MAX_INDEX_BYTES {
         return Ok(None);
     }
@@ -229,9 +238,13 @@ fn decode_index_bytes(bytes: &[u8]) -> Option<DirIndex> {
     match &bytes[..MAGIC.len()] {
         magic if magic == MAGIC => decode_plain_index(bytes),
         magic if magic == MAGIC_ZSTD => {
-            let mut decoder = ZstdDecoder::new(&bytes[MAGIC_ZSTD.len()..]).ok()?;
+            let decoder = ZstdDecoder::new(&bytes[MAGIC_ZSTD.len()..]).ok()?;
             let mut decoded = Vec::new();
-            decoder.read_to_end(&mut decoded).ok()?;
+            let mut limited = decoder.take((MAX_INDEX_BYTES + 1) as u64);
+            limited.read_to_end(&mut decoded).ok()?;
+            if decoded.len() > MAX_INDEX_BYTES {
+                return None;
+            }
             // Only decode the decompressed payload as a plain index to avoid recursive
             // LN2Z nesting from untrusted/corrupt files.
             decode_plain_index(&decoded)
@@ -252,58 +265,101 @@ fn read_journal_bytes(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<(Vec<u8>, u64
         Err(err) => return Err(CoreError::from(err)),
     };
     let size = fstat(fd.as_fd()).map(|st| st.st_size as u64).unwrap_or(0);
-    let mut file = std::fs::File::from(fd);
+    if size > JOURNAL_MAX_BYTES {
+        return Ok(Some((Vec::new(), size)));
+    }
+    let file = std::fs::File::from(fd);
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).map_err(CoreError::from)?;
+    let mut limited = file.take(JOURNAL_MAX_BYTES + 1);
+    limited.read_to_end(&mut buf).map_err(CoreError::from)?;
+    if buf.len() as u64 > JOURNAL_MAX_BYTES {
+        return Ok(Some((Vec::new(), size)));
+    }
     Ok(Some((buf, size)))
 }
 
-fn decode_journal(bytes: &[u8]) -> CoreResult<Vec<JournalOp>> {
-    let mut ops = Vec::new();
+#[derive(Debug, Default)]
+struct JournalDecodeResult {
+    ops: Vec<JournalOp>,
+    truncate_to: Option<usize>,
+    corrupted: bool,
+}
+
+fn decode_journal_tolerant(bytes: &[u8]) -> JournalDecodeResult {
+    let mut out = JournalDecodeResult::default();
     let mut offset = 0usize;
 
+    let read_u32 = |buf: &[u8], off: &mut usize| -> Option<u32> {
+        if buf.len() < *off + 4 {
+            return None;
+        }
+        let val = u32::from_le_bytes(buf[*off..*off + 4].try_into().ok()?);
+        *off += 4;
+        Some(val)
+    };
+
     while offset < bytes.len() {
+        let record_start = offset;
         let Some(op_type) = bytes.get(offset).copied() else {
-            return Err(CoreError::from_errno(libc::EILSEQ));
+            out.truncate_to = Some(record_start);
+            break;
         };
         offset += 1;
-        let read_u32 = |buf: &[u8], off: &mut usize| -> Option<u32> {
-            if buf.len() < *off + 4 {
-                return None;
-            }
-            let val = u32::from_le_bytes(buf[*off..*off + 4].try_into().ok()?);
-            *off += 4;
-            Some(val)
+
+        let Some(key_len) = read_u32(bytes, &mut offset).map(|v| v as usize) else {
+            out.truncate_to = Some(record_start);
+            break;
         };
-        let key_len =
-            read_u32(bytes, &mut offset).ok_or(CoreError::from_errno(libc::EILSEQ))? as usize;
         if bytes.len() < offset + key_len {
-            return Err(CoreError::from_errno(libc::EILSEQ));
+            out.truncate_to = Some(record_start);
+            break;
         }
         let key = bytes[offset..offset + key_len].to_vec();
         offset += key_len;
 
-        let val_len =
-            read_u32(bytes, &mut offset).ok_or(CoreError::from_errno(libc::EILSEQ))? as usize;
-        if op_type == 0 || op_type > 2 {
-            return Err(CoreError::from_errno(libc::EILSEQ));
-        }
-        if op_type == 1 {
-            if bytes.len() < offset + val_len {
-                return Err(CoreError::from_errno(libc::EILSEQ));
+        let Some(val_len) = read_u32(bytes, &mut offset).map(|v| v as usize) else {
+            out.truncate_to = Some(record_start);
+            break;
+        };
+
+        match op_type {
+            1 => {
+                if bytes.len() < offset + val_len {
+                    out.truncate_to = Some(record_start);
+                    break;
+                }
+                let val = bytes[offset..offset + val_len].to_vec();
+                offset += val_len;
+                out.ops.push(JournalOp::Upsert(key, val));
             }
-            let val = bytes[offset..offset + val_len].to_vec();
-            offset += val_len;
-            ops.push(JournalOp::Upsert(key, val));
-        } else {
-            if val_len != 0 {
-                return Err(CoreError::from_errno(libc::EILSEQ));
+            2 => {
+                if val_len != 0 {
+                    out.truncate_to = Some(record_start);
+                    out.corrupted = true;
+                    break;
+                }
+                out.ops.push(JournalOp::Remove(key));
             }
-            ops.push(JournalOp::Remove(key));
+            _ => {
+                out.truncate_to = Some(record_start);
+                out.corrupted = true;
+                break;
+            }
         }
     }
 
-    Ok(ops)
+    out
+}
+
+fn truncate_journal(dir_fd: BorrowedFd<'_>, truncate_to: usize) -> CoreResult<()> {
+    let fd = nix::fcntl::openat(
+        dir_fd,
+        JOURNAL_NAME_CSTR,
+        nix::fcntl::OFlag::O_WRONLY | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(CoreError::from)?;
+    ftruncate(fd.as_fd(), truncate_to as i64).map_err(CoreError::from)
 }
 
 pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<IndexLoadResult>> {
@@ -342,12 +398,20 @@ pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<IndexLoadResu
         None => return Ok(None),
     };
 
-    let ops = decode_journal(&journal)?;
-    for op in &ops {
-        match op {
-            JournalOp::Upsert(k, v) => index.upsert(k.clone(), v.clone()),
-            JournalOp::Remove(k) => {
-                index.remove(k);
+    let decoded = decode_journal_tolerant(&journal);
+    if decoded.corrupted {
+        let _ = reset_journal(dir_fd);
+    } else if let Some(truncate_to) = decoded.truncate_to {
+        let _ = truncate_journal(dir_fd, truncate_to);
+    }
+
+    if !decoded.corrupted {
+        for op in &decoded.ops {
+            match op {
+                JournalOp::Upsert(k, v) => index.upsert(k.clone(), v.clone()),
+                JournalOp::Remove(k) => {
+                    index.remove(k);
+                }
             }
         }
     }
@@ -357,7 +421,7 @@ pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<IndexLoadResu
     Ok(Some(IndexLoadResult {
         index,
         journal_size,
-        journal_ops_since_compact: ops.len() as u64,
+        journal_ops_since_compact: decoded.ops.len() as u64,
     }))
 }
 
