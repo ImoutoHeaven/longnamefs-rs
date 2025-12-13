@@ -3209,21 +3209,36 @@ impl LongNameFsV2Fuser {
     }
 
     fn open_dir_handle(&self, entry: &InodeEntry) -> CoreResult<DirHandle> {
-        let path = self.entry_path(entry)?;
-        if entry.ino == ROOT_INODE || path == OsStr::new("/") {
-            let fd = open_backend_root(&self.core.config)?;
+        if entry.ino == ROOT_INODE {
+            let cached = self.core.cached_root_fd()?;
+            let fd = nix::unistd::dup(cached.as_fd()).map_err(core_errno_from_nix)?;
             let index = load_dir_state(&self.core.index_cache, fd.as_fd())?;
             return Ok(DirHandle::new(fd, index));
         }
+
+        if !entry.backend_name.is_empty()
+            && let Some(parent_entry) = self.inode_store.get(entry.parent)
+            && let Some(parent_dirfd) = self.core.try_dir_fd_by_backend_key(parent_entry.backend)
+        {
+            let backend = if entry.backend_name.starts_with(INTERNAL_PREFIX.as_bytes()) {
+                BackendName::Internal(entry.backend_name.clone())
+            } else {
+                BackendName::Short(entry.backend_name.clone())
+            };
+            if let Ok(cached) = self.core.open_dir_cached(parent_dirfd.as_fd(), &backend)
+                && let Ok(fd) = nix::unistd::dup(cached.as_fd())
+            {
+                let index = load_dir_state(&self.core.index_cache, fd.as_fd())?;
+                return Ok(DirHandle::new(fd, index));
+            }
+        }
+
+        let path = self.entry_path(entry)?;
         let mapped = self.core.resolve_path(&path)?;
-        let fname = mapped.backend_name.as_cstring()?;
-        let fd = nix::fcntl::openat(
-            mapped.dir_fd.as_fd(),
-            fname.as_c_str(),
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(core_errno_from_nix)?;
+        let cached = self
+            .core
+            .open_dir_cached(mapped.dir_fd.as_fd(), &mapped.backend_name)?;
+        let fd = nix::unistd::dup(cached.as_fd()).map_err(core_errno_from_nix)?;
         let index = load_dir_state(&self.core.index_cache, fd.as_fd())?;
         Ok(DirHandle::new(fd, index))
     }
