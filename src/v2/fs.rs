@@ -96,11 +96,7 @@ fn core_string_to_cstring(value: &str) -> CoreResult<CString> {
     CString::new(value.as_bytes()).map_err(|_| CoreError::from_errno(libc::EINVAL))
 }
 
-fn is_fs_internal_file_name(raw: &[u8]) -> bool {
-    raw.starts_with(FS_INTERNAL_PREFIX.as_bytes())
-}
-
-fn is_internal_meta(raw: &[u8]) -> bool {
+fn is_fs_internal_name(raw: &[u8]) -> bool {
     raw.starts_with(FS_INTERNAL_PREFIX.as_bytes())
 }
 
@@ -121,7 +117,7 @@ fn dir_is_only_fs_internal_files(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
         if name_bytes.is_empty() || name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-        if is_fs_internal_file_name(name_bytes) {
+        if is_fs_internal_name(name_bytes) {
             continue;
         }
         return Ok(false);
@@ -148,7 +144,7 @@ fn best_effort_unlink_fs_internal_files(dir_fd: BorrowedFd<'_>) {
         if name_bytes.is_empty() || name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-        if !is_fs_internal_file_name(name_bytes) {
+        if !is_fs_internal_name(name_bytes) {
             continue;
         }
         let c_name = match cstring_from_bytes(name_bytes) {
@@ -923,7 +919,12 @@ impl IndexCache {
                 journal_size,
                 journal_ops_since_compact,
             }) => (index, journal_size, journal_ops_since_compact),
-            None => (rebuild_dir_index_from_backend(dir_fd)?, 0, 0),
+            None => {
+                let index = rebuild_dir_index_from_backend(dir_fd)?;
+                write_dir_index(dir_fd, &index)?;
+                reset_journal(dir_fd)?;
+                (index, 0, 0)
+            }
         };
         let state = Arc::new(RwLock::new(IndexState {
             index,
@@ -1655,6 +1656,7 @@ fn get_internal_rawname(fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
 
 fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
     let fname = core_string_to_cstring(XATTR_CHECK_NAME)?;
+    let _ = unlinkat(dir_fd, fname.as_c_str(), UnlinkatFlags::NoRemoveDir);
     let fd = nix::fcntl::openat(
         dir_fd,
         fname.as_c_str(),
@@ -1714,7 +1716,7 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
         if name_bytes.is_empty() {
             continue;
         }
-        if is_fs_internal_file_name(&name_bytes) {
+        if is_fs_internal_name(&name_bytes) {
             continue;
         }
         if name_bytes.starts_with(INTERNAL_PREFIX.as_bytes()) {
@@ -2056,7 +2058,7 @@ fn list_logical_entries(
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-        if is_fs_internal_file_name(&name_bytes) {
+        if is_fs_internal_name(&name_bytes) {
             continue;
         }
         let is_internal = name_bytes.starts_with(INTERNAL_PREFIX.as_bytes());
@@ -2295,7 +2297,7 @@ fn map_segment_for_lookup(
     raw: &[u8],
     max_name_len: usize,
 ) -> CoreResult<(BackendName, SegmentKind)> {
-    if is_internal_meta(raw) {
+    if is_fs_internal_name(raw) {
         return Err(CoreError::InternalMeta);
     }
     if is_reserved_prefix(raw) {
@@ -2316,7 +2318,7 @@ fn map_segment_for_create(
     raw: &[u8],
     max_name_len: usize,
 ) -> CoreResult<(BackendName, SegmentKind)> {
-    if is_internal_meta(raw) {
+    if is_fs_internal_name(raw) {
         return Err(CoreError::InternalMeta);
     }
     if is_reserved_prefix(raw) {
@@ -2747,7 +2749,7 @@ impl LongNameFsCore {
     ) -> CoreResult<RenameTarget> {
         let mut ctx = self.resolve_dir(parent)?;
         let logical_name = normalize_osstr(name);
-        if is_internal_meta(&logical_name) {
+        if is_fs_internal_name(&logical_name) {
             return Err(CoreError::InternalMeta);
         }
         let kind = classify_segment(&logical_name, self.max_name_len)?;
