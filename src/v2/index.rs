@@ -382,6 +382,7 @@ pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<IndexLoadResu
                 if has_base_index {
                     return Ok(Some(IndexLoadResult {
                         index,
+                        has_base_index,
                         journal_size: 0,
                         journal_ops_since_compact: 0,
                     }));
@@ -393,6 +394,7 @@ pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<IndexLoadResu
         None if has_base_index => {
             return Ok(Some(IndexLoadResult {
                 index,
+                has_base_index,
                 journal_size: 0,
                 journal_ops_since_compact: 0,
             }));
@@ -422,6 +424,7 @@ pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<IndexLoadResu
 
     Ok(Some(IndexLoadResult {
         index,
+        has_base_index,
         journal_size,
         journal_ops_since_compact: decoded.ops.len() as u64,
     }))
@@ -557,6 +560,7 @@ pub fn reset_journal(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
 #[derive(Debug, Clone)]
 pub struct IndexLoadResult {
     pub index: DirIndex,
+    pub has_base_index: bool,
     pub journal_size: u64,
     pub journal_ops_since_compact: u64,
 }

@@ -916,9 +916,18 @@ impl IndexCache {
         let (index, journal_size_bytes, journal_ops_since_compact) = match read_dir_index(dir_fd)? {
             Some(IndexLoadResult {
                 index,
+                has_base_index,
                 journal_size,
                 journal_ops_since_compact,
-            }) => (index, journal_size, journal_ops_since_compact),
+            }) => {
+                if !has_base_index {
+                    write_dir_index(dir_fd, &index)?;
+                    reset_journal(dir_fd)?;
+                    (index, 0, 0)
+                } else {
+                    (index, journal_size, journal_ops_since_compact)
+                }
+            }
             None => {
                 let index = rebuild_dir_index_from_backend(dir_fd)?;
                 write_dir_index(dir_fd, &index)?;
@@ -6677,7 +6686,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::index::INDEX_NAME;
+    use crate::v2::index::{INDEX_NAME, JOURNAL_NAME, JournalOp, append_to_journal};
     use crate::v2::path::MAX_SEGMENT_ON_DISK;
     use parking_lot::RwLock;
     use std::collections::HashMap;
@@ -6968,5 +6977,34 @@ mod tests {
         let dfd =
             nix::fcntl::open(&child, OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty()).unwrap();
         assert!(!dir_is_only_fs_internal_files(dfd.as_fd()).unwrap());
+    }
+
+    #[test]
+    fn journal_only_load_persists_base_index_once() {
+        let tmp = TempDir::new();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+
+        let backend_name = b".__ln2_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        let raw_name = b"hello-world".to_vec();
+        append_to_journal(
+            config.backend_fd(),
+            &[JournalOp::Upsert(backend_name.clone(), raw_name.clone())],
+            true,
+        )
+        .unwrap();
+        assert!(tmp.path().join(JOURNAL_NAME).exists());
+        assert!(!tmp.path().join(INDEX_NAME).exists());
+
+        let core = LongNameFsCore::new(config, MAX_SEGMENT_ON_DISK, None, IndexSync::Off).unwrap();
+        let _ = core.resolve_dir(OsStr::new("/")).unwrap();
+
+        assert!(tmp.path().join(INDEX_NAME).exists());
+        assert!(!tmp.path().join(JOURNAL_NAME).exists());
+
+        let loaded = read_dir_index(core.config.backend_fd())
+            .unwrap()
+            .expect("index should load after persist");
+        assert!(loaded.has_base_index);
+        assert!(loaded.index.contains_key(&backend_name));
     }
 }
