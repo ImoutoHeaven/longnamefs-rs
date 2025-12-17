@@ -1,11 +1,10 @@
 use crate::config::Config;
-use crate::util::{
-    access_mask_from_bits, core_begin_temp_file, oflag_from_bits, retry_eintr, string_to_cstring,
-};
+use crate::util::{access_mask_from_bits, core_begin_temp_file, oflag_from_bits, retry_eintr};
 use crate::v2::error::{CoreError, CoreResult, core_err_to_errno};
 use crate::v2::index::{
-    DirIndex, INDEX_NAME, IndexLoadResult, JOURNAL_MAX_BYTES, JOURNAL_MAX_OPS, JOURNAL_NAME,
-    append_to_journal_file, read_dir_index, reset_journal, write_dir_index,
+    DirIndex, FS_INTERNAL_PREFIX, IndexLoadResult, JOURNAL_MAX_BYTES, JOURNAL_MAX_OPS,
+    JOURNAL_NAME, LEGACY_INDEX_PREFIX, LEGACY_JOURNAL_PREFIX, append_to_journal_file,
+    read_dir_index, reset_journal, write_dir_index,
 };
 use crate::v2::inode_store::{
     BackendKey, InodeEntry, InodeId, InodeKind, InodeStore, ParentName, ROOT_INODE,
@@ -57,8 +56,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const PARALLEL_REBUILD_THRESHOLD: usize = 64;
 const PARALLEL_REBUILD_WORKERS: usize = 4;
-const CREATE_TMP_INTERNAL_PREFIX: &str = ".__ln2_ctmp_";
-const RENAME_TMP_INTERNAL_PREFIX: &str = ".__ln2_rtmp_";
+const XATTR_CHECK_NAME: &str = ".ln2_fs_xattr_check.tmp";
+const LEGACY_XATTR_CHECK_NAME: &str = ".ln2_xattr_check.tmp";
+const RENAMEAT2_PROBE_NAME: &str = ".ln2_fs_renameat2_probe";
+const LEGACY_RENAMEAT2_PROBE_PREFIX: &str = ".__ln2_renameat2_probe";
+const CREATE_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_ctmp_";
+const RENAME_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_rtmp_";
+const LEGACY_CREATE_TMP_INTERNAL_PREFIX: &str = ".__ln2_ctmp_";
+const LEGACY_RENAME_TMP_INTERNAL_PREFIX: &str = ".__ln2_rtmp_";
 static TMP_INTERNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,11 +101,24 @@ fn core_string_to_cstring(value: &str) -> CoreResult<CString> {
     CString::new(value.as_bytes()).map_err(|_| CoreError::from_errno(libc::EINVAL))
 }
 
-fn is_internal_meta(raw: &[u8]) -> bool {
-    raw == INDEX_NAME.as_bytes() || raw == JOURNAL_NAME.as_bytes()
+fn is_fs_internal_file_name(raw: &[u8]) -> bool {
+    raw.starts_with(FS_INTERNAL_PREFIX.as_bytes())
+        || raw.starts_with(LEGACY_INDEX_PREFIX.as_bytes())
+        || raw.starts_with(LEGACY_JOURNAL_PREFIX.as_bytes())
+        || raw == LEGACY_XATTR_CHECK_NAME.as_bytes()
+        || raw.starts_with(LEGACY_RENAMEAT2_PROBE_PREFIX.as_bytes())
+        || raw.starts_with(LEGACY_CREATE_TMP_INTERNAL_PREFIX.as_bytes())
+        || raw.starts_with(LEGACY_RENAME_TMP_INTERNAL_PREFIX.as_bytes())
 }
 
-fn dir_is_only_ln2_meta(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
+fn is_internal_meta(raw: &[u8]) -> bool {
+    raw.starts_with(FS_INTERNAL_PREFIX.as_bytes())
+        || raw.starts_with(LEGACY_INDEX_PREFIX.as_bytes())
+        || raw.starts_with(LEGACY_JOURNAL_PREFIX.as_bytes())
+        || raw == LEGACY_XATTR_CHECK_NAME.as_bytes()
+}
+
+fn dir_is_only_fs_internal_files(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
     let mut dir = Dir::openat(
         dir_fd,
         ".",
@@ -117,12 +135,46 @@ fn dir_is_only_ln2_meta(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
         if name_bytes.is_empty() || name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-        if name_bytes == INDEX_NAME.as_bytes() || name_bytes == JOURNAL_NAME.as_bytes() {
+        if is_fs_internal_file_name(name_bytes) {
             continue;
         }
         return Ok(false);
     }
     Ok(true)
+}
+
+fn best_effort_unlink_fs_internal_files(dir_fd: BorrowedFd<'_>) {
+    let mut dir = match Dir::openat(
+        dir_fd,
+        ".",
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    for entry in dir.iter() {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let name_bytes = entry.file_name().to_bytes();
+        if name_bytes.is_empty() || name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        if !is_fs_internal_file_name(name_bytes) {
+            continue;
+        }
+        let c_name = match cstring_from_bytes(name_bytes) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Err(err) = unlinkat(dir_fd, c_name.as_c_str(), UnlinkatFlags::NoRemoveDir)
+            && err == nix::errno::Errno::EISDIR
+        {
+            let _ = unlinkat(dir_fd, c_name.as_c_str(), UnlinkatFlags::RemoveDir);
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1507,31 +1559,6 @@ fn set_internal_rawname_at(dir_fd: BorrowedFd<'_>, name: &CStr, raw: &[u8]) -> C
     }
 }
 
-fn is_create_tmp_internal_name(name: &[u8]) -> bool {
-    name.starts_with(CREATE_TMP_INTERNAL_PREFIX.as_bytes())
-}
-
-fn best_effort_remove_create_tmp_entry(dir_fd: BorrowedFd<'_>, name: &[u8]) {
-    let c_name = match cstring_from_bytes(name) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    match unlinkat(dir_fd, c_name.as_c_str(), UnlinkatFlags::NoRemoveDir) {
-        Ok(()) => {}
-        Err(nix::errno::Errno::EISDIR) => {
-            let _ = unlinkat(dir_fd, c_name.as_c_str(), UnlinkatFlags::RemoveDir);
-        }
-        Err(_) => {}
-    }
-}
-
-fn is_missing_rawname_xattr(err: &CoreError) -> bool {
-    match err {
-        CoreError::Io(ioe) => matches!(ioe.raw_os_error(), Some(libc::ENODATA)),
-        _ => false,
-    }
-}
-
 fn select_create_tmp_internal_name(dir_fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
     for _ in 0..256 {
         let n = TMP_INTERNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1641,7 +1668,10 @@ fn get_internal_rawname(fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
 }
 
 fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
-    let fname = core_string_to_cstring(".ln2_xattr_check.tmp")?;
+    if let Ok(legacy) = core_string_to_cstring(LEGACY_XATTR_CHECK_NAME) {
+        let _ = unlinkat(dir_fd, legacy.as_c_str(), UnlinkatFlags::NoRemoveDir);
+    }
+    let fname = core_string_to_cstring(XATTR_CHECK_NAME)?;
     let fd = nix::fcntl::openat(
         dir_fd,
         fname.as_c_str(),
@@ -1655,7 +1685,7 @@ fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
 }
 
 fn probe_renameat2(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
-    let final_name = core_string_to_cstring(".__ln2_renameat2_probe")?;
+    let final_name = core_string_to_cstring(RENAMEAT2_PROBE_NAME)?;
     let temp = match core_begin_temp_file(dir_fd, final_name.as_c_str(), "rn2") {
         Ok(v) => v,
         Err(err) if err.raw_os_error() == Some(libc::EROFS) => return Ok(false),
@@ -1701,32 +1731,8 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
         if name_bytes.is_empty() {
             continue;
         }
-        if name_bytes.starts_with(INDEX_NAME.as_bytes())
-            || name_bytes.starts_with(JOURNAL_NAME.as_bytes())
-        {
+        if is_fs_internal_file_name(&name_bytes) {
             continue;
-        }
-        if is_create_tmp_internal_name(&name_bytes) {
-            let c_name = match cstring_from_bytes(&name_bytes) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let fd = match nix::fcntl::openat(
-                dir_fd,
-                c_name.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(nix::errno::Errno::ENOENT) => continue,
-                Err(_) => continue,
-            };
-            if let Err(err) = get_internal_rawname(fd.as_fd())
-                && is_missing_rawname_xattr(&err)
-            {
-                best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
-                continue;
-            }
         }
         if name_bytes.starts_with(INTERNAL_PREFIX.as_bytes()) {
             internal.push(name_bytes);
@@ -2067,32 +2073,8 @@ fn list_logical_entries(
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-        if name_bytes.starts_with(INDEX_NAME.as_bytes())
-            || name_bytes.starts_with(JOURNAL_NAME.as_bytes())
-        {
+        if is_fs_internal_file_name(&name_bytes) {
             continue;
-        }
-        if is_create_tmp_internal_name(&name_bytes) {
-            let c_name = match cstring_from_bytes(&name_bytes) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let fd = match nix::fcntl::openat(
-                dir_fd,
-                c_name.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(nix::errno::Errno::ENOENT) => continue,
-                Err(_) => continue,
-            };
-            if let Err(err) = get_internal_rawname(fd.as_fd())
-                && is_missing_rawname_xattr(&err)
-            {
-                best_effort_remove_create_tmp_entry(dir_fd, &name_bytes);
-                continue;
-            }
         }
         let is_internal = name_bytes.starts_with(INTERNAL_PREFIX.as_bytes());
         let kind_hint = map_dirent_type(&entry);
@@ -5355,24 +5337,11 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 )
                 .map_err(core_errno_from_nix)?;
 
-                if !dir_is_only_ln2_meta(target_dir_fd.as_fd())? {
+                if !dir_is_only_fs_internal_files(target_dir_fd.as_fd())? {
                     return Err(CoreError::from_errno(libc::ENOTEMPTY));
                 }
 
-                if let Ok(index_cstr) = string_to_cstring(INDEX_NAME) {
-                    let _ = unlinkat(
-                        target_dir_fd.as_fd(),
-                        index_cstr.as_c_str(),
-                        UnlinkatFlags::NoRemoveDir,
-                    );
-                }
-                if let Ok(journal_cstr) = string_to_cstring(JOURNAL_NAME) {
-                    let _ = unlinkat(
-                        target_dir_fd.as_fd(),
-                        journal_cstr.as_c_str(),
-                        UnlinkatFlags::NoRemoveDir,
-                    );
-                }
+                best_effort_unlink_fs_internal_files(target_dir_fd.as_fd());
 
                 unlinkat(
                     ctx.dir_fd.as_fd(),
@@ -6723,6 +6692,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::index::INDEX_NAME;
     use crate::v2::path::MAX_SEGMENT_ON_DISK;
     use parking_lot::RwLock;
     use std::collections::HashMap;
@@ -6974,5 +6944,44 @@ mod tests {
 
         fs.patch_dir_cache(root_fd.as_fd(), CacheOp::Remove(b"a".to_vec()));
         assert_eq!(fs.core.dir_fd_cache.name_index_get(parent_key, b"a"), None);
+    }
+
+    #[test]
+    fn rmdir_meta_cleanup_allows_only_ln2_meta() {
+        let tmp = TempDir::new();
+        let child = tmp.path().join("d");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join(INDEX_NAME), b"idx").unwrap();
+        fs::write(child.join(JOURNAL_NAME), b"jnl").unwrap();
+        fs::write(child.join(format!("{INDEX_NAME}.tmp.1.2.idx")), b"tmp").unwrap();
+        fs::write(child.join(".ln2_fs_renameat2_probe.tmp.1.2.rn2"), b"rn2").unwrap();
+        fs::write(
+            child.join(".ln2_fs_renameat2_probe.tmp.1.2.rn2.dst"),
+            b"rn2dst",
+        )
+        .unwrap();
+        fs::write(child.join(XATTR_CHECK_NAME), b"xattr").unwrap();
+        fs::create_dir(child.join(".ln2_fs_ctmp_deadbeef")).unwrap();
+        fs::write(child.join(".ln2_fs_rtmp_deadbeef"), b"x").unwrap();
+
+        let dfd =
+            nix::fcntl::open(&child, OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty()).unwrap();
+        assert!(dir_is_only_fs_internal_files(dfd.as_fd()).unwrap());
+        best_effort_unlink_fs_internal_files(dfd.as_fd());
+
+        let entries: Vec<_> = fs::read_dir(&child).unwrap().collect();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn dir_is_only_fs_internal_files_rejects_other_hidden_files() {
+        let tmp = TempDir::new();
+        let child = tmp.path().join("d");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join(".keep"), b"x").unwrap();
+
+        let dfd =
+            nix::fcntl::open(&child, OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty()).unwrap();
+        assert!(!dir_is_only_fs_internal_files(dfd.as_fd()).unwrap());
     }
 }

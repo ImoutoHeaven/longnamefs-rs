@@ -100,7 +100,7 @@ Behavior
 - Operations on `/` interact directly with the backend directory (chmod/chown/utimens supported; truncate disallowed).
 - Extended attributes (get/set/list/remove) are forwarded to backend objects; `position` must be zero on Linux.
 - `readdirplus` returns names with attributes; `flush`/`fsyncdir` are implemented; `poll` is accepted (returns no ready events).
-- With `--backend-layout v1`, long names are stored in `<hash>n` namefiles and remain compatible with the C implementation. With `--backend-layout v2`, long names are mapped to internal `.__ln2_*` entries with the original bytes stored in `user.ln2.rawname`; internal names and `.ln2_index` are hidden from listings, and long-name hardlinks are rejected.
+- With `--backend-layout v1`, long names are stored in `<hash>n` namefiles and remain compatible with the C implementation. With `--backend-layout v2`, long names are mapped to internal `.__ln2_*` entries with the original bytes stored in `user.ln2.rawname`; FS-internal `.ln2_fs_*` entries (index/journal/tmp/probes) are hidden from listings, and long-name hardlinks are rejected.
 - On SIGINT/SIGTERM the process attempts a lazy unmount (`MNT_DETACH`) and then exits immediately (it does not try to drain in-flight IO).
 
 systemd example
