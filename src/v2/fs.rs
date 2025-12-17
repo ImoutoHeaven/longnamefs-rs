@@ -3,8 +3,7 @@ use crate::util::{access_mask_from_bits, core_begin_temp_file, oflag_from_bits, 
 use crate::v2::error::{CoreError, CoreResult, core_err_to_errno};
 use crate::v2::index::{
     DirIndex, FS_INTERNAL_PREFIX, IndexLoadResult, JOURNAL_MAX_BYTES, JOURNAL_MAX_OPS,
-    JOURNAL_NAME, LEGACY_INDEX_PREFIX, LEGACY_JOURNAL_PREFIX, append_to_journal_file,
-    read_dir_index, reset_journal, write_dir_index,
+    JOURNAL_NAME, append_to_journal_file, read_dir_index, reset_journal, write_dir_index,
 };
 use crate::v2::inode_store::{
     BackendKey, InodeEntry, InodeId, InodeKind, InodeStore, ParentName, ROOT_INODE,
@@ -57,13 +56,9 @@ const RAWNAME_XATTR: &str = "user.ln2.rawname";
 const PARALLEL_REBUILD_THRESHOLD: usize = 64;
 const PARALLEL_REBUILD_WORKERS: usize = 4;
 const XATTR_CHECK_NAME: &str = ".ln2_fs_xattr_check.tmp";
-const LEGACY_XATTR_CHECK_NAME: &str = ".ln2_xattr_check.tmp";
 const RENAMEAT2_PROBE_NAME: &str = ".ln2_fs_renameat2_probe";
-const LEGACY_RENAMEAT2_PROBE_PREFIX: &str = ".__ln2_renameat2_probe";
 const CREATE_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_ctmp_";
 const RENAME_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_rtmp_";
-const LEGACY_CREATE_TMP_INTERNAL_PREFIX: &str = ".__ln2_ctmp_";
-const LEGACY_RENAME_TMP_INTERNAL_PREFIX: &str = ".__ln2_rtmp_";
 static TMP_INTERNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,19 +98,10 @@ fn core_string_to_cstring(value: &str) -> CoreResult<CString> {
 
 fn is_fs_internal_file_name(raw: &[u8]) -> bool {
     raw.starts_with(FS_INTERNAL_PREFIX.as_bytes())
-        || raw.starts_with(LEGACY_INDEX_PREFIX.as_bytes())
-        || raw.starts_with(LEGACY_JOURNAL_PREFIX.as_bytes())
-        || raw == LEGACY_XATTR_CHECK_NAME.as_bytes()
-        || raw.starts_with(LEGACY_RENAMEAT2_PROBE_PREFIX.as_bytes())
-        || raw.starts_with(LEGACY_CREATE_TMP_INTERNAL_PREFIX.as_bytes())
-        || raw.starts_with(LEGACY_RENAME_TMP_INTERNAL_PREFIX.as_bytes())
 }
 
 fn is_internal_meta(raw: &[u8]) -> bool {
     raw.starts_with(FS_INTERNAL_PREFIX.as_bytes())
-        || raw.starts_with(LEGACY_INDEX_PREFIX.as_bytes())
-        || raw.starts_with(LEGACY_JOURNAL_PREFIX.as_bytes())
-        || raw == LEGACY_XATTR_CHECK_NAME.as_bytes()
 }
 
 fn dir_is_only_fs_internal_files(dir_fd: BorrowedFd<'_>) -> CoreResult<bool> {
@@ -1668,9 +1654,6 @@ fn get_internal_rawname(fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
 }
 
 fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
-    if let Ok(legacy) = core_string_to_cstring(LEGACY_XATTR_CHECK_NAME) {
-        let _ = unlinkat(dir_fd, legacy.as_c_str(), UnlinkatFlags::NoRemoveDir);
-    }
     let fname = core_string_to_cstring(XATTR_CHECK_NAME)?;
     let fd = nix::fcntl::openat(
         dir_fd,

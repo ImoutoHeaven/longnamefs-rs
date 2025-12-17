@@ -2,14 +2,13 @@
 
 use crate::util::{core_begin_temp_file, core_sync_and_commit, retry_eintr};
 use crate::v2::error::{CoreError, CoreResult};
-use nix::fcntl::renameat;
-use nix::sys::stat::{Mode, fstat, fstatat};
+use nix::sys::stat::{Mode, fstat};
 use nix::unistd::ftruncate;
 use nix::unistd::write;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
 use zstd::stream::{read::Decoder as ZstdDecoder, write::Encoder as ZstdEncoder};
 
@@ -28,14 +27,6 @@ pub const JOURNAL_MAX_OPS: u64 = 4096;
 pub const INDEX_NAME: &str = ".ln2_fs_index";
 #[allow(clippy::manual_c_str_literals)]
 const INDEX_NAME_CSTR: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b".ln2_fs_index\0") };
-
-pub const LEGACY_JOURNAL_PREFIX: &str = ".ln2_journal";
-#[allow(clippy::manual_c_str_literals)]
-const LEGACY_JOURNAL_CSTR: &CStr =
-    unsafe { CStr::from_bytes_with_nul_unchecked(b".ln2_journal\0") };
-pub const LEGACY_INDEX_PREFIX: &str = ".ln2_index";
-#[allow(clippy::manual_c_str_literals)]
-const LEGACY_INDEX_CSTR: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b".ln2_index\0") };
 
 type SharedBytes = Arc<[u8]>;
 
@@ -156,9 +147,15 @@ impl DirIndex {
 }
 
 fn read_index_bytes(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<Vec<u8>>> {
-    let fd = match open_index_fd(dir_fd)? {
-        None => return Ok(None),
-        Some(fd) => fd,
+    let fd = match nix::fcntl::openat(
+        dir_fd,
+        INDEX_NAME_CSTR,
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(err) => return Err(CoreError::from(err)),
     };
 
     let size = fstat(fd.as_fd())
@@ -176,62 +173,6 @@ fn read_index_bytes(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<Vec<u8>>> {
         return Ok(None);
     }
     Ok(Some(buf))
-}
-
-fn open_index_fd(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<OwnedFd>> {
-    for name in [INDEX_NAME_CSTR, LEGACY_INDEX_CSTR] {
-        match nix::fcntl::openat(
-            dir_fd,
-            name,
-            nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => return Ok(Some(fd)),
-            Err(nix::errno::Errno::ENOENT) => continue,
-            Err(err) => return Err(CoreError::from(err)),
-        }
-    }
-    Ok(None)
-}
-
-fn open_journal_fd(
-    dir_fd: BorrowedFd<'_>,
-    flags: nix::fcntl::OFlag,
-) -> CoreResult<Option<OwnedFd>> {
-    for name in [JOURNAL_NAME_CSTR, LEGACY_JOURNAL_CSTR] {
-        match nix::fcntl::openat(
-            dir_fd,
-            name,
-            flags | nix::fcntl::OFlag::O_CLOEXEC,
-            Mode::from_bits_truncate(0o600),
-        ) {
-            Ok(fd) => return Ok(Some(fd)),
-            Err(nix::errno::Errno::ENOENT) => continue,
-            Err(err) => return Err(CoreError::from(err)),
-        }
-    }
-    Ok(None)
-}
-
-fn exists(dir_fd: BorrowedFd<'_>, name: &CStr) -> bool {
-    fstatat(dir_fd, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW).is_ok()
-}
-
-fn migrate_legacy_file(dir_fd: BorrowedFd<'_>, src: &CStr, dst: &CStr) -> CoreResult<()> {
-    if exists(dir_fd, dst) {
-        return Ok(());
-    }
-    match renameat(dir_fd, src, dir_fd, dst) {
-        Ok(()) => Ok(()),
-        Err(nix::errno::Errno::ENOENT) => Ok(()),
-        Err(err) => Err(CoreError::from(err)),
-    }
-}
-
-fn migrate_legacy_metadata(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
-    migrate_legacy_file(dir_fd, LEGACY_INDEX_CSTR, INDEX_NAME_CSTR)?;
-    migrate_legacy_file(dir_fd, LEGACY_JOURNAL_CSTR, JOURNAL_NAME_CSTR)?;
-    Ok(())
 }
 
 fn decode_plain_index(bytes: &[u8]) -> Option<DirIndex> {
@@ -315,9 +256,15 @@ fn decode_index_bytes(bytes: &[u8]) -> Option<DirIndex> {
 }
 
 fn read_journal_bytes(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<(Vec<u8>, u64)>> {
-    let fd = match open_journal_fd(dir_fd, nix::fcntl::OFlag::O_RDONLY)? {
-        None => return Ok(None),
-        Some(fd) => fd,
+    let fd = match nix::fcntl::openat(
+        dir_fd,
+        JOURNAL_NAME_CSTR,
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(err) => return Err(CoreError::from(err)),
     };
     let size = fstat(fd.as_fd()).map(|st| st.st_size as u64).unwrap_or(0);
     if size > JOURNAL_MAX_BYTES {
@@ -407,13 +354,17 @@ fn decode_journal_tolerant(bytes: &[u8]) -> JournalDecodeResult {
 }
 
 fn truncate_journal(dir_fd: BorrowedFd<'_>, truncate_to: usize) -> CoreResult<()> {
-    let fd = open_journal_fd(dir_fd, nix::fcntl::OFlag::O_WRONLY)?
-        .ok_or_else(|| CoreError::from_errno(libc::ENOENT))?;
+    let fd = nix::fcntl::openat(
+        dir_fd,
+        JOURNAL_NAME_CSTR,
+        nix::fcntl::OFlag::O_WRONLY | nix::fcntl::OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(CoreError::from)?;
     ftruncate(fd.as_fd(), truncate_to as i64).map_err(CoreError::from)
 }
 
 pub fn read_dir_index(dir_fd: BorrowedFd<'_>) -> CoreResult<Option<IndexLoadResult>> {
-    migrate_legacy_metadata(dir_fd)?;
     let base = match read_index_bytes(dir_fd)? {
         None => None,
         Some(bytes) => decode_index_bytes(&bytes),
@@ -504,7 +455,6 @@ fn encode_index_compressed(raw: &[u8]) -> CoreResult<Vec<u8>> {
 }
 
 pub fn write_dir_index(dir_fd: BorrowedFd<'_>, index: &DirIndex) -> CoreResult<()> {
-    migrate_legacy_metadata(dir_fd)?;
     let raw = encode_index(index);
     let compressed = encode_index_compressed(&raw)?;
     let data = if compressed.len() <= MAX_INDEX_BYTES {
@@ -578,7 +528,6 @@ pub fn append_to_journal(
     if ops.is_empty() {
         return Ok((0, 0, 0));
     }
-    migrate_legacy_metadata(dir_fd)?;
     let fd = nix::fcntl::openat(
         dir_fd,
         JOURNAL_NAME_CSTR,
@@ -594,24 +543,15 @@ pub fn append_to_journal(
 }
 
 pub fn reset_journal(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
-    let res_new = nix::unistd::unlinkat(
+    match nix::unistd::unlinkat(
         dir_fd,
         JOURNAL_NAME_CSTR,
         nix::unistd::UnlinkatFlags::NoRemoveDir,
-    );
-    let res_old = nix::unistd::unlinkat(
-        dir_fd,
-        LEGACY_JOURNAL_CSTR,
-        nix::unistd::UnlinkatFlags::NoRemoveDir,
-    );
-    for res in [res_new, res_old] {
-        match res {
-            Ok(()) => {}
-            Err(nix::errno::Errno::ENOENT) => {}
-            Err(err) => return Err(CoreError::from(err)),
-        }
+    ) {
+        Ok(_) => Ok(()),
+        Err(nix::errno::Errno::ENOENT) => Ok(()),
+        Err(err) => Err(CoreError::from(err)),
     }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
