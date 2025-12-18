@@ -25,6 +25,8 @@ use fuser::{
 };
 use nix::dir::Dir;
 use nix::fcntl::{AtFlags, OFlag, RenameFlags, readlinkat, renameat, renameat2};
+#[cfg(target_os = "linux")]
+use nix::fcntl::{FallocateFlags, fallocate as nix_fallocate};
 use nix::sys::stat::{
     FchmodatFlags, Mode, UtimensatFlags, fchmodat, fstat, fstatat, mkdirat, mknodat, utimensat,
 };
@@ -46,7 +48,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{
-    Arc,
+    Arc, Weak,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
@@ -60,6 +62,142 @@ const RENAMEAT2_PROBE_NAME: &str = ".ln2_fs_renameat2_probe";
 const CREATE_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_ctmp_";
 const RENAME_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_rtmp_";
 static TMP_INTERNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "abi-7-40")]
+const PASSTHROUGH_BACKING_CACHE_MAX_ENTRIES: usize = 4096;
+
+#[cfg(feature = "abi-7-40")]
+#[derive(Debug)]
+struct PassthroughBackingCacheCaps {
+    read: bool,
+    write: bool,
+}
+
+#[cfg(feature = "abi-7-40")]
+impl PassthroughBackingCacheCaps {
+    fn for_open_flags(flags: u32) -> Self {
+        let accmode = flags & (libc::O_ACCMODE as u32);
+        let read = accmode != libc::O_WRONLY as u32;
+        let write = accmode != libc::O_RDONLY as u32;
+        Self { read, write }
+    }
+
+    fn satisfies(&self, needed: Self) -> bool {
+        (!needed.read || self.read) && (!needed.write || self.write)
+    }
+}
+
+#[cfg(feature = "abi-7-40")]
+#[derive(Debug)]
+struct PassthroughBackingCacheEntry {
+    backing: Weak<BackingId>,
+    caps: PassthroughBackingCacheCaps,
+}
+
+#[cfg(feature = "abi-7-40")]
+#[derive(Debug)]
+enum PassthroughBackingSlotState {
+    Ready(PassthroughBackingCacheEntry),
+    Creating,
+}
+
+#[cfg(feature = "abi-7-40")]
+#[derive(Debug)]
+struct PassthroughBackingSlot {
+    state: Mutex<PassthroughBackingSlotState>,
+    cv: Condvar,
+}
+
+#[cfg(feature = "abi-7-40")]
+impl PassthroughBackingSlot {
+    fn new_empty() -> Self {
+        Self {
+            state: Mutex::new(PassthroughBackingSlotState::Ready(
+                PassthroughBackingCacheEntry {
+                    backing: Weak::new(),
+                    caps: PassthroughBackingCacheCaps {
+                        read: false,
+                        write: false,
+                    },
+                },
+            )),
+            cv: Condvar::new(),
+        }
+    }
+}
+
+#[cfg(feature = "abi-7-40")]
+#[derive(Debug)]
+struct PassthroughBackingCache {
+    max_entries: usize,
+    entries: HashMap<BackendKey, Arc<PassthroughBackingSlot>>,
+    lru: VecDeque<BackendKey>,
+}
+
+#[cfg(feature = "abi-7-40")]
+impl PassthroughBackingCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    fn touch(&mut self, key: BackendKey) {
+        if let Some(pos) = self.lru.iter().position(|v| *v == key) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(key);
+    }
+
+    fn remove(&mut self, key: BackendKey) {
+        self.entries.remove(&key);
+        if let Some(pos) = self.lru.iter().position(|v| *v == key) {
+            self.lru.remove(pos);
+        }
+    }
+
+    fn evict_if_needed(&mut self) {
+        if self.entries.len() <= self.max_entries {
+            return;
+        }
+        let mut scanned = 0usize;
+        while self.entries.len() > self.max_entries && scanned < self.lru.len().max(1) {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            scanned += 1;
+            let Some(slot) = self.entries.get(&oldest) else {
+                continue;
+            };
+            // Avoid blocking on per-inode slot locks while holding the global cache lock.
+            let evictable = match slot.state.try_lock() {
+                None => false,
+                Some(state) => match &*state {
+                    PassthroughBackingSlotState::Creating => false,
+                    PassthroughBackingSlotState::Ready(entry) => entry.backing.upgrade().is_none(),
+                },
+            };
+            if evictable {
+                self.entries.remove(&oldest);
+            } else {
+                // Keep it but rotate, so we don't get stuck scanning the same live entry.
+                self.lru.push_back(oldest);
+            }
+        }
+    }
+
+    fn slot(&mut self, key: BackendKey) -> Arc<PassthroughBackingSlot> {
+        let slot = self
+            .entries
+            .entry(key)
+            .or_insert_with(|| Arc::new(PassthroughBackingSlot::new_empty()))
+            .clone();
+        self.touch(key);
+        self.evict_if_needed();
+        slot
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoreFileType {
@@ -1202,6 +1340,23 @@ impl PassthroughHandleTable {
 
     fn insert(&self, fh: u64, id: BackingId, meta_fd: Option<Arc<OwnedFd>>) -> Arc<BackingId> {
         let backing = Arc::new(id);
+        let handle = Arc::new(PassthroughHandleInner {
+            backing: backing.clone(),
+            opened_at: Instant::now(),
+            meta_ops: AtomicU32::new(0),
+            promotion_inflight: AtomicBool::new(false),
+            meta_fd: RwLock::new(meta_fd),
+        });
+        self.shard(fh).write().insert(fh, handle);
+        backing
+    }
+
+    fn insert_existing(
+        &self,
+        fh: u64,
+        backing: Arc<BackingId>,
+        meta_fd: Option<Arc<OwnedFd>>,
+    ) -> Arc<BackingId> {
         let handle = Arc::new(PassthroughHandleInner {
             backing: backing.clone(),
             opened_at: Instant::now(),
@@ -3270,6 +3425,8 @@ pub struct LongNameFsV2Fuser {
     #[cfg(feature = "abi-7-40")]
     passthrough_handles: PassthroughHandleTable,
     #[cfg(feature = "abi-7-40")]
+    passthrough_backing_cache: Mutex<PassthroughBackingCache>,
+    #[cfg(feature = "abi-7-40")]
     passthrough_meta_policy: PassthroughMetaFdPolicy,
     writeback_cache_cfg: bool,
     max_write: NonZeroU32,
@@ -3320,6 +3477,10 @@ impl LongNameFsV2Fuser {
             passthrough_runtime: false,
             #[cfg(feature = "abi-7-40")]
             passthrough_handles: PassthroughHandleTable::default(),
+            #[cfg(feature = "abi-7-40")]
+            passthrough_backing_cache: Mutex::new(PassthroughBackingCache::new(
+                PASSTHROUGH_BACKING_CACHE_MAX_ENTRIES,
+            )),
             #[cfg(feature = "abi-7-40")]
             passthrough_meta_policy: PassthroughMetaFdPolicy::new(passthrough_meta_fd),
             writeback_cache_cfg: enable_writeback_cache,
@@ -3516,6 +3677,30 @@ impl LongNameFsV2Fuser {
         {
             false
         }
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn warn_passthrough_userspace_fallback(
+        &self,
+        reason: &str,
+        ino: u64,
+        backend: BackendKey,
+        flags: u32,
+    ) {
+        eprintln!(
+            "longnamefs-rs v2: WARNING: passthrough userspace fallback ({reason}) ino={ino} backend.dev={} backend.ino={} flags=0x{flags:x}",
+            backend.dev, backend.ino
+        );
+    }
+
+    #[cfg(not(feature = "abi-7-40"))]
+    fn warn_passthrough_userspace_fallback(
+        &self,
+        _reason: &str,
+        _ino: u64,
+        _backend: BackendKey,
+        _flags: u32,
+    ) {
     }
 
     #[cfg(feature = "abi-7-40")]
@@ -6085,6 +6270,211 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             reply.error(libc::ESTALE);
             return;
         };
+        #[cfg(feature = "abi-7-40")]
+        if self.passthrough_active() && entry.kind == InodeKind::File {
+            let flags_u32 = flags as u32;
+            let needed_caps = PassthroughBackingCacheCaps::for_open_flags(flags_u32);
+            let open_count = entry.open_count.saturating_add(1);
+            let acquired_slot = self.passthrough_meta_policy.should_keep_on_open(open_count)
+                && self.passthrough_meta_policy.try_acquire_slot();
+
+            let fd = match self.open_backend_file(&entry, flags_u32) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    if acquired_slot {
+                        self.passthrough_meta_policy.release_slot();
+                    }
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+
+            // Some kernels appear to return EIO when the same inode ends up with multiple backing
+            // IDs (and can also be sensitive to mixing passthrough and non-passthrough opens).
+            // To avoid this, keep at most one cached backing ID per inode. For capability
+            // mismatches (e.g. cached backing is read-only but the open needs write), fall back to
+            // userspace rather than creating another backing ID.
+
+            let slot = {
+                let mut cache = self.passthrough_backing_cache.lock();
+                cache.slot(entry.backend)
+            };
+
+            let backing = loop {
+                let mut guard = slot.state.lock();
+                match &*guard {
+                    PassthroughBackingSlotState::Creating => {
+                        slot.cv.wait(&mut guard);
+                        continue;
+                    }
+                    PassthroughBackingSlotState::Ready(entry0) => {
+                        if let Some(backing) = entry0.backing.upgrade() {
+                            if entry0.caps.satisfies(needed_caps) {
+                                break backing;
+                            }
+                            drop(guard);
+                            self.warn_passthrough_userspace_fallback(
+                                "cached backing lacks required access",
+                                ino,
+                                entry.backend,
+                                flags_u32,
+                            );
+                            if acquired_slot {
+                                self.passthrough_meta_policy.release_slot();
+                            }
+                            let fh = self.handles.insert_file(fd);
+                            let _ = self.inode_store.inc_open(ino);
+                            reply.opened(fh, 0);
+                            return;
+                        }
+
+                        *guard = PassthroughBackingSlotState::Creating;
+                    }
+                }
+                drop(guard);
+
+                let (backing_fd, caps) = match self.open_backend_file(&entry, libc::O_RDWR as u32) {
+                    Ok(backing_fd) => (
+                        backing_fd,
+                        PassthroughBackingCacheCaps {
+                            read: true,
+                            write: true,
+                        },
+                    ),
+                    Err(_) => match self.open_backend_file(&entry, libc::O_RDONLY as u32) {
+                        Ok(backing_fd) => (
+                            backing_fd,
+                            PassthroughBackingCacheCaps {
+                                read: true,
+                                write: false,
+                            },
+                        ),
+                        Err(_) => match self.open_backend_file(&entry, libc::O_WRONLY as u32) {
+                            Ok(backing_fd) => (
+                                backing_fd,
+                                PassthroughBackingCacheCaps {
+                                    read: false,
+                                    write: true,
+                                },
+                            ),
+                            Err(err) => {
+                                let mut guard = slot.state.lock();
+                                *guard = PassthroughBackingSlotState::Ready(
+                                    PassthroughBackingCacheEntry {
+                                        backing: Weak::new(),
+                                        caps: PassthroughBackingCacheCaps {
+                                            read: false,
+                                            write: false,
+                                        },
+                                    },
+                                );
+                                slot.cv.notify_all();
+                                drop(guard);
+
+                                eprintln!(
+                                    "longnamefs-rs v2: WARNING: passthrough userspace fallback (open backing fd failed: {err:?}) ino={ino} backend.dev={} backend.ino={} flags=0x{flags_u32:x}",
+                                    entry.backend.dev, entry.backend.ino
+                                );
+                                if acquired_slot {
+                                    self.passthrough_meta_policy.release_slot();
+                                }
+                                let fh = self.handles.insert_file(fd);
+                                let _ = self.inode_store.inc_open(ino);
+                                reply.opened(fh, 0);
+                                return;
+                            }
+                        },
+                    },
+                };
+
+                if !caps.satisfies(needed_caps) {
+                    let mut guard = slot.state.lock();
+                    *guard = PassthroughBackingSlotState::Ready(PassthroughBackingCacheEntry {
+                        backing: Weak::new(),
+                        caps: PassthroughBackingCacheCaps {
+                            read: false,
+                            write: false,
+                        },
+                    });
+                    slot.cv.notify_all();
+                    drop(guard);
+
+                    self.warn_passthrough_userspace_fallback(
+                        "no backing fd satisfies requested access",
+                        ino,
+                        entry.backend,
+                        flags_u32,
+                    );
+                    if acquired_slot {
+                        self.passthrough_meta_policy.release_slot();
+                    }
+                    let fh = self.handles.insert_file(fd);
+                    let _ = self.inode_store.inc_open(ino);
+                    reply.opened(fh, 0);
+                    return;
+                }
+
+                let backing_res = reply.open_backing(backing_fd.as_fd());
+                let mut guard = slot.state.lock();
+                match backing_res {
+                    Ok(backing_id) => {
+                        let backing = Arc::new(backing_id);
+                        *guard = PassthroughBackingSlotState::Ready(PassthroughBackingCacheEntry {
+                            backing: Arc::downgrade(&backing),
+                            caps,
+                        });
+                        slot.cv.notify_all();
+                        break backing;
+                    }
+                    Err(err) => {
+                        *guard = PassthroughBackingSlotState::Ready(PassthroughBackingCacheEntry {
+                            backing: Weak::new(),
+                            caps: PassthroughBackingCacheCaps {
+                                read: false,
+                                write: false,
+                            },
+                        });
+                        slot.cv.notify_all();
+                        drop(guard);
+
+                        let errno = err.raw_os_error().unwrap_or(libc::EIO);
+                        self.warn_passthrough_userspace_fallback(
+                            "open_backing failed",
+                            ino,
+                            entry.backend,
+                            flags_u32,
+                        );
+                        if errno == libc::EPERM
+                            || errno == libc::EOPNOTSUPP
+                            || errno == libc::ENOTTY
+                        {
+                            self.passthrough_runtime = false;
+                        }
+                        if acquired_slot {
+                            self.passthrough_meta_policy.release_slot();
+                        }
+                        let fh = self.handles.insert_file(fd);
+                        let _ = self.inode_store.inc_open(ino);
+                        reply.opened(fh, 0);
+                        return;
+                    }
+                }
+            };
+
+            let meta_fd = if acquired_slot {
+                Some(Arc::new(fd))
+            } else {
+                None
+            };
+            let fh = self.handles.allocate_fh();
+            let backing = self
+                .passthrough_handles
+                .insert_existing(fh, backing, meta_fd);
+            let _ = self.inode_store.inc_open(ino);
+            reply.opened_passthrough(fh, 0, &backing);
+            return;
+        }
+
         let fd = match self.open_backend_file(&entry, flags as u32) {
             Ok(fd) => fd,
             Err(err) => {
@@ -6092,40 +6482,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let mut fd_opt = Some(fd);
-        #[cfg(feature = "abi-7-40")]
-        if self.passthrough_active() && entry.kind == InodeKind::File {
-            match reply.open_backing(fd_opt.as_ref().expect("fd present").as_fd()) {
-                Ok(backing_id) => {
-                    let fh = self.handles.allocate_fh();
-                    let open_count = entry.open_count.saturating_add(1);
-                    let meta_fd = if self.passthrough_meta_policy.should_keep_on_open(open_count)
-                        && self.passthrough_meta_policy.try_acquire_slot()
-                    {
-                        Some(Arc::new(fd_opt.take().expect("fd present")))
-                    } else {
-                        None
-                    };
-                    let backing = self.passthrough_handles.insert(fh, backing_id, meta_fd);
-                    let _ = self.inode_store.inc_open(ino);
-                    reply.opened_passthrough(fh, 0, &backing);
-                    return;
-                }
-                Err(err) => {
-                    let errno = err.raw_os_error().unwrap_or(libc::EIO);
-                    eprintln!(
-                        "longnamefs-rs v2: open_backing failed for ino {ino} ({err}), falling back to userspace IO"
-                    );
-                    // Only disable passthrough globally on capability or ioctl-level errors.
-                    // For per-file limitations (e.g. non-regular files), keep passthrough for
-                    // other inodes to avoid silent global performance regressions.
-                    if errno == libc::EPERM || errno == libc::EOPNOTSUPP || errno == libc::ENOTTY {
-                        self.passthrough_runtime = false;
-                    }
-                }
-            }
-        }
-        let fh = self.handles.insert_file(fd_opt.take().expect("fd present"));
+        let fh = self.handles.insert_file(fd);
         let _ = self.inode_store.inc_open(ino);
         reply.opened(fh, 0);
     }
@@ -6133,7 +6490,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
     fn read(
         &mut self,
         _req: &FuserRequest<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         size: u32,
@@ -6143,9 +6500,53 @@ impl FuserFilesystem for LongNameFsV2Fuser {
     ) {
         if self.is_passthrough_fh(fh) {
             eprintln!(
-                "longnamefs-rs v2: read for passthrough fh {fh} unexpectedly reached userspace; returning EIO"
+                "longnamefs-rs v2: WARNING: read for passthrough fh {fh} unexpectedly reached userspace; falling back to userspace IO"
             );
-            reply.error(libc::EIO);
+            let Some(entry) = self.inode_store.get(ino) else {
+                reply.error(libc::ESTALE);
+                return;
+            };
+
+            #[cfg(feature = "abi-7-40")]
+            let meta_fd = self
+                .get_passthrough_handle(fh)
+                .and_then(|handle| handle.meta_fd());
+            #[cfg(not(feature = "abi-7-40"))]
+            let meta_fd: Option<Arc<OwnedFd>> = None;
+
+            let mut buf = vec![0u8; size as usize];
+            if let Some(fd) = meta_fd.as_ref() {
+                match retry_eintr(|| pread(fd.as_fd(), &mut buf, offset)) {
+                    Ok(read_len) => {
+                        buf.truncate(read_len);
+                        reply.data(&buf);
+                        return;
+                    }
+                    Err(nix::errno::Errno::EBADF | nix::errno::Errno::EACCES) => {
+                        // Fall through: meta_fd isn't readable (or isn't valid), open a fresh fd.
+                    }
+                    Err(err) => {
+                        reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                        return;
+                    }
+                }
+            }
+
+            let fd = match self.open_backend_file(&entry, libc::O_RDONLY as u32) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+
+            match retry_eintr(|| pread(fd.as_fd(), &mut buf, offset)) {
+                Ok(read_len) => {
+                    buf.truncate(read_len);
+                    reply.data(&buf);
+                }
+                Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
+            }
             return;
         }
         let Some(handle) = self.handles.get_file(fh) else {
@@ -6176,9 +6577,72 @@ impl FuserFilesystem for LongNameFsV2Fuser {
     ) {
         if self.is_passthrough_fh(fh) {
             eprintln!(
-                "longnamefs-rs v2: write for passthrough fh {fh} unexpectedly reached userspace; returning EIO"
+                "longnamefs-rs v2: WARNING: write for passthrough fh {fh} unexpectedly reached userspace; falling back to userspace IO"
             );
-            reply.error(libc::EIO);
+            let Some(entry) = self.inode_store.get(ino) else {
+                reply.error(libc::ESTALE);
+                return;
+            };
+
+            #[cfg(feature = "abi-7-40")]
+            let meta_fd = self
+                .get_passthrough_handle(fh)
+                .and_then(|handle| handle.meta_fd());
+            #[cfg(not(feature = "abi-7-40"))]
+            let meta_fd: Option<Arc<OwnedFd>> = None;
+
+            let try_write = |fd: BorrowedFd<'_>| retry_eintr(|| pwrite(fd, data, offset));
+
+            if let Some(fd) = meta_fd.as_ref() {
+                match try_write(fd.as_fd()) {
+                    Ok(written) => {
+                        if self.core.config.sync_data() {
+                            let _ = fdatasync(fd.as_fd());
+                        }
+                        if let Ok(path) = self.entry_path(&entry)
+                            && path != OsStr::new("/")
+                            && let Ok(mapped) = self.core.resolve_path(&path)
+                        {
+                            self.invalidate_dir(mapped.dir_fd.as_fd());
+                        }
+                        self.notify_inode(ino);
+                        reply.written(written as u32);
+                        return;
+                    }
+                    Err(nix::errno::Errno::EBADF | nix::errno::Errno::EACCES) => {
+                        // Fall through: meta_fd isn't writable (or isn't valid), open a fresh fd.
+                    }
+                    Err(err) => {
+                        reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                        return;
+                    }
+                }
+            }
+
+            let fd = match self.open_backend_file(&entry, libc::O_WRONLY as u32) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+
+            match try_write(fd.as_fd()) {
+                Ok(written) => {
+                    if self.core.config.sync_data() {
+                        let _ = fdatasync(fd.as_fd());
+                    }
+                    if let Ok(path) = self.entry_path(&entry)
+                        && path != OsStr::new("/")
+                        && let Ok(mapped) = self.core.resolve_path(&path)
+                    {
+                        self.invalidate_dir(mapped.dir_fd.as_fd());
+                    }
+                    self.notify_inode(ino);
+                    reply.written(written as u32);
+                }
+                Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
+            }
             return;
         }
         let Some(handle) = self.handles.get_file(fh) else {
@@ -6201,6 +6665,91 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 reply.written(written as u32);
             }
             Err(err) => reply.error(core_err_to_errno(&core_errno_from_nix(err))),
+        }
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &FuserRequest<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: FuserReplyEmpty,
+    ) {
+        if offset < 0 || length < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let mode = FallocateFlags::from_bits_truncate(mode);
+            let offset = offset as libc::off_t;
+            let length = length as libc::off_t;
+
+            if let Some(handle) = self.handles.get_file(fh) {
+                if let Err(err) = nix_fallocate(handle.as_fd(), mode, offset, length) {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+                reply.ok();
+                return;
+            }
+
+            if self.is_passthrough_fh(fh) {
+                #[cfg(feature = "abi-7-40")]
+                let meta_fd = self
+                    .get_passthrough_handle(fh)
+                    .and_then(|handle| handle.meta_fd());
+                #[cfg(not(feature = "abi-7-40"))]
+                let meta_fd: Option<Arc<OwnedFd>> = None;
+
+                if let Some(fd) = meta_fd.as_ref() {
+                    match nix_fallocate(fd.as_fd(), mode, offset, length) {
+                        Ok(()) => {
+                            reply.ok();
+                            return;
+                        }
+                        Err(nix::errno::Errno::EBADF | nix::errno::Errno::EACCES) => {
+                            // Fall through: meta_fd isn't writable (or isn't valid), open a fresh fd.
+                        }
+                        Err(err) => {
+                            reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                            return;
+                        }
+                    }
+                }
+
+                let Some(entry) = self.inode_store.get(ino) else {
+                    reply.error(libc::ESTALE);
+                    return;
+                };
+
+                let fd = match self.open_backend_file(&entry, libc::O_WRONLY as u32) {
+                    Ok(fd) => fd,
+                    Err(err) => {
+                        reply.error(core_err_to_errno(&err));
+                        return;
+                    }
+                };
+
+                if let Err(err) = nix_fallocate(fd.as_fd(), mode, offset, length) {
+                    reply.error(core_err_to_errno(&core_errno_from_nix(err)));
+                    return;
+                }
+                reply.ok();
+                return;
+            }
+
+            reply.error(libc::EBADF);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (ino, fh, offset, length, mode);
+            reply.error(libc::EOPNOTSUPP);
         }
     }
 
