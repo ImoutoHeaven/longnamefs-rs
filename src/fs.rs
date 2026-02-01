@@ -11,6 +11,7 @@ use fuse3::notify::Notify;
 use fuse3::path::prelude::*;
 use fuse3::path::reply::{DirectoryEntryPlus, ReplyPoll, ReplyXAttr};
 use fuse3::{FileType, SetAttr};
+use nix::errno::Errno;
 use nix::fcntl::{AtFlags, OFlag, openat, readlinkat, renameat};
 use nix::sys::stat::{
     FchmodatFlags, Mode, SFlag, UtimensatFlags, fchmodat, fstat, fstatat, mkdirat, mknodat,
@@ -24,7 +25,7 @@ use nix::unistd::{
     symlinkat, unlinkat,
 };
 use std::collections::HashMap;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -188,14 +189,38 @@ impl LongNameFs {
 
         let mapped = open_path(&self.config, path)?;
         let fname = string_to_cstring(&mapped.fname)?;
-        let fd = openat(
-            mapped.dir_fd.as_fd(),
-            fname.as_c_str(),
-            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(errno_from_nix)?;
+        let fd = self.openat_nofollow_for_xattr(mapped.dir_fd.as_fd(), fname.as_c_str())?;
         func(fd.as_fd())
+    }
+
+    fn openat_nofollow_for_xattr(
+        &self,
+        dir_fd: BorrowedFd<'_>,
+        name: &CStr,
+    ) -> Result<OwnedFd, fuse3::Errno> {
+        match openat(
+            dir_fd,
+            name,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(fd) => Ok(fd),
+            Err(Errno::EISDIR) => openat(
+                dir_fd,
+                name,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(errno_from_nix),
+            Err(Errno::ELOOP) => openat(
+                dir_fd,
+                name,
+                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(errno_from_nix),
+            Err(err) => Err(errno_from_nix(err)),
+        }
     }
 
     fn stat_path(&self, path: &OsStr) -> Result<FileAttr, fuse3::Errno> {
@@ -1117,5 +1142,136 @@ impl PathFilesystem for LongNameFs {
             return Err(fuse3::Errno::from(libc::EBADF));
         }
         Ok(ReplyPoll { revents: 0 })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::namefile::write_namefile;
+    use crate::pathmap::open_path;
+    use crate::util::string_to_cstring;
+    use nix::fcntl::open;
+    use std::ffi::CString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let mut path = std::env::temp_dir();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            path.push(format!("lnfs_v1_test_{}_{}", std::process::id(), nanos));
+            fs::create_dir(&path).expect("create temp dir");
+            TempDir(path)
+        }
+
+        fn path(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn opath_fgetxattr_ebadf(dir_fd: BorrowedFd<'_>, name: &CStr, xattr: &CStr) -> bool {
+        let fd = match openat(
+            dir_fd,
+            name,
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => return false,
+        };
+        let res =
+            unsafe { libc::fgetxattr(fd.as_raw_fd(), xattr.as_ptr(), std::ptr::null_mut(), 0) };
+        if res >= 0 {
+            return false;
+        }
+        matches!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF))
+    }
+
+    #[test]
+    fn with_xattr_target_reads_xattr_when_opath_fails() {
+        let tmp = TempDir::new();
+        let xattr = CString::new("user.opath_test").unwrap();
+        let value = b"opath-value";
+        let config = Config::open_backend(tmp.path().clone(), false, true).unwrap();
+        let mapped = open_path(&config, OsStr::new("/x")).unwrap();
+        let fname = string_to_cstring(&mapped.fname).unwrap();
+        let data_fd = openat(
+            mapped.dir_fd.as_fd(),
+            fname.as_c_str(),
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        write_namefile(&mapped).unwrap();
+
+        let res = unsafe {
+            libc::fsetxattr(
+                data_fd.as_raw_fd(),
+                xattr.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        };
+        if res < 0 {
+            let err = io::Error::last_os_error();
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EPERM)
+            ) {
+                return;
+            }
+            panic!("setxattr failed: {err:?}");
+        }
+
+        let dir_fd = open(
+            tmp.path(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        if !opath_fgetxattr_ebadf(dir_fd.as_fd(), fname.as_c_str(), xattr.as_c_str()) {
+            return;
+        }
+
+        let fs = LongNameFs::new(config, None, 64);
+        let got = fs
+            .with_xattr_target(OsStr::new("/x"), |fd| {
+                let size = unsafe {
+                    libc::fgetxattr(fd.as_raw_fd(), xattr.as_ptr(), std::ptr::null_mut(), 0)
+                };
+                if size < 0 {
+                    return Err(fuse3::Errno::from(libc::EIO));
+                }
+                let mut buf = vec![0u8; size as usize];
+                let res = unsafe {
+                    libc::fgetxattr(
+                        fd.as_raw_fd(),
+                        xattr.as_ptr(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if res < 0 {
+                    return Err(fuse3::Errno::from(libc::EIO));
+                }
+                buf.truncate(res as usize);
+                Ok(buf)
+            })
+            .unwrap();
+        assert_eq!(got, value);
     }
 }

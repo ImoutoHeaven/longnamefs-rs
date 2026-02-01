@@ -62,6 +62,7 @@ const RENAMEAT2_PROBE_NAME: &str = ".ln2_fs_renameat2_probe";
 const CREATE_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_ctmp_";
 const RENAME_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_rtmp_";
 static TMP_INTERNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+static OPATH_XATTR_WARNED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "abi-7-40")]
 const PASSTHROUGH_BACKING_CACHE_MAX_ENTRIES: usize = 4096;
 
@@ -1818,6 +1819,32 @@ fn get_internal_rawname(fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
     }
 }
 
+fn get_internal_rawname_at(dir_fd: BorrowedFd<'_>, name: &CStr) -> CoreResult<Vec<u8>> {
+    let fd = nix::fcntl::openat(
+        dir_fd,
+        name,
+        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    );
+    if let Ok(fd) = fd {
+        match get_internal_rawname(fd.as_fd()) {
+            Ok(raw) => return Ok(raw),
+            Err(CoreError::Io(ref ioe)) if ioe.raw_os_error() == Some(libc::EBADF) => {
+                if !OPATH_XATTR_WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "longnamefs-rs v2: WARNING: O_PATH fgetxattr EBADF for backend entry {:?}; retrying with readable fd",
+                        name.to_bytes()
+                    );
+                }
+                // Some kernels reject fgetxattr on O_PATH; retry with a readable fd.
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let fd = openat_nofollow_for_xattr(dir_fd, name)?;
+    get_internal_rawname(fd.as_fd())
+}
+
 fn verify_backend_supports_xattr(dir_fd: BorrowedFd<'_>) -> CoreResult<()> {
     let fname = core_string_to_cstring(XATTR_CHECK_NAME)?;
     let _ = unlinkat(dir_fd, fname.as_c_str(), UnlinkatFlags::NoRemoveDir);
@@ -1895,16 +1922,7 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let fd = match nix::fcntl::openat(
-                dir_fd,
-                c_name.as_c_str(),
-                OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(_) => continue,
-            };
-            let raw_name = match get_internal_rawname(fd.as_fd()) {
+            let raw_name = match get_internal_rawname_at(dir_fd, c_name.as_c_str()) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -1937,16 +1955,8 @@ fn rebuild_dir_index_from_backend(dir_fd: BorrowedFd<'_>) -> CoreResult<DirIndex
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let fd = match nix::fcntl::openat(
-                        dup_fd.as_fd(),
-                        c_name.as_c_str(),
-                        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                        Mode::empty(),
-                    ) {
-                        Ok(fd) => fd,
-                        Err(_) => continue,
-                    };
-                    let raw_name = match get_internal_rawname(fd.as_fd()) {
+                    let raw_name = match get_internal_rawname_at(dup_fd.as_fd(), c_name.as_c_str())
+                    {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
@@ -2297,16 +2307,7 @@ fn list_logical_entries(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let fd = match nix::fcntl::openat(
-            dir_fd,
-            c_name.as_c_str(),
-            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(_) => continue,
-        };
-        if let Ok(raw_name) = get_internal_rawname(fd.as_fd())
+        if let Ok(raw_name) = get_internal_rawname_at(dir_fd, c_name.as_c_str())
             && raw_name.len() <= max_name_len
         {
             repairs.insert(backend_name.clone(), raw_name);
@@ -2428,14 +2429,7 @@ fn map_long_for_lookup(
             .map_err(|_| CoreError::from_errno(libc::EINVAL))?;
         match fstatat(dir_fd, c_name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(_) => {
-                let fd = nix::fcntl::openat(
-                    dir_fd,
-                    c_name.as_c_str(),
-                    OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                    Mode::empty(),
-                )
-                .map_err(core_errno_from_nix)?;
-                if let Ok(raw_name) = get_internal_rawname(fd.as_fd())
+                if let Ok(raw_name) = get_internal_rawname_at(dir_fd, c_name.as_c_str())
                     && raw_name == raw
                 {
                     {
@@ -2563,14 +2557,7 @@ fn handle_backend_eexist_index_missing(
     desired_raw: &[u8],
 ) -> CoreResult<CreateDecision> {
     let c_name = cstring_from_bytes(backend_name)?;
-    let fd = nix::fcntl::openat(
-        dir_fd,
-        c_name.as_c_str(),
-        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(core_errno_from_nix)?;
-    let existing_raw = get_internal_rawname(fd.as_fd())?;
+    let existing_raw = get_internal_rawname_at(dir_fd, c_name.as_c_str())?;
     {
         let mut guard = state.index.write();
         guard
@@ -2591,14 +2578,7 @@ fn refresh_dir_index_from_backend(
     backend_name: &[u8],
 ) -> CoreResult<Vec<u8>> {
     let c_name = cstring_from_bytes(backend_name)?;
-    let fd = nix::fcntl::openat(
-        dir_fd,
-        c_name.as_c_str(),
-        OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(core_errno_from_nix)?;
-    let raw = get_internal_rawname(fd.as_fd())?;
+    let raw = get_internal_rawname_at(dir_fd, c_name.as_c_str())?;
     Ok(raw)
 }
 
@@ -3134,9 +3114,8 @@ impl LongNameFsCore {
         };
 
         let src_c = src_backend.as_cstring()?;
-        let src_fd = openat_nofollow_for_xattr(src.ctx.dir_fd.as_fd(), src_c.as_c_str())?;
-        let old_raw =
-            get_internal_rawname(src_fd.as_fd()).unwrap_or_else(|_| src.path.logical_name.clone());
+        let old_raw = get_internal_rawname_at(src.ctx.dir_fd.as_fd(), src_c.as_c_str())
+            .unwrap_or_else(|_| src.path.logical_name.clone());
 
         let tmp_internal = select_rename_tmp_internal_name(dst.ctx.dir_fd.as_fd())?;
         let tmp_backend = BackendName::Internal(tmp_internal.clone());
@@ -7241,6 +7220,7 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::{CString, OsStr};
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -7555,5 +7535,110 @@ mod tests {
             .expect("index should load after persist");
         assert!(loaded.has_base_index);
         assert!(loaded.index.contains_key(&backend_name));
+    }
+
+    fn opath_rawname_ebadf(dir_fd: BorrowedFd<'_>, name: &CStr) -> bool {
+        let fd = match nix::fcntl::openat(
+            dir_fd,
+            name,
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => return false,
+        };
+        match get_internal_rawname(fd.as_fd()) {
+            Ok(_) => false,
+            Err(CoreError::Io(ref ioe)) if ioe.raw_os_error() == Some(libc::EBADF) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn capture_stderr<F, T>(func: F) -> (T, Vec<u8>)
+    where
+        F: FnOnce() -> T,
+    {
+        unsafe {
+            let mut fds = [0; 2];
+            if libc::pipe(fds.as_mut_ptr()) != 0 {
+                panic!("pipe failed");
+            }
+            let read_fd = fds[0];
+            let write_fd = fds[1];
+            let saved = libc::dup(libc::STDERR_FILENO);
+            if saved < 0 {
+                libc::close(read_fd);
+                libc::close(write_fd);
+                panic!("dup stderr failed");
+            }
+            if libc::dup2(write_fd, libc::STDERR_FILENO) < 0 {
+                libc::close(read_fd);
+                libc::close(write_fd);
+                libc::close(saved);
+                panic!("dup2 stderr failed");
+            }
+            libc::close(write_fd);
+
+            let result = func();
+            let _ = std::io::stderr().flush();
+
+            if libc::dup2(saved, libc::STDERR_FILENO) < 0 {
+                libc::close(read_fd);
+                libc::close(saved);
+                panic!("restore stderr failed");
+            }
+            libc::close(saved);
+
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = libc::read(read_fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len());
+                if n <= 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n as usize]);
+            }
+            libc::close(read_fd);
+            (result, buf)
+        }
+    }
+
+    #[test]
+    fn rebuild_dir_index_recovers_rawname_when_opath_xattr_fails() {
+        let tmp = TempDir::new();
+        let dir_fd = nix::fcntl::open(
+            tmp.path(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let name = CString::new(".__ln2_opath_probe").unwrap();
+        let _file_fd = nix::fcntl::openat(
+            dir_fd.as_fd(),
+            name.as_c_str(),
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+
+        let raw = b"opath-probe-rawname".to_vec();
+        set_internal_rawname_at(dir_fd.as_fd(), name.as_c_str(), &raw).unwrap();
+
+        if !opath_rawname_ebadf(dir_fd.as_fd(), name.as_c_str()) {
+            return;
+        }
+
+        OPATH_XATTR_WARNED.store(false, Ordering::Relaxed);
+        let (index, stderr) =
+            capture_stderr(|| rebuild_dir_index_from_backend(dir_fd.as_fd()).unwrap());
+        let entry = index
+            .get(name.as_bytes())
+            .expect("index entry should exist");
+        assert_eq!(entry.raw_name.as_ref(), raw.as_slice());
+        assert!(OPATH_XATTR_WARNED.load(Ordering::Relaxed));
+        if !stderr.is_empty() {
+            let stderr_text = String::from_utf8_lossy(&stderr);
+            assert!(stderr_text.contains("O_PATH fgetxattr EBADF"));
+        }
     }
 }
