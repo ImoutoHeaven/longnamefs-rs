@@ -6,7 +6,7 @@ use nix::sys::stat::{FileStat, Mode};
 use nix::unistd::{fdatasync, fsync};
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,19 @@ fn io_error_from_nix(err: nix::Error) -> io::Error {
 
 pub fn string_to_cstring(value: &str) -> Result<CString, fuse3::Errno> {
     CString::new(value.as_bytes()).map_err(|_| fuse3::Errno::from(libc::EINVAL))
+}
+
+pub fn procfs_path_for(dir_fd: BorrowedFd<'_>, name: &CStr) -> Option<CString> {
+    // Caller must pass a single path segment (no '/').
+    if name.to_bytes().contains(&b'/') {
+        return None;
+    }
+    let mut path = Vec::new();
+    path.extend_from_slice(b"/proc/self/fd/");
+    path.extend_from_slice(dir_fd.as_raw_fd().to_string().as_bytes());
+    path.push(b'/');
+    path.extend_from_slice(name.to_bytes());
+    CString::new(path).ok()
 }
 
 pub fn file_type_from_mode(mode: libc::mode_t) -> FileType {

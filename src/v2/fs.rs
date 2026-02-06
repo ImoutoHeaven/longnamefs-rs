@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::util::{access_mask_from_bits, core_begin_temp_file, oflag_from_bits, retry_eintr};
+use crate::util::{access_mask_from_bits, core_begin_temp_file, oflag_from_bits, procfs_path_for, retry_eintr};
 use crate::v2::error::{CoreError, CoreResult, core_err_to_errno};
 use crate::v2::index::{
     DirIndex, FS_INTERNAL_PREFIX, IndexLoadResult, JOURNAL_MAX_BYTES, JOURNAL_MAX_OPS,
@@ -63,6 +63,9 @@ const CREATE_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_ctmp_";
 const RENAME_TMP_INTERNAL_PREFIX: &str = ".ln2_fs_rtmp_";
 static TMP_INTERNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 static OPATH_XATTR_WARNED: AtomicBool = AtomicBool::new(false);
+static PROCFS_XATTR_WARNED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static PROCFS_SYMLINK_FALLBACK_USED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "abi-7-40")]
 const PASSTHROUGH_BACKING_CACHE_MAX_ENTRIES: usize = 4096;
 
@@ -1682,12 +1685,49 @@ fn openat_nofollow_for_xattr(dir_fd: BorrowedFd<'_>, name: &CStr) -> CoreResult<
 }
 
 fn set_internal_rawname_at(dir_fd: BorrowedFd<'_>, name: &CStr, raw: &[u8]) -> CoreResult<()> {
-    let fd = openat_nofollow_for_xattr(dir_fd, name)?;
+    let fd = match nix::fcntl::openat(
+        dir_fd,
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::EISDIR) => nix::fcntl::openat(
+            dir_fd,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(core_errno_from_nix)?,
+        Err(nix::errno::Errno::ELOOP) => {
+            if let Some(proc_path) = procfs_path_for(dir_fd, name) {
+                mark_procfs_symlink_fallback();
+                return match set_internal_rawname_via_procfs_path(proc_path.as_c_str(), name, raw) {
+                    Ok(()) => Ok(()),
+                    Err(err) if is_procfs_unavailable(&err) => {
+                        Err(CoreError::from_errno(libc::ELOOP))
+                    }
+                    Err(err) => Err(err),
+                };
+            }
+            return Err(CoreError::from_errno(libc::ELOOP));
+        }
+        Err(err) => return Err(core_errno_from_nix(err)),
+    };
     match set_internal_rawname(fd.as_fd(), raw) {
         Ok(()) => Ok(()),
         Err(CoreError::Io(ref ioe)) if ioe.raw_os_error() == Some(libc::EBADF) => {
-            // Some kernels reject certain operations on O_PATH fds; reopen with a normal
-            // access mode and retry (similar to v1's O_PATH fsync workaround).
+            if let Some(proc_path) = procfs_path_for(dir_fd, name) {
+                match set_internal_rawname_via_procfs_path(proc_path.as_c_str(), name, raw) {
+                    Ok(()) => return Ok(()),
+                    Err(err) if is_procfs_unavailable(&err) => {
+                        return Err(CoreError::from_errno(libc::EBADF));
+                    }
+                    Err(_) => {}
+                }
+            }
+            // Some kernels reject xattr operations on metadata fds; reopen with a normal
+            // access mode and retry (similar to v1's fsync workaround).
             let reopened = match nix::fcntl::openat(
                 dir_fd,
                 name,
@@ -1695,7 +1735,22 @@ fn set_internal_rawname_at(dir_fd: BorrowedFd<'_>, name: &CStr, raw: &[u8]) -> C
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
-                Err(nix::errno::Errno::ELOOP) => return Err(CoreError::from_errno(libc::EBADF)),
+                Err(nix::errno::Errno::ELOOP) => {
+                    if let Some(proc_path) = procfs_path_for(dir_fd, name) {
+                        match set_internal_rawname_via_procfs_path(
+                            proc_path.as_c_str(),
+                            name,
+                            raw,
+                        ) {
+                            Ok(()) => return Ok(()),
+                            Err(err) if is_procfs_unavailable(&err) => {
+                                return Err(CoreError::from_errno(libc::EBADF));
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    return Err(CoreError::from_errno(libc::EBADF));
+                }
                 Err(nix::errno::Errno::EISDIR) => nix::fcntl::openat(
                     dir_fd,
                     name,
@@ -1782,6 +1837,62 @@ fn set_internal_rawname(fd: BorrowedFd<'_>, raw: &[u8]) -> CoreResult<()> {
     Ok(())
 }
 
+fn warn_procfs_fallback(name: &CStr) {
+    if !PROCFS_XATTR_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "longnamefs-rs v2: WARNING: using /proc/self/fd fallback for rawname xattr on {:?}",
+            name.to_bytes()
+        );
+    }
+}
+
+fn is_procfs_unavailable(err: &CoreError) -> bool {
+    match err {
+        CoreError::Io(ioe) => matches!(ioe.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR))
+            && !Path::new("/proc/self/fd").exists(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn mark_procfs_symlink_fallback() {
+    PROCFS_SYMLINK_FALLBACK_USED.store(true, Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn mark_procfs_symlink_fallback() {}
+
+fn set_internal_rawname_via_path(path: &CStr, raw: &[u8]) -> CoreResult<()> {
+    let name = CString::new(RAWNAME_XATTR.as_bytes()).unwrap();
+    let res = unsafe {
+        libc::lsetxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            raw.as_ptr() as *const libc::c_void,
+            raw.len(),
+            0,
+        )
+    };
+    if res < 0 {
+        let err = io::Error::last_os_error();
+        let raw_err = err.raw_os_error().unwrap_or(libc::EIO);
+        if raw_err == libc::ENOSPC || raw_err == libc::E2BIG {
+            return Err(CoreError::NameTooLong);
+        }
+        return Err(CoreError::from_errno(raw_err));
+    }
+    Ok(())
+}
+
+fn set_internal_rawname_via_procfs_path(
+    proc_path: &CStr,
+    name: &CStr,
+    raw: &[u8],
+) -> CoreResult<()> {
+    warn_procfs_fallback(name);
+    set_internal_rawname_via_path(proc_path, raw)
+}
+
 fn get_internal_rawname(fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
     let name = CString::new(RAWNAME_XATTR.as_bytes()).unwrap();
     let res = unsafe { libc::fgetxattr(fd.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
@@ -1819,27 +1930,93 @@ fn get_internal_rawname(fd: BorrowedFd<'_>) -> CoreResult<Vec<u8>> {
     }
 }
 
+fn get_internal_rawname_via_path(path: &CStr) -> CoreResult<Vec<u8>> {
+    let name = CString::new(RAWNAME_XATTR.as_bytes()).unwrap();
+    let res = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if res < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut buf = vec![0u8; res as usize];
+    let mut did_retry = false;
+    loop {
+        let res = unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if res >= 0 {
+            buf.truncate(res as usize);
+            return Ok(buf);
+        }
+
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ERANGE) && !did_retry {
+            did_retry = true;
+            let size =
+                unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+            if size < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            buf.resize(size as usize, 0u8);
+            continue;
+        }
+        return Err(err.into());
+    }
+}
+
+fn get_internal_rawname_via_procfs_path(proc_path: &CStr, name: &CStr) -> CoreResult<Vec<u8>> {
+    warn_procfs_fallback(name);
+    get_internal_rawname_via_path(proc_path)
+}
+
 fn get_internal_rawname_at(dir_fd: BorrowedFd<'_>, name: &CStr) -> CoreResult<Vec<u8>> {
+    let proc_path = procfs_path_for(dir_fd, name);
+    let mut procfs_raw = None;
     let fd = nix::fcntl::openat(
         dir_fd,
         name,
         OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
     );
-    if let Ok(fd) = fd {
-        match get_internal_rawname(fd.as_fd()) {
+    match fd {
+        Ok(fd) => match get_internal_rawname(fd.as_fd()) {
             Ok(raw) => return Ok(raw),
             Err(CoreError::Io(ref ioe)) if ioe.raw_os_error() == Some(libc::EBADF) => {
-                if !OPATH_XATTR_WARNED.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "longnamefs-rs v2: WARNING: O_PATH fgetxattr EBADF for backend entry {:?}; retrying with readable fd",
-                        name.to_bytes()
-                    );
+                if let Some(proc_path) = proc_path.as_ref() {
+                    if let Ok(raw) =
+                        get_internal_rawname_via_procfs_path(proc_path.as_c_str(), name)
+                    {
+                        procfs_raw = Some(raw);
+                    }
                 }
-                // Some kernels reject fgetxattr on O_PATH; retry with a readable fd.
             }
             Err(err) => return Err(err),
+        },
+        Err(nix::errno::Errno::ELOOP) => {
+            if let Some(proc_path) = proc_path.as_ref() {
+                return match get_internal_rawname_via_procfs_path(proc_path.as_c_str(), name) {
+                    Ok(raw) => Ok(raw),
+                    Err(err) if is_procfs_unavailable(&err) => {
+                        Err(CoreError::from_errno(libc::ELOOP))
+                    }
+                    Err(err) => Err(err),
+                };
+            }
+            return Err(CoreError::from_errno(libc::ELOOP));
         }
+        Err(err) => return Err(core_errno_from_nix(err)),
+    }
+    if !OPATH_XATTR_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "longnamefs-rs v2: WARNING: O_PATH fgetxattr EBADF for backend entry {:?}; retrying with readable fd",
+            name.to_bytes()
+        );
+    }
+    if let Some(raw) = procfs_raw {
+        return Ok(raw);
     }
     let fd = openat_nofollow_for_xattr(dir_fd, name)?;
     get_internal_rawname(fd.as_fd())
@@ -7348,6 +7525,88 @@ mod tests {
         let fd = openat_nofollow_for_xattr(dir_fd.as_fd(), name.as_c_str()).unwrap();
         let got = get_internal_rawname(fd.as_fd()).unwrap();
         assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn set_internal_rawname_at_supports_symlink_via_procfs() {
+        let tmp = TempDir::new();
+        let dir_fd = nix::fcntl::open(
+            tmp.path(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let name = CString::new(".__ln2_symlink").unwrap();
+        symlinkat("target", dir_fd.as_fd(), name.as_c_str()).unwrap();
+
+        let raw = b"rawname-symlink".to_vec();
+        let res = set_internal_rawname_at(dir_fd.as_fd(), name.as_c_str(), &raw);
+        if let Err(CoreError::Io(ref ioe)) = res {
+            if matches!(
+                ioe.raw_os_error(),
+                Some(libc::EOPNOTSUPP)
+                    | Some(libc::ENOSYS)
+                    | Some(libc::EPERM)
+                    | Some(libc::ELOOP)
+            ) {
+                return;
+            }
+        }
+        res.unwrap();
+
+        let got = get_internal_rawname_at(dir_fd.as_fd(), name.as_c_str()).unwrap();
+        assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn set_internal_rawname_at_uses_procfs_when_openat_eloop() {
+        let tmp = TempDir::new();
+        let dir_fd = nix::fcntl::open(
+            tmp.path(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let name = CString::new(".__ln2_symlink_eloop").unwrap();
+        symlinkat("target", dir_fd.as_fd(), name.as_c_str()).unwrap();
+
+        PROCFS_SYMLINK_FALLBACK_USED.store(false, Ordering::Relaxed);
+        let raw = b"rawname-eloop".to_vec();
+        let res = set_internal_rawname_at(dir_fd.as_fd(), name.as_c_str(), &raw);
+        if let Err(CoreError::Io(ref ioe)) = res {
+            if matches!(
+                ioe.raw_os_error(),
+                Some(libc::EOPNOTSUPP)
+                    | Some(libc::ENOSYS)
+                    | Some(libc::EPERM)
+                    | Some(libc::ELOOP)
+            ) {
+                assert!(
+                    PROCFS_SYMLINK_FALLBACK_USED.load(Ordering::Relaxed),
+                    "expected procfs fallback on openat ELOOP"
+                );
+                return;
+            }
+        }
+
+        assert!(
+            PROCFS_SYMLINK_FALLBACK_USED.load(Ordering::Relaxed),
+            "expected procfs fallback on openat ELOOP"
+        );
+    }
+
+    #[test]
+    fn procfs_unavailable_error_detection() {
+        let missing = CoreError::Io(io::Error::from_raw_os_error(libc::ENOENT));
+        let denied = CoreError::Io(io::Error::from_raw_os_error(libc::EACCES));
+        let forbidden = CoreError::Io(io::Error::from_raw_os_error(libc::EPERM));
+        let other = CoreError::Io(io::Error::from_raw_os_error(libc::EIO));
+
+        let procfs_exists = Path::new("/proc/self/fd").exists();
+        assert_eq!(is_procfs_unavailable(&missing), !procfs_exists);
+        assert!(!is_procfs_unavailable(&denied));
+        assert!(!is_procfs_unavailable(&forbidden));
+        assert!(!is_procfs_unavailable(&other));
     }
 
     #[test]

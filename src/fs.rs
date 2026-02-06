@@ -3,8 +3,8 @@ use crate::handle_table::HandleTable;
 use crate::namefile::{DirEntryInfo, list_logical_entries, remove_namefile, write_namefile};
 use crate::pathmap::{clear_dir_fd_cache, make_child_path, open_path, open_paths};
 use crate::util::{
-    access_mask_from_bits, errno_from_nix, file_attr_from_stat, oflag_from_bits, retry_eintr,
-    string_to_cstring,
+    access_mask_from_bits, errno_from_nix, file_attr_from_stat, oflag_from_bits,
+    procfs_path_for, retry_eintr, string_to_cstring,
 };
 use bytes::Bytes;
 use fuse3::notify::Notify;
@@ -181,16 +181,17 @@ impl LongNameFs {
 
     fn with_xattr_target<F, T>(&self, path: &OsStr, func: F) -> Result<T, fuse3::Errno>
     where
-        F: FnOnce(BorrowedFd<'_>) -> Result<T, fuse3::Errno>,
+        F: FnOnce(BorrowedFd<'_>, Option<&CStr>) -> Result<T, fuse3::Errno>,
     {
         if path == OsStr::new("/") {
-            return func(self.config.backend_fd());
+            return func(self.config.backend_fd(), None);
         }
 
         let mapped = open_path(&self.config, path)?;
         let fname = string_to_cstring(&mapped.fname)?;
+        let proc_path = procfs_path_for(mapped.dir_fd.as_fd(), fname.as_c_str());
         let fd = self.openat_nofollow_for_xattr(mapped.dir_fd.as_fd(), fname.as_c_str())?;
-        func(fd.as_fd())
+        func(fd.as_fd(), proc_path.as_ref().map(|path| path.as_c_str()))
     }
 
     fn openat_nofollow_for_xattr(
@@ -220,6 +221,28 @@ impl LongNameFs {
             )
             .map_err(errno_from_nix),
             Err(err) => Err(errno_from_nix(err)),
+        }
+    }
+
+    fn with_procfs_xattr_fallback<T, F, G>(
+        proc_path: Option<&CStr>,
+        fcall: F,
+        lcall: G,
+    ) -> Result<T, fuse3::Errno>
+    where
+        F: FnOnce() -> Result<T, io::Error>,
+        G: FnOnce(&CStr) -> Result<T, io::Error>,
+    {
+        match fcall() {
+            Ok(value) => Ok(value),
+            Err(err) if err.raw_os_error() == Some(libc::EBADF) => {
+                if let Some(proc_path) = proc_path {
+                    lcall(proc_path).map_err(Into::into)
+                } else {
+                    Err(err.into())
+                }
+            }
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -778,20 +801,42 @@ impl PathFilesystem for LongNameFs {
             return Err(fuse3::Errno::from(libc::EINVAL));
         }
         let name = xattr_name_to_cstring(name)?;
-        self.with_xattr_target(path, |fd| {
-            let res = unsafe {
-                libc::fsetxattr(
-                    fd.as_raw_fd(),
-                    name.as_ptr(),
-                    value.as_ptr() as *const libc::c_void,
-                    value.len(),
-                    flags as libc::c_int,
-                )
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            Ok(())
+        self.with_xattr_target(path, |fd, proc_path| {
+            Self::with_procfs_xattr_fallback(
+                proc_path,
+                || {
+                    let res = unsafe {
+                        libc::fsetxattr(
+                            fd.as_raw_fd(),
+                            name.as_ptr(),
+                            value.as_ptr() as *const libc::c_void,
+                            value.len(),
+                            flags as libc::c_int,
+                        )
+                    };
+                    if res < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |proc_path| {
+                    let res = unsafe {
+                        libc::lsetxattr(
+                            proc_path.as_ptr(),
+                            name.as_ptr(),
+                            value.as_ptr() as *const libc::c_void,
+                            value.len(),
+                            flags as libc::c_int,
+                        )
+                    };
+                    if res < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
         })
     }
 
@@ -803,29 +848,75 @@ impl PathFilesystem for LongNameFs {
         size: u32,
     ) -> Result<ReplyXAttr, fuse3::Errno> {
         let name = xattr_name_to_cstring(name)?;
-        self.with_xattr_target(path, |fd| {
+        self.with_xattr_target(path, |fd, proc_path| {
             let raw_fd = fd.as_raw_fd();
             if size == 0 {
-                let res =
-                    unsafe { libc::fgetxattr(raw_fd, name.as_ptr(), std::ptr::null_mut(), 0) };
-                if res < 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
+                let res = Self::with_procfs_xattr_fallback(
+                    proc_path,
+                    || {
+                        let res = unsafe {
+                            libc::fgetxattr(raw_fd, name.as_ptr(), std::ptr::null_mut(), 0)
+                        };
+                        if res < 0 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(res)
+                        }
+                    },
+                    |proc_path| {
+                        let res = unsafe {
+                            libc::lgetxattr(
+                                proc_path.as_ptr(),
+                                name.as_ptr(),
+                                std::ptr::null_mut(),
+                                0,
+                            )
+                        };
+                        if res < 0 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(res)
+                        }
+                    },
+                )?;
                 return Ok(ReplyXAttr::Size(res as u32));
             }
 
             let mut buf = vec![0u8; size as usize];
-            let res = unsafe {
-                libc::fgetxattr(
-                    raw_fd,
-                    name.as_ptr(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    size as usize,
-                )
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error().into());
-            }
+            let buf_ptr = buf.as_mut_ptr();
+            let res = Self::with_procfs_xattr_fallback(
+                proc_path,
+                || {
+                    let res = unsafe {
+                        libc::fgetxattr(
+                            raw_fd,
+                            name.as_ptr(),
+                            buf_ptr as *mut libc::c_void,
+                            size as usize,
+                        )
+                    };
+                    if res < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(res)
+                    }
+                },
+                |proc_path| {
+                    let res = unsafe {
+                        libc::lgetxattr(
+                            proc_path.as_ptr(),
+                            name.as_ptr(),
+                            buf_ptr as *mut libc::c_void,
+                            size as usize,
+                        )
+                    };
+                    if res < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(res)
+                    }
+                },
+            )?;
             let read_len = res as usize;
             if read_len > size as usize {
                 return Err(fuse3::Errno::from(libc::ERANGE));
@@ -841,27 +932,65 @@ impl PathFilesystem for LongNameFs {
         path: &OsStr,
         size: u32,
     ) -> Result<ReplyXAttr, fuse3::Errno> {
-        self.with_xattr_target(path, |fd| {
+        self.with_xattr_target(path, |fd, proc_path| {
             let raw_fd = fd.as_raw_fd();
             if size == 0 {
-                let res = unsafe { libc::flistxattr(raw_fd, std::ptr::null_mut(), 0) };
-                if res < 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
+                let res = Self::with_procfs_xattr_fallback(
+                    proc_path,
+                    || {
+                        let res = unsafe { libc::flistxattr(raw_fd, std::ptr::null_mut(), 0) };
+                        if res < 0 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(res)
+                        }
+                    },
+                    |proc_path| {
+                        let res =
+                            unsafe { libc::llistxattr(proc_path.as_ptr(), std::ptr::null_mut(), 0) };
+                        if res < 0 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(res)
+                        }
+                    },
+                )?;
                 return Ok(ReplyXAttr::Size(res as u32));
             }
 
             let mut buf = vec![0u8; size as usize];
-            let res = unsafe {
-                libc::flistxattr(
-                    raw_fd,
-                    buf.as_mut_ptr() as *mut libc::c_char,
-                    size as libc::size_t,
-                )
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error().into());
-            }
+            let buf_ptr = buf.as_mut_ptr();
+            let res = Self::with_procfs_xattr_fallback(
+                proc_path,
+                || {
+                    let res = unsafe {
+                        libc::flistxattr(
+                            raw_fd,
+                            buf_ptr as *mut libc::c_char,
+                            size as libc::size_t,
+                        )
+                    };
+                    if res < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(res)
+                    }
+                },
+                |proc_path| {
+                    let res = unsafe {
+                        libc::llistxattr(
+                            proc_path.as_ptr(),
+                            buf_ptr as *mut libc::c_char,
+                            size as libc::size_t,
+                        )
+                    };
+                    if res < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(res)
+                    }
+                },
+            )?;
             let list_len = res as usize;
             if list_len > size as usize {
                 return Err(fuse3::Errno::from(libc::ERANGE));
@@ -878,12 +1007,26 @@ impl PathFilesystem for LongNameFs {
         name: &OsStr,
     ) -> Result<(), fuse3::Errno> {
         let name = xattr_name_to_cstring(name)?;
-        self.with_xattr_target(path, |fd| {
-            let res = unsafe { libc::fremovexattr(fd.as_raw_fd(), name.as_ptr()) };
-            if res < 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            Ok(())
+        self.with_xattr_target(path, |fd, proc_path| {
+            Self::with_procfs_xattr_fallback(
+                proc_path,
+                || {
+                    let res = unsafe { libc::fremovexattr(fd.as_raw_fd(), name.as_ptr()) };
+                    if res < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |proc_path| {
+                    let res = unsafe { libc::lremovexattr(proc_path.as_ptr(), name.as_ptr()) };
+                    if res < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
         })
     }
 
@@ -1152,8 +1295,10 @@ mod tests {
     use crate::pathmap::open_path;
     use crate::util::string_to_cstring;
     use nix::fcntl::open;
+    use nix::unistd::symlinkat;
     use std::ffi::CString;
     use std::fs;
+    use std::os::fd::AsRawFd;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1249,7 +1394,7 @@ mod tests {
 
         let fs = LongNameFs::new(config, None, 64);
         let got = fs
-            .with_xattr_target(OsStr::new("/x"), |fd| {
+            .with_xattr_target(OsStr::new("/x"), |fd, _proc_path| {
                 let size = unsafe {
                     libc::fgetxattr(fd.as_raw_fd(), xattr.as_ptr(), std::ptr::null_mut(), 0)
                 };
@@ -1268,6 +1413,122 @@ mod tests {
                 if res < 0 {
                     return Err(fuse3::Errno::from(libc::EIO));
                 }
+                buf.truncate(res as usize);
+                Ok(buf)
+            })
+            .unwrap();
+        assert_eq!(got, value);
+    }
+
+    #[test]
+    fn with_xattr_target_reads_xattr_on_symlink_when_opath_ebadf() {
+        let tmp = TempDir::new();
+        let xattr = CString::new("user.opath_symlink").unwrap();
+        let value = b"symlink-value";
+        let config = Config::open_backend(tmp.path().clone(), false, true).unwrap();
+        let mapped = open_path(&config, OsStr::new("/link")).unwrap();
+        let fname = string_to_cstring(&mapped.fname).unwrap();
+
+        let target = CString::new("target").unwrap();
+        symlinkat(target.as_c_str(), mapped.dir_fd.as_fd(), fname.as_c_str()).unwrap();
+        write_namefile(&mapped).unwrap();
+
+        let dir_fd = open(
+            tmp.path(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        if !opath_fgetxattr_ebadf(dir_fd.as_fd(), fname.as_c_str(), xattr.as_c_str()) {
+            return;
+        }
+
+        let proc_path = crate::util::procfs_path_for(dir_fd.as_fd(), fname.as_c_str()).unwrap();
+        let res = unsafe {
+            libc::lsetxattr(
+                proc_path.as_ptr(),
+                xattr.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        };
+        if res < 0 {
+            let err = io::Error::last_os_error();
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EPERM)
+            ) {
+                return;
+            }
+            panic!("lsetxattr failed: {err:?}");
+        }
+
+        let fs = LongNameFs::new(config, None, 64);
+        let got = fs
+            .with_xattr_target(OsStr::new("/link"), |fd, proc_path| {
+                let size = unsafe {
+                    libc::fgetxattr(fd.as_raw_fd(), xattr.as_ptr(), std::ptr::null_mut(), 0)
+                };
+                let size = if size < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EBADF) {
+                        if let Some(proc_path) = proc_path {
+                            let size = unsafe {
+                                libc::lgetxattr(
+                                    proc_path.as_ptr(),
+                                    xattr.as_ptr(),
+                                    std::ptr::null_mut(),
+                                    0,
+                                )
+                            };
+                            if size < 0 {
+                                return Err(fuse3::Errno::from(libc::EIO));
+                            }
+                            size
+                        } else {
+                            return Err(fuse3::Errno::from(libc::EIO));
+                        }
+                    } else {
+                        return Err(fuse3::Errno::from(libc::EIO));
+                    }
+                } else {
+                    size
+                };
+                let mut buf = vec![0u8; size as usize];
+                let res = unsafe {
+                    libc::fgetxattr(
+                        fd.as_raw_fd(),
+                        xattr.as_ptr(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                let res = if res < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EBADF) {
+                        if let Some(proc_path) = proc_path {
+                            let res = unsafe {
+                                libc::lgetxattr(
+                                    proc_path.as_ptr(),
+                                    xattr.as_ptr(),
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    buf.len(),
+                                )
+                            };
+                            if res < 0 {
+                                return Err(fuse3::Errno::from(libc::EIO));
+                            }
+                            res
+                        } else {
+                            return Err(fuse3::Errno::from(libc::EIO));
+                        }
+                    } else {
+                        return Err(fuse3::Errno::from(libc::EIO));
+                    }
+                } else {
+                    res
+                };
                 buf.truncate(res as usize);
                 Ok(buf)
             })
