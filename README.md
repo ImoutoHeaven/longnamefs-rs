@@ -101,6 +101,8 @@ Behavior
 - Extended attributes (get/set/list/remove) are forwarded to backend objects; `position` must be zero on Linux.
 - In v2 generic xattr handling, symlink `no-follow` operations first try `openat(..., O_NOFOLLOW)` and, if that fails with `ELOOP`, fall back to `/proc/self/fd/...` path-based `l* xattr` (`lgetxattr/lsetxattr/llistxattr/lremovexattr`).
 - O_PATH-based xattr access also falls back to `/proc/self/fd/...` path-based `l* xattr` when the kernel returns `EBADF`; both fallback paths require procfs to be available.
+- In v2 rename overwrite bookkeeping, target replacement cleanup is guarded by in-process serialization plus replaced-child snapshot validation, preventing stale snapshots from removing unrelated inode parent/name mappings.
+- For both v2 procfs xattr fallback paths, when procfs is unavailable and fallback returns `ENOENT`/`ENOTDIR`, the original semantic errno (`ELOOP`/`EBADF`) is preserved.
 - `readdirplus` returns names with attributes; `flush`/`fsyncdir` are implemented; `poll` is accepted (returns no ready events).
 - With `--backend-layout v1`, long names are stored in `<hash>n` namefiles and remain compatible with the C implementation. With `--backend-layout v2`, long names are mapped to internal `.__ln2_*` entries with the original bytes stored in `user.ln2.rawname`; FS-internal `.ln2_fs_*` entries (index/journal/tmp/probes) are hidden from listings, and long-name hardlinks are rejected.
 - On SIGINT/SIGTERM the process attempts a lazy unmount (`MNT_DETACH`) and then exits immediately (it does not try to drain in-flight IO).

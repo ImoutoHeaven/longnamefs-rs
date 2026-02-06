@@ -1854,6 +1854,14 @@ fn is_procfs_unavailable(err: &CoreError) -> bool {
     }
 }
 
+fn normalize_procfs_fallback_errno(raw_errno: i32, original_errno: i32, procfs_available: bool) -> i32 {
+    if !procfs_available && matches!(raw_errno, libc::ENOENT | libc::ENOTDIR) {
+        original_errno
+    } else {
+        raw_errno
+    }
+}
+
 #[cfg(test)]
 fn mark_procfs_symlink_fallback() {
     PROCFS_SYMLINK_FALLBACK_USED.store(true, Ordering::Relaxed);
@@ -2865,7 +2873,7 @@ fn xattr_target_for_path(
 }
 
 fn xattr_set(target: &XattrTarget, name: &CStr, value: &[u8], flags: i32) -> CoreResult<()> {
-    let res = match target {
+    let (res, original_errno) = match target {
         XattrTarget::Fd {
             raw_fd, proc_path, ..
         } => {
@@ -2882,7 +2890,8 @@ fn xattr_set(target: &XattrTarget, name: &CStr, value: &[u8], flags: i32) -> Cor
                 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
                 && let Some(proc_path) = proc_path
             {
-                unsafe {
+                (
+                    unsafe {
                     libc::lsetxattr(
                         proc_path.as_ptr(),
                         name.as_ptr(),
@@ -2890,29 +2899,38 @@ fn xattr_set(target: &XattrTarget, name: &CStr, value: &[u8], flags: i32) -> Cor
                         value.len(),
                         flags as libc::c_int,
                     )
-                }
+                    },
+                    Some(libc::EBADF),
+                )
             } else {
-                res
+                (res, None)
             }
         }
-        XattrTarget::ProcPath(path) => unsafe {
-            libc::lsetxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                value.len(),
-                flags as libc::c_int,
-            )
-        },
+        XattrTarget::ProcPath(path) => (
+            unsafe {
+                libc::lsetxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len(),
+                    flags as libc::c_int,
+                )
+            },
+            Some(libc::ELOOP),
+        ),
     };
     if res < 0 {
-        return Err(io::Error::last_os_error().into());
+        let raw_errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        let errno = original_errno.map_or(raw_errno, |orig| {
+            normalize_procfs_fallback_errno(raw_errno, orig, Path::new("/proc/self/fd").exists())
+        });
+        return Err(CoreError::from_errno(errno));
     }
     Ok(())
 }
 
 fn xattr_get_size(target: &XattrTarget, name: &CStr) -> CoreResult<usize> {
-    let res = match target {
+    let (res, original_errno) = match target {
         XattrTarget::Fd {
             raw_fd, proc_path, ..
         } => {
@@ -2921,23 +2939,33 @@ fn xattr_get_size(target: &XattrTarget, name: &CStr) -> CoreResult<usize> {
                 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
                 && let Some(proc_path) = proc_path
             {
-                unsafe { libc::lgetxattr(proc_path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) }
+                (
+                    unsafe {
+                        libc::lgetxattr(proc_path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0)
+                    },
+                    Some(libc::EBADF),
+                )
             } else {
-                res
+                (res, None)
             }
         }
-        XattrTarget::ProcPath(path) => {
-            unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) }
-        }
+        XattrTarget::ProcPath(path) => (
+            unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) },
+            Some(libc::ELOOP),
+        ),
     };
     if res < 0 {
-        return Err(io::Error::last_os_error().into());
+        let raw_errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        let errno = original_errno.map_or(raw_errno, |orig| {
+            normalize_procfs_fallback_errno(raw_errno, orig, Path::new("/proc/self/fd").exists())
+        });
+        return Err(CoreError::from_errno(errno));
     }
     Ok(res as usize)
 }
 
 fn xattr_get_into(target: &XattrTarget, name: &CStr, buf: &mut [u8]) -> CoreResult<usize> {
-    let res = match target {
+    let (res, original_errno) = match target {
         XattrTarget::Fd {
             raw_fd, proc_path, ..
         } => {
@@ -2953,35 +2981,45 @@ fn xattr_get_into(target: &XattrTarget, name: &CStr, buf: &mut [u8]) -> CoreResu
                 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
                 && let Some(proc_path) = proc_path
             {
-                unsafe {
-                    libc::lgetxattr(
-                        proc_path.as_ptr(),
-                        name.as_ptr(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                    )
-                }
+                (
+                    unsafe {
+                        libc::lgetxattr(
+                            proc_path.as_ptr(),
+                            name.as_ptr(),
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                        )
+                    },
+                    Some(libc::EBADF),
+                )
             } else {
-                res
+                (res, None)
             }
         }
-        XattrTarget::ProcPath(path) => unsafe {
-            libc::lgetxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        },
+        XattrTarget::ProcPath(path) => (
+            unsafe {
+                libc::lgetxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            },
+            Some(libc::ELOOP),
+        ),
     };
     if res < 0 {
-        return Err(io::Error::last_os_error().into());
+        let raw_errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        let errno = original_errno.map_or(raw_errno, |orig| {
+            normalize_procfs_fallback_errno(raw_errno, orig, Path::new("/proc/self/fd").exists())
+        });
+        return Err(CoreError::from_errno(errno));
     }
     Ok(res as usize)
 }
 
 fn xattr_list_size(target: &XattrTarget) -> CoreResult<usize> {
-    let res = match target {
+    let (res, original_errno) = match target {
         XattrTarget::Fd {
             raw_fd, proc_path, ..
         } => {
@@ -2990,21 +3028,31 @@ fn xattr_list_size(target: &XattrTarget) -> CoreResult<usize> {
                 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
                 && let Some(proc_path) = proc_path
             {
-                unsafe { libc::llistxattr(proc_path.as_ptr(), std::ptr::null_mut(), 0) }
+                (
+                    unsafe { libc::llistxattr(proc_path.as_ptr(), std::ptr::null_mut(), 0) },
+                    Some(libc::EBADF),
+                )
             } else {
-                res
+                (res, None)
             }
         }
-        XattrTarget::ProcPath(path) => unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) },
+        XattrTarget::ProcPath(path) => (
+            unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) },
+            Some(libc::ELOOP),
+        ),
     };
     if res < 0 {
-        return Err(io::Error::last_os_error().into());
+        let raw_errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        let errno = original_errno.map_or(raw_errno, |orig| {
+            normalize_procfs_fallback_errno(raw_errno, orig, Path::new("/proc/self/fd").exists())
+        });
+        return Err(CoreError::from_errno(errno));
     }
     Ok(res as usize)
 }
 
 fn xattr_list_into(target: &XattrTarget, buf: &mut [u8]) -> CoreResult<usize> {
-    let res = match target {
+    let (res, original_errno) = match target {
         XattrTarget::Fd {
             raw_fd, proc_path, ..
         } => {
@@ -3019,33 +3067,43 @@ fn xattr_list_into(target: &XattrTarget, buf: &mut [u8]) -> CoreResult<usize> {
                 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
                 && let Some(proc_path) = proc_path
             {
-                unsafe {
-                    libc::llistxattr(
-                        proc_path.as_ptr(),
-                        buf.as_mut_ptr() as *mut libc::c_char,
-                        buf.len() as libc::size_t,
-                    )
-                }
+                (
+                    unsafe {
+                        libc::llistxattr(
+                            proc_path.as_ptr(),
+                            buf.as_mut_ptr() as *mut libc::c_char,
+                            buf.len() as libc::size_t,
+                        )
+                    },
+                    Some(libc::EBADF),
+                )
             } else {
-                res
+                (res, None)
             }
         }
-        XattrTarget::ProcPath(path) => unsafe {
-            libc::llistxattr(
-                path.as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len() as libc::size_t,
-            )
-        },
+        XattrTarget::ProcPath(path) => (
+            unsafe {
+                libc::llistxattr(
+                    path.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len() as libc::size_t,
+                )
+            },
+            Some(libc::ELOOP),
+        ),
     };
     if res < 0 {
-        return Err(io::Error::last_os_error().into());
+        let raw_errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        let errno = original_errno.map_or(raw_errno, |orig| {
+            normalize_procfs_fallback_errno(raw_errno, orig, Path::new("/proc/self/fd").exists())
+        });
+        return Err(CoreError::from_errno(errno));
     }
     Ok(res as usize)
 }
 
 fn xattr_remove(target: &XattrTarget, name: &CStr) -> CoreResult<()> {
-    let res = match target {
+    let (res, original_errno) = match target {
         XattrTarget::Fd {
             raw_fd, proc_path, ..
         } => {
@@ -3054,15 +3112,25 @@ fn xattr_remove(target: &XattrTarget, name: &CStr) -> CoreResult<()> {
                 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
                 && let Some(proc_path) = proc_path
             {
-                unsafe { libc::lremovexattr(proc_path.as_ptr(), name.as_ptr()) }
+                (
+                    unsafe { libc::lremovexattr(proc_path.as_ptr(), name.as_ptr()) },
+                    Some(libc::EBADF),
+                )
             } else {
-                res
+                (res, None)
             }
         }
-        XattrTarget::ProcPath(path) => unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) },
+        XattrTarget::ProcPath(path) => (
+            unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) },
+            Some(libc::ELOOP),
+        ),
     };
     if res < 0 {
-        return Err(io::Error::last_os_error().into());
+        let raw_errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        let errno = original_errno.map_or(raw_errno, |orig| {
+            normalize_procfs_fallback_errno(raw_errno, orig, Path::new("/proc/self/fd").exists())
+        });
+        return Err(CoreError::from_errno(errno));
     }
     Ok(())
 }
@@ -3826,6 +3894,13 @@ pub struct LongNameFsV2Fuser {
     open_attr_ttl: Duration,
     open_entry_ttl: Duration,
     notifier: FsNotifier,
+    rename_bookkeeping_lock: Mutex<()>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplacedChildSnapshot {
+    ino: InodeId,
+    backend: BackendKey,
 }
 
 impl LongNameFsV2Fuser {
@@ -3881,6 +3956,7 @@ impl LongNameFsV2Fuser {
             open_attr_ttl: open_ttl,
             open_entry_ttl: open_ttl,
             notifier,
+            rename_bookkeeping_lock: Mutex::new(()),
         })
     }
 
@@ -4226,12 +4302,12 @@ impl LongNameFsV2Fuser {
         )
     }
 
-    fn lookup_existing_child_inode(
+    fn lookup_existing_child_snapshot(
         &self,
         _parent: InodeId,
         parent_path: &OsStr,
         name: &OsStr,
-    ) -> Option<InodeId> {
+    ) -> Option<ReplacedChildSnapshot> {
         let mut ctx = self.core.resolve_dir(parent_path).ok()?;
         let raw = normalize_osstr(name);
         let (backend, _) = map_segment_for_lookup(
@@ -4249,7 +4325,12 @@ impl LongNameFsV2Fuser {
         )
         .ok()?;
         let backend_key = backend_key_from_stat(&stat);
-        self.inode_store.get_by_backend(backend_key).map(|entry| entry.ino)
+        self.inode_store
+            .get_by_backend(backend_key)
+            .map(|entry| ReplacedChildSnapshot {
+                ino: entry.ino,
+                backend: backend_key,
+            })
     }
 
     fn apply_rename_inode_bookkeeping(
@@ -4259,7 +4340,7 @@ impl LongNameFsV2Fuser {
         newparent: InodeId,
         newname: &OsStr,
         dst_parent_path: &OsStr,
-        replaced_ino: Option<InodeId>,
+        replaced_snapshot: Option<ReplacedChildSnapshot>,
     ) -> CoreResult<Option<InodeId>> {
         let mut dst_ctx = self.core.resolve_dir(dst_parent_path)?;
         let raw_new = normalize_osstr(newname);
@@ -4306,11 +4387,17 @@ impl LongNameFsV2Fuser {
             }
         }
 
-        if let Some(replaced_ino) = replaced_ino
-            && Some(replaced_ino) != renamed_ino
+        if let Some(snapshot) = replaced_snapshot
+            && Some(snapshot.ino) != renamed_ino
+            && let Some(entry) = self.inode_store.get(snapshot.ino)
+            && entry.backend == snapshot.backend
+            && entry
+                .parents
+                .iter()
+                .any(|p| p.parent == newparent && p.name == newname)
         {
             let _ = self.inode_store.remove_parent_name(
-                replaced_ino,
+                snapshot.ino,
                 &ParentName {
                     parent: newparent,
                     name: newname.to_os_string(),
@@ -5671,36 +5758,41 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let replaced_child = self.lookup_existing_child_inode(newparent, &dst_parent_path, newname);
-        let inv = match self.core.rename_with_flags(
-            &src_parent_path,
-            name,
-            &dst_parent_path,
-            newname,
-            flags,
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(core_err_to_errno(&err));
-                return;
-            }
+        let (inv, renamed_child) = {
+            let _rename_guard = self.rename_bookkeeping_lock.lock();
+            let replaced_child =
+                self.lookup_existing_child_snapshot(newparent, &dst_parent_path, newname);
+            let inv = match self.core.rename_with_flags(
+                &src_parent_path,
+                name,
+                &dst_parent_path,
+                newname,
+                flags,
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+
+            let renamed_child = match self.apply_rename_inode_bookkeeping(
+                parent,
+                name,
+                newparent,
+                newname,
+                &dst_parent_path,
+                replaced_child,
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    reply.error(core_err_to_errno(&err));
+                    return;
+                }
+            };
+            (inv, renamed_child)
         };
         self.apply_invalidation(inv);
-
-        let renamed_child = match self.apply_rename_inode_bookkeeping(
-            parent,
-            name,
-            newparent,
-            newname,
-            &dst_parent_path,
-            replaced_child,
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(core_err_to_errno(&err));
-                return;
-            }
-        };
         self.notify_entry_change(parent, name);
         self.notify_entry_change(newparent, newname);
         if let Some(child) = renamed_child {
@@ -7769,7 +7861,8 @@ mod tests {
         let a = fs.ensure_child_entry(ROOT_INODE, OsStr::new("a"), b"a".to_vec(), stat_a, 1);
         let b = fs.ensure_child_entry(ROOT_INODE, OsStr::new("b"), b"b".to_vec(), stat_b, 1);
 
-        let replaced = fs.lookup_existing_child_inode(ROOT_INODE, OsStr::new("/"), OsStr::new("b"));
+        let replaced =
+            fs.lookup_existing_child_snapshot(ROOT_INODE, OsStr::new("/"), OsStr::new("b"));
         fs.core
             .rename_with_flags(
                 OsStr::new("/"),
@@ -7814,6 +7907,89 @@ mod tests {
             fs.inode_store.get_path(b.ino),
             Err(CoreError::StaleInode)
         ));
+    }
+
+    #[test]
+    fn rename_bookkeeping_ignores_stale_replaced_snapshot() {
+        let tmp = TempDir::new();
+        fs::write(tmp.path().join("a"), b"a").unwrap();
+        fs::write(tmp.path().join("b"), b"b").unwrap();
+        fs::write(tmp.path().join("c"), b"c").unwrap();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+        let fs = LongNameFsV2Fuser::new(
+            config,
+            MAX_SEGMENT_ON_DISK,
+            Some(Duration::from_secs(60)),
+            1024,
+            IndexSync::Off,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            false,
+            false,
+            PassthroughMetaFdConfig::disabled(),
+        )
+        .unwrap();
+
+        let root_fd = fs.core.cached_root_fd().unwrap();
+        let stat_a = fstatat(root_fd.as_fd(), c"a", AtFlags::AT_SYMLINK_NOFOLLOW).unwrap();
+        let stat_b = fstatat(root_fd.as_fd(), c"b", AtFlags::AT_SYMLINK_NOFOLLOW).unwrap();
+        let stat_c = fstatat(root_fd.as_fd(), c"c", AtFlags::AT_SYMLINK_NOFOLLOW).unwrap();
+        let a = fs.ensure_child_entry(ROOT_INODE, OsStr::new("a"), b"a".to_vec(), stat_a, 1);
+        let b = fs.ensure_child_entry(ROOT_INODE, OsStr::new("b"), b"b".to_vec(), stat_b, 1);
+        let c = fs.ensure_child_entry(ROOT_INODE, OsStr::new("c"), b"c".to_vec(), stat_c, 1);
+
+        let _ = fs.inode_store.add_parent_name(
+            c.ino,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("b"),
+                backend_name: b"c".to_vec(),
+            },
+        );
+        assert!(
+            fs.inode_store
+                .get(c.ino)
+                .unwrap()
+                .parents
+                .iter()
+                .any(|p| p.parent == ROOT_INODE && p.name == OsStr::new("b"))
+        );
+
+        fs.core
+            .rename_with_flags(
+                OsStr::new("/"),
+                OsStr::new("a"),
+                OsStr::new("/"),
+                OsStr::new("b"),
+                0,
+            )
+            .unwrap();
+
+        let renamed = fs
+            .apply_rename_inode_bookkeeping(
+                ROOT_INODE,
+                OsStr::new("a"),
+                ROOT_INODE,
+                OsStr::new("b"),
+                OsStr::new("/"),
+                Some(ReplacedChildSnapshot {
+                    ino: c.ino,
+                    backend: b.backend,
+                }),
+            )
+            .unwrap()
+            .expect("renamed inode should resolve");
+        assert_eq!(renamed, a.ino);
+
+        assert!(
+            fs.inode_store
+                .get(c.ino)
+                .unwrap()
+                .parents
+                .iter()
+                .any(|p| p.parent == ROOT_INODE && p.name == OsStr::new("b")),
+            "stale replaced snapshot must not remove unrelated inode parent mapping"
+        );
     }
 
     #[test]
@@ -8176,6 +8352,34 @@ mod tests {
         assert!(!is_procfs_unavailable(&denied));
         assert!(!is_procfs_unavailable(&forbidden));
         assert!(!is_procfs_unavailable(&other));
+    }
+
+    #[test]
+    fn procfs_fallback_maps_unavailable_to_original_errno() {
+        assert_eq!(
+            normalize_procfs_fallback_errno(libc::ENOENT, libc::ELOOP, false),
+            libc::ELOOP
+        );
+        assert_eq!(
+            normalize_procfs_fallback_errno(libc::ENOTDIR, libc::EBADF, false),
+            libc::EBADF
+        );
+    }
+
+    #[test]
+    fn procfs_fallback_keeps_real_errno_when_procfs_available() {
+        assert_eq!(
+            normalize_procfs_fallback_errno(libc::ENOENT, libc::ELOOP, true),
+            libc::ENOENT
+        );
+        assert_eq!(
+            normalize_procfs_fallback_errno(libc::ENOTDIR, libc::EBADF, true),
+            libc::ENOTDIR
+        );
+        assert_eq!(
+            normalize_procfs_fallback_errno(libc::EACCES, libc::ELOOP, false),
+            libc::EACCES
+        );
     }
 
     #[test]
