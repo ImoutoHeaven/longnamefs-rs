@@ -1,14 +1,15 @@
 use crate::config::Config;
 use crate::util::{errno_from_nix, retry_eintr, string_to_cstring};
-use nix::fcntl::{AtFlags, OFlag, openat};
+use nix::fcntl::{AtFlags, FcntlArg, OFlag, fcntl, openat};
 use nix::sys::stat::Mode;
-use nix::unistd::dup;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::ops::Range;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub const MAX_NAME_LENGTH: usize = 4096;
@@ -72,7 +73,9 @@ impl DirFdCacheInner {
 
     fn get(&mut self, key: &str) -> Option<OwnedFd> {
         let fd = self.map.get(key)?;
-        let dup_fd = dup(fd.as_fd()).ok();
+        #[cfg(test)]
+        DIR_FD_CACHE_DUP_GET_CALLS.fetch_add(1, Ordering::Relaxed);
+        let dup_fd = dup_for_dir_fd_cache(fd.as_fd()).ok();
         self.touch(key);
         dup_fd
     }
@@ -109,9 +112,34 @@ impl DirFdCacheInner {
 
 const DIR_FD_CACHE_CAPACITY: usize = 64;
 
+#[cfg(test)]
+static DIR_FD_CACHE_DUP_INSERT_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static DIR_FD_CACHE_DUP_GET_CALLS: AtomicUsize = AtomicUsize::new(0);
+
 fn dir_fd_cache() -> &'static DirFdCache {
     static CACHE: OnceLock<DirFdCache> = OnceLock::new();
     CACHE.get_or_init(|| DirFdCache::new(DIR_FD_CACHE_CAPACITY))
+}
+
+fn dup_for_dir_fd_cache(fd: BorrowedFd<'_>) -> nix::Result<OwnedFd> {
+    let raw_fd = fcntl(fd, FcntlArg::F_DUPFD_CLOEXEC(0))?;
+    // SAFETY: fcntl(F_DUPFD_CLOEXEC) returns a new owned file descriptor on success.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
+#[cfg(test)]
+fn reset_dir_fd_cache_dup_callsite_counters() {
+    DIR_FD_CACHE_DUP_INSERT_CALLS.store(0, Ordering::Relaxed);
+    DIR_FD_CACHE_DUP_GET_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn dir_fd_cache_dup_callsite_counters() -> (usize, usize) {
+    (
+        DIR_FD_CACHE_DUP_INSERT_CALLS.load(Ordering::Relaxed),
+        DIR_FD_CACHE_DUP_GET_CALLS.load(Ordering::Relaxed),
+    )
 }
 
 #[derive(Debug)]
@@ -327,7 +355,9 @@ fn open_path_with_cache(
                 .map_err(errno_from_nix)?
             };
 
-            if use_cache && let Ok(dup_fd) = dup(next_fd.as_fd()) {
+            if use_cache && let Ok(dup_fd) = dup_for_dir_fd_cache(next_fd.as_fd()) {
+                #[cfg(test)]
+                DIR_FD_CACHE_DUP_INSERT_CALLS.fetch_add(1, Ordering::Relaxed);
                 dir_fd_cache().insert(prefix.clone(), dup_fd);
             }
             drop(dir_fd);
@@ -385,5 +415,102 @@ pub fn make_child_path(parent: &OsStr, name: &OsStr) -> OsString {
         composed.push(OsStr::new("/"));
         composed.push(name);
         composed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::fcntl::{FcntlArg, OFlag};
+    use nix::sys::stat::Mode;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let mut path = std::env::temp_dir();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            path.push(format!("ln2_pathmap_test_{}_{}", std::process::id(), nanos));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn dir_fd_cache_get_dup_fd_sets_cloexec() {
+        let tmp = TempDir::new();
+        let dir_fd = nix::fcntl::open(
+            tmp.path(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+
+        let dup_fd = dup_for_dir_fd_cache(dir_fd.as_fd()).unwrap();
+        let fd_flags = nix::fcntl::fcntl(dup_fd.as_fd(), FcntlArg::F_GETFD).unwrap();
+        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn dir_fd_cache_insert_dup_fd_sets_cloexec() {
+        let tmp = TempDir::new();
+        let dir_fd = nix::fcntl::open(
+            tmp.path(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+
+        let mut cache = DirFdCacheInner::new(1);
+        let cached_dup = dup_for_dir_fd_cache(dir_fd.as_fd()).unwrap();
+        cache.insert("k".to_string(), cached_dup, 1);
+
+        let from_cache = cache.get("k").unwrap();
+        let fd_flags = nix::fcntl::fcntl(from_cache.as_fd(), FcntlArg::F_GETFD).unwrap();
+        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn open_path_with_cache_uses_dir_fd_cache_dup_call_sites() {
+        let tmp = TempDir::new();
+        let encoded_a = encode_name(b"a");
+        fs::create_dir(tmp.path().join(encoded_a)).unwrap();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+
+        clear_dir_fd_cache();
+        reset_dir_fd_cache_dup_callsite_counters();
+
+        let first = open_path_with_cache(&config, OsStr::new("/a/b"), true, false).unwrap();
+        let first_flags = nix::fcntl::fcntl(first.dir_fd.as_fd(), FcntlArg::F_GETFD).unwrap();
+        assert_ne!(first_flags & libc::FD_CLOEXEC, 0);
+
+        let second = open_path_with_cache(&config, OsStr::new("/a/b"), true, false).unwrap();
+        let second_flags = nix::fcntl::fcntl(second.dir_fd.as_fd(), FcntlArg::F_GETFD).unwrap();
+        assert_ne!(second_flags & libc::FD_CLOEXEC, 0);
+
+        let (insert_calls, get_calls) = dir_fd_cache_dup_callsite_counters();
+        assert!(
+            insert_calls >= 1,
+            "expected insert-path dup call-site usage"
+        );
+        assert!(get_calls >= 1, "expected cache-get dup call-site usage");
+
+        clear_dir_fd_cache();
     }
 }

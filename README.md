@@ -104,6 +104,10 @@ Behavior
 - In v2 rename overwrite bookkeeping, target replacement cleanup is guarded by in-process serialization plus replaced-child snapshot validation, preventing stale snapshots from removing unrelated inode parent/name mappings.
 - For both v2 procfs xattr fallback paths, when procfs is unavailable and fallback returns `ENOENT`/`ENOTDIR`, the original semantic errno (`ELOOP`/`EBADF`) is preserved.
 - `readdirplus` returns names with attributes; `flush`/`fsyncdir` are implemented; `poll` is accepted (returns no ready events).
+- In v2, `readdirplus` materialization now installs child entries with a live lookup reference so later `forget` decrements match the kernel lookup lifecycle (no underflow/mismatched ref tracking).
+- In v2, root `setattr` with `size` now returns `EISDIR`, and `rename` with unsupported flag bits now returns `EINVAL`.
+- In v2 xattr procfs fallbacks, symlink/`O_PATH` fallback targets hold a parent-dir fd guard so `/proc/self/fd/...` paths stay valid for the full xattr call.
+- In v2 inode-fd rebuild paths and v1 pathmap fd-cache duplication paths, dup operations use CLOEXEC-safe helpers so duplicated fds do not leak across exec.
 - With `--backend-layout v1`, long names are stored in `<hash>n` namefiles and remain compatible with the C implementation. With `--backend-layout v2`, long names are mapped to internal `.__ln2_*` entries with the original bytes stored in `user.ln2.rawname`; FS-internal `.ln2_fs_*` entries (index/journal/tmp/probes) are hidden from listings, and long-name hardlinks are rejected.
 - On SIGINT/SIGTERM the process attempts a lazy unmount (`MNT_DETACH`) and then exits immediately (it does not try to drain in-flight IO).
 

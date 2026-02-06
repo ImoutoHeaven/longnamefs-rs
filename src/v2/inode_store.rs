@@ -85,8 +85,14 @@ impl InodeStore {
         let mut shard = self.shards[shard_idx].write();
 
         if let Some(existing) = shard.entries.get_mut(&ROOT_INODE) {
+            let previous_backend = existing.backend;
             existing.backend = backend;
             existing.lookup_count = existing.lookup_count.max(1);
+            if previous_backend != backend
+                && backend_map.get(&previous_backend).copied() == Some(ROOT_INODE)
+            {
+                backend_map.remove(&previous_backend);
+            }
             backend_map.insert(backend, ROOT_INODE);
             return existing.clone();
         }
@@ -297,6 +303,7 @@ impl InodeStore {
     }
 
     pub fn remove_parent_name(&self, ino: InodeId, parent: &ParentName) -> Option<InodeEntry> {
+        let mut backend_map = self.backend_map.write();
         let mut shard = self.shard(ino).write();
         let entry = shard.entries.get_mut(&ino)?;
         let removing_primary = entry.parent == parent.parent && entry.name == parent.name;
@@ -307,9 +314,13 @@ impl InodeStore {
             if let Some(new_primary) = entry.parents.first().cloned() {
                 Self::set_primary_parent(entry, &new_primary);
             } else if ino != ROOT_INODE {
+                let backend = entry.backend;
                 entry.parent = ROOT_INODE;
                 entry.name = OsString::new();
                 entry.backend_name = Vec::new();
+                if backend_map.get(&backend).copied() == Some(ino) {
+                    backend_map.remove(&backend);
+                }
             }
         }
 
@@ -585,5 +596,71 @@ mod tests {
             .expect("backend key should resolve existing inode");
         assert_eq!(hit.ino, child.ino);
         assert_eq!(hit.name, OsString::from("hit"));
+    }
+
+    #[test]
+    fn orphaned_open_inode_does_not_alias_reused_backend_key() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let backend = BackendKey { dev: 7, ino: 11 };
+        let original_parent = ParentName {
+            parent: ROOT_INODE,
+            name: OsString::from("old"),
+            backend_name: b"old".to_vec(),
+        };
+        let original = store.lookup_or_create(backend, InodeKind::File, original_parent.clone());
+        let _ = store.inc_open(original.ino);
+
+        let orphaned = store
+            .remove_parent_name(original.ino, &original_parent)
+            .expect("inode should still exist while open");
+        assert_eq!(orphaned.parents.len(), 0);
+        assert_eq!(orphaned.name, OsString::new());
+
+        let reused = store.get_or_insert(
+            backend,
+            InodeKind::File,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("new"),
+                backend_name: b"new".to_vec(),
+            },
+            1,
+        );
+
+        assert_ne!(reused.ino, original.ino);
+        let still_open_old = store
+            .get(original.ino)
+            .expect("orphaned inode must remain while open");
+        assert_eq!(still_open_old.parents.len(), 0);
+        assert_eq!(still_open_old.name, OsString::new());
+        assert_eq!(still_open_old.open_count, 1);
+        assert_eq!(
+            store
+                .get_by_backend(backend)
+                .expect("backend should resolve to new inode")
+                .ino,
+            reused.ino
+        );
+    }
+
+    #[test]
+    fn init_root_removes_stale_backend_mapping_when_backend_changes() {
+        let store = InodeStore::new();
+        let old_backend = BackendKey { dev: 1, ino: 1 };
+        let new_backend = BackendKey { dev: 2, ino: 2 };
+
+        store.init_root(old_backend);
+        store.init_root(new_backend);
+
+        assert!(store.get_by_backend(old_backend).is_none());
+        assert_eq!(
+            store
+                .get_by_backend(new_backend)
+                .expect("new root backend should be mapped")
+                .ino,
+            ROOT_INODE
+        );
     }
 }

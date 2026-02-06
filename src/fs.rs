@@ -3,8 +3,8 @@ use crate::handle_table::HandleTable;
 use crate::namefile::{DirEntryInfo, list_logical_entries, remove_namefile, write_namefile};
 use crate::pathmap::{clear_dir_fd_cache, make_child_path, open_path, open_paths};
 use crate::util::{
-    access_mask_from_bits, errno_from_nix, file_attr_from_stat, oflag_from_bits,
-    procfs_path_for, retry_eintr, string_to_cstring,
+    access_mask_from_bits, errno_from_nix, file_attr_from_stat, oflag_from_bits, procfs_path_for,
+    retry_eintr, string_to_cstring,
 };
 use bytes::Bytes;
 use fuse3::notify::Notify;
@@ -191,7 +191,7 @@ impl LongNameFs {
         let fname = string_to_cstring(&mapped.fname)?;
         let proc_path = procfs_path_for(mapped.dir_fd.as_fd(), fname.as_c_str());
         let fd = self.openat_nofollow_for_xattr(mapped.dir_fd.as_fd(), fname.as_c_str())?;
-        func(fd.as_fd(), proc_path.as_ref().map(|path| path.as_c_str()))
+        func(fd.as_fd(), proc_path.as_deref())
     }
 
     fn openat_nofollow_for_xattr(
@@ -946,8 +946,9 @@ impl PathFilesystem for LongNameFs {
                         }
                     },
                     |proc_path| {
-                        let res =
-                            unsafe { libc::llistxattr(proc_path.as_ptr(), std::ptr::null_mut(), 0) };
+                        let res = unsafe {
+                            libc::llistxattr(proc_path.as_ptr(), std::ptr::null_mut(), 0)
+                        };
                         if res < 0 {
                             Err(io::Error::last_os_error())
                         } else {
@@ -964,11 +965,7 @@ impl PathFilesystem for LongNameFs {
                 proc_path,
                 || {
                     let res = unsafe {
-                        libc::flistxattr(
-                            raw_fd,
-                            buf_ptr as *mut libc::c_char,
-                            size as libc::size_t,
-                        )
+                        libc::flistxattr(raw_fd, buf_ptr as *mut libc::c_char, size as libc::size_t)
                     };
                     if res < 0 {
                         Err(io::Error::last_os_error())
