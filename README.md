@@ -99,7 +99,8 @@ Behavior
 - Directory listings reconstruct original names and cache entries per-directory for the configured TTL (default 1s) and invalidate on mutations to cut repeated backend I/O. In v2 the same TTL controls an LRU of directory FDs to reduce open/close churn when resolving deep paths.
 - Operations on `/` interact directly with the backend directory (chmod/chown/utimens supported; truncate disallowed).
 - Extended attributes (get/set/list/remove) are forwarded to backend objects; `position` must be zero on Linux.
-- When O_PATH xattr operations return `EBADF`, or when symlink metadata access causes `openat` to return `ELOOP`, the filesystem retries using `/proc/self/fd/...` path-based `l* xattr`; this requires procfs to be available.
+- In v2 generic xattr handling, symlink `no-follow` operations first try `openat(..., O_NOFOLLOW)` and, if that fails with `ELOOP`, fall back to `/proc/self/fd/...` path-based `l* xattr` (`lgetxattr/lsetxattr/llistxattr/lremovexattr`).
+- O_PATH-based xattr access also falls back to `/proc/self/fd/...` path-based `l* xattr` when the kernel returns `EBADF`; both fallback paths require procfs to be available.
 - `readdirplus` returns names with attributes; `flush`/`fsyncdir` are implemented; `poll` is accepted (returns no ready events).
 - With `--backend-layout v1`, long names are stored in `<hash>n` namefiles and remain compatible with the C implementation. With `--backend-layout v2`, long names are mapped to internal `.__ln2_*` entries with the original bytes stored in `user.ln2.rawname`; FS-internal `.ln2_fs_*` entries (index/journal/tmp/probes) are hidden from listings, and long-name hardlinks are rejected.
 - On SIGINT/SIGTERM the process attempts a lazy unmount (`MNT_DETACH`) and then exits immediately (it does not try to drain in-flight IO).

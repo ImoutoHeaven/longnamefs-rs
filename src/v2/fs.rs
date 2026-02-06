@@ -2795,19 +2795,29 @@ fn open_backend_root(config: &Config) -> CoreResult<OwnedFd> {
     .map_err(core_errno_from_nix)
 }
 
-fn raw_fd_for_xattr(
+#[derive(Debug)]
+enum XattrTarget {
+    Fd {
+        raw_fd: RawFd,
+        _guard: Option<OwnedFd>,
+        proc_path: Option<CString>,
+    },
+    ProcPath(CString),
+}
+
+fn xattr_target_for_path(
     core: &LongNameFsCore,
     path: &OsStr,
     write_intent: bool,
-) -> CoreResult<(RawFd, Option<OwnedFd>)> {
-    let access_mode = if write_intent {
-        OFlag::O_RDWR
-    } else {
-        OFlag::O_RDONLY
-    };
+) -> CoreResult<XattrTarget> {
+    let access_mode = OFlag::O_RDONLY;
     if path == OsStr::new("/") {
         if !write_intent {
-            return Ok((core.config.backend_fd().as_raw_fd(), None));
+            return Ok(XattrTarget::Fd {
+                raw_fd: core.config.backend_fd().as_raw_fd(),
+                _guard: None,
+                proc_path: None,
+            });
         }
         let fd = nix::fcntl::openat(
             core.config.backend_fd(),
@@ -2816,20 +2826,245 @@ fn raw_fd_for_xattr(
             Mode::empty(),
         )
         .map_err(core_errno_from_nix)?;
-        let raw = fd.as_raw_fd();
-        return Ok((raw, Some(fd)));
+        return Ok(XattrTarget::Fd {
+            raw_fd: fd.as_raw_fd(),
+            _guard: Some(fd),
+            proc_path: None,
+        });
     }
     let mapped = core.resolve_path(path)?;
     let fname = mapped.backend_name.as_cstring()?;
-    let fd = nix::fcntl::openat(
+    let proc_path = procfs_path_for(mapped.dir_fd.as_fd(), fname.as_c_str());
+    let fd = match nix::fcntl::openat(
         mapped.dir_fd.as_fd(),
         fname.as_c_str(),
         access_mode | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
         Mode::empty(),
-    )
-    .map_err(core_errno_from_nix)?;
-    let raw = fd.as_raw_fd();
-    Ok((raw, Some(fd)))
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::EISDIR) => nix::fcntl::openat(
+            mapped.dir_fd.as_fd(),
+            fname.as_c_str(),
+            access_mode | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(core_errno_from_nix)?,
+        Err(nix::errno::Errno::ELOOP) => {
+            if let Some(proc_path) = proc_path {
+                return Ok(XattrTarget::ProcPath(proc_path));
+            }
+            return Err(CoreError::from_errno(libc::ELOOP));
+        }
+        Err(err) => return Err(core_errno_from_nix(err)),
+    };
+    Ok(XattrTarget::Fd {
+        raw_fd: fd.as_raw_fd(),
+        _guard: Some(fd),
+        proc_path,
+    })
+}
+
+fn xattr_set(target: &XattrTarget, name: &CStr, value: &[u8], flags: i32) -> CoreResult<()> {
+    let res = match target {
+        XattrTarget::Fd {
+            raw_fd, proc_path, ..
+        } => {
+            let res = unsafe {
+                libc::fsetxattr(
+                    *raw_fd,
+                    name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len(),
+                    flags as libc::c_int,
+                )
+            };
+            if res < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+                && let Some(proc_path) = proc_path
+            {
+                unsafe {
+                    libc::lsetxattr(
+                        proc_path.as_ptr(),
+                        name.as_ptr(),
+                        value.as_ptr() as *const libc::c_void,
+                        value.len(),
+                        flags as libc::c_int,
+                    )
+                }
+            } else {
+                res
+            }
+        }
+        XattrTarget::ProcPath(path) => unsafe {
+            libc::lsetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                flags as libc::c_int,
+            )
+        },
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+fn xattr_get_size(target: &XattrTarget, name: &CStr) -> CoreResult<usize> {
+    let res = match target {
+        XattrTarget::Fd {
+            raw_fd, proc_path, ..
+        } => {
+            let res = unsafe { libc::fgetxattr(*raw_fd, name.as_ptr(), std::ptr::null_mut(), 0) };
+            if res < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+                && let Some(proc_path) = proc_path
+            {
+                unsafe { libc::lgetxattr(proc_path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) }
+            } else {
+                res
+            }
+        }
+        XattrTarget::ProcPath(path) => {
+            unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) }
+        }
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(res as usize)
+}
+
+fn xattr_get_into(target: &XattrTarget, name: &CStr, buf: &mut [u8]) -> CoreResult<usize> {
+    let res = match target {
+        XattrTarget::Fd {
+            raw_fd, proc_path, ..
+        } => {
+            let res = unsafe {
+                libc::fgetxattr(
+                    *raw_fd,
+                    name.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if res < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+                && let Some(proc_path) = proc_path
+            {
+                unsafe {
+                    libc::lgetxattr(
+                        proc_path.as_ptr(),
+                        name.as_ptr(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                }
+            } else {
+                res
+            }
+        }
+        XattrTarget::ProcPath(path) => unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        },
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(res as usize)
+}
+
+fn xattr_list_size(target: &XattrTarget) -> CoreResult<usize> {
+    let res = match target {
+        XattrTarget::Fd {
+            raw_fd, proc_path, ..
+        } => {
+            let res = unsafe { libc::flistxattr(*raw_fd, std::ptr::null_mut(), 0) };
+            if res < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+                && let Some(proc_path) = proc_path
+            {
+                unsafe { libc::llistxattr(proc_path.as_ptr(), std::ptr::null_mut(), 0) }
+            } else {
+                res
+            }
+        }
+        XattrTarget::ProcPath(path) => unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) },
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(res as usize)
+}
+
+fn xattr_list_into(target: &XattrTarget, buf: &mut [u8]) -> CoreResult<usize> {
+    let res = match target {
+        XattrTarget::Fd {
+            raw_fd, proc_path, ..
+        } => {
+            let res = unsafe {
+                libc::flistxattr(
+                    *raw_fd,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len() as libc::size_t,
+                )
+            };
+            if res < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+                && let Some(proc_path) = proc_path
+            {
+                unsafe {
+                    libc::llistxattr(
+                        proc_path.as_ptr(),
+                        buf.as_mut_ptr() as *mut libc::c_char,
+                        buf.len() as libc::size_t,
+                    )
+                }
+            } else {
+                res
+            }
+        }
+        XattrTarget::ProcPath(path) => unsafe {
+            libc::llistxattr(
+                path.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len() as libc::size_t,
+            )
+        },
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(res as usize)
+}
+
+fn xattr_remove(target: &XattrTarget, name: &CStr) -> CoreResult<()> {
+    let res = match target {
+        XattrTarget::Fd {
+            raw_fd, proc_path, ..
+        } => {
+            let res = unsafe { libc::fremovexattr(*raw_fd, name.as_ptr()) };
+            if res < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+                && let Some(proc_path) = proc_path
+            {
+                unsafe { libc::lremovexattr(proc_path.as_ptr(), name.as_ptr()) }
+            } else {
+                res
+            }
+        }
+        XattrTarget::ProcPath(path) => unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) },
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 pub struct LongNameFsCore {
@@ -3989,6 +4224,141 @@ impl LongNameFsV2Fuser {
             },
             lookup_inc,
         )
+    }
+
+    fn lookup_existing_child_inode(
+        &self,
+        _parent: InodeId,
+        parent_path: &OsStr,
+        name: &OsStr,
+    ) -> Option<InodeId> {
+        let mut ctx = self.core.resolve_dir(parent_path).ok()?;
+        let raw = normalize_osstr(name);
+        let (backend, _) = map_segment_for_lookup(
+            ctx.dir_fd.as_fd(),
+            &mut ctx.state,
+            &raw,
+            self.core.max_name_len,
+        )
+        .ok()?;
+        let fname = backend.as_cstring().ok()?;
+        let stat = fstatat(
+            ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .ok()?;
+        let backend_key = backend_key_from_stat(&stat);
+        self.inode_store.get_by_backend(backend_key).map(|entry| entry.ino)
+    }
+
+    fn apply_rename_inode_bookkeeping(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        newparent: InodeId,
+        newname: &OsStr,
+        dst_parent_path: &OsStr,
+        replaced_ino: Option<InodeId>,
+    ) -> CoreResult<Option<InodeId>> {
+        let mut dst_ctx = self.core.resolve_dir(dst_parent_path)?;
+        let raw_new = normalize_osstr(newname);
+        let (backend, _) = map_segment_for_lookup(
+            dst_ctx.dir_fd.as_fd(),
+            &mut dst_ctx.state,
+            &raw_new,
+            self.core.max_name_len,
+        )?;
+        let _ = maybe_flush_index(
+            dst_ctx.dir_fd.as_fd(),
+            &mut dst_ctx.state,
+            self.core.index_sync,
+            false,
+        );
+        let fname = backend.as_cstring()?;
+
+        let mut renamed_ino = None;
+        if let Ok(stat) = fstatat(
+            dst_ctx.dir_fd.as_fd(),
+            fname.as_c_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            let backend_key = backend_key_from_stat(&stat);
+            if let Some(child) = self.inode_store.get_by_backend(backend_key) {
+                renamed_ino = Some(child.ino);
+                let _ = self.inode_store.remove_parent_name(
+                    child.ino,
+                    &ParentName {
+                        parent,
+                        name: name.to_os_string(),
+                        backend_name: Vec::new(),
+                    },
+                );
+                let new_parent_name = ParentName {
+                    parent: newparent,
+                    name: newname.to_os_string(),
+                    backend_name: backend.display_bytes(),
+                };
+                let _ = self
+                    .inode_store
+                    .add_parent_name(child.ino, new_parent_name.clone());
+                let _ = self.inode_store.move_entry(child.ino, new_parent_name);
+            }
+        }
+
+        if let Some(replaced_ino) = replaced_ino
+            && Some(replaced_ino) != renamed_ino
+        {
+            let _ = self.inode_store.remove_parent_name(
+                replaced_ino,
+                &ParentName {
+                    parent: newparent,
+                    name: newname.to_os_string(),
+                    backend_name: Vec::new(),
+                },
+            );
+        }
+        Ok(renamed_ino)
+    }
+
+    fn apply_unlink_inode_bookkeeping(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        backend_bytes: &[u8],
+        existing_stat: nix::sys::stat::FileStat,
+    ) -> Option<InodeId> {
+        let backend_key = backend_key_from_stat(&existing_stat);
+        let child = self.inode_store.get_by_backend(backend_key)?;
+        let _ = self.inode_store.remove_parent_name(
+            child.ino,
+            &ParentName {
+                parent,
+                name: name.to_os_string(),
+                backend_name: backend_bytes.to_vec(),
+            },
+        );
+        Some(child.ino)
+    }
+
+    fn apply_rmdir_inode_bookkeeping(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        backend_bytes: &[u8],
+        existing_stat: nix::sys::stat::FileStat,
+    ) -> Option<InodeId> {
+        let backend_key = backend_key_from_stat(&existing_stat);
+        let child = self.inode_store.get_by_backend(backend_key)?;
+        let _ = self.inode_store.remove_parent_name(
+            child.ino,
+            &ParentName {
+                parent,
+                name: name.to_os_string(),
+                backend_name: backend_bytes.to_vec(),
+            },
+        );
+        Some(child.ino)
     }
 
     fn open_backend_file(&self, entry: &InodeEntry, flags: u32) -> CoreResult<OwnedFd> {
@@ -5301,7 +5671,7 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let mut renamed_child: Option<InodeId> = None;
+        let replaced_child = self.lookup_existing_child_inode(newparent, &dst_parent_path, newname);
         let inv = match self.core.rename_with_flags(
             &src_parent_path,
             name,
@@ -5317,19 +5687,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
         };
         self.apply_invalidation(inv);
 
-        let mut dst_ctx = match self.core.resolve_dir(&dst_parent_path) {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(core_err_to_errno(&err));
-                return;
-            }
-        };
-        let raw_new = normalize_osstr(newname);
-        let (backend, _) = match map_segment_for_lookup(
-            dst_ctx.dir_fd.as_fd(),
-            &mut dst_ctx.state,
-            &raw_new,
-            self.core.max_name_len,
+        let renamed_child = match self.apply_rename_inode_bookkeeping(
+            parent,
+            name,
+            newparent,
+            newname,
+            &dst_parent_path,
+            replaced_child,
         ) {
             Ok(v) => v,
             Err(err) => {
@@ -5337,45 +5701,6 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let _ = maybe_flush_index(
-            dst_ctx.dir_fd.as_fd(),
-            &mut dst_ctx.state,
-            self.core.index_sync,
-            false,
-        );
-        let fname = match backend.as_cstring() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(core_err_to_errno(&err));
-                return;
-            }
-        };
-        if let Ok(stat) = fstatat(
-            dst_ctx.dir_fd.as_fd(),
-            fname.as_c_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        ) {
-            let child =
-                self.ensure_child_entry(newparent, newname, backend.display_bytes(), stat, 0);
-            renamed_child = Some(child.ino);
-            let _ = self.inode_store.remove_parent_name(
-                child.ino,
-                &ParentName {
-                    parent,
-                    name: name.to_os_string(),
-                    backend_name: Vec::new(),
-                },
-            );
-            let new_parent_name = ParentName {
-                parent: newparent,
-                name: newname.to_os_string(),
-                backend_name: backend.display_bytes(),
-            };
-            let _ = self
-                .inode_store
-                .add_parent_name(child.ino, new_parent_name.clone());
-            let _ = self.inode_store.move_entry(child.ino, new_parent_name);
-        }
         self.notify_entry_change(parent, name);
         self.notify_entry_change(newparent, newname);
         if let Some(child) = renamed_child {
@@ -5591,17 +5916,14 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             self.core.index_sync,
             false,
         );
-        let child = self.ensure_child_entry(parent, name, backend_bytes.clone(), existing_stat, 0);
         self.patch_dir_cache(ctx.dir_fd.as_fd(), CacheOp::Remove(backend_bytes.clone()));
-        let _ = self.inode_store.remove_parent_name(
-            child.ino,
-            &ParentName {
-                parent,
-                name: name.to_os_string(),
-                backend_name: backend_bytes.clone(),
-            },
-        );
-        self.notify_delete(parent, child.ino, name);
+        if let Some(child_ino) =
+            self.apply_unlink_inode_bookkeeping(parent, name, &backend_bytes, existing_stat)
+        {
+            self.notify_delete(parent, child_ino, name);
+        } else {
+            self.notify_entry_change(parent, name);
+        }
         reply.ok();
     }
 
@@ -5714,16 +6036,13 @@ impl FuserFilesystem for LongNameFsV2Fuser {
             self.handles.clear_dir_attr_cache(child_key);
         }
         if let Some(stat) = existing_stat {
-            let child = self.ensure_child_entry(parent, name, backend_bytes.clone(), stat, 0);
-            let _ = self.inode_store.remove_parent_name(
-                child.ino,
-                &ParentName {
-                    parent,
-                    name: name.to_os_string(),
-                    backend_name: backend_bytes.clone(),
-                },
-            );
-            self.notify_delete(parent, child.ino, name);
+            if let Some(child_ino) =
+                self.apply_rmdir_inode_bookkeeping(parent, name, &backend_bytes, stat)
+            {
+                self.notify_delete(parent, child_ino, name);
+            } else {
+                self.notify_entry_change(parent, name);
+            }
         } else {
             self.notify_entry_change(parent, name);
         }
@@ -7053,25 +7372,15 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &path, true) {
+        let target = match xattr_target_for_path(self.core.as_ref(), &path, true) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
                 return;
             }
         };
-        let _fd_guard = fd_guard;
-        let res = unsafe {
-            libc::fsetxattr(
-                fd_raw,
-                cname.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                value.len(),
-                flags as libc::c_int,
-            )
-        };
-        if res < 0 {
-            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+        if let Err(err) = xattr_set(&target, cname.as_c_str(), value, flags) {
+            reply.error(core_err_to_errno(&err));
             return;
         }
         reply.ok();
@@ -7107,37 +7416,28 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &path, false) {
+        let target = match xattr_target_for_path(self.core.as_ref(), &path, false) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
                 return;
             }
         };
-        let _fd_guard = fd_guard;
         if size == 0 {
-            let res = unsafe { libc::fgetxattr(fd_raw, cname.as_ptr(), std::ptr::null_mut(), 0) };
-            if res < 0 {
-                reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
-                return;
+            match xattr_get_size(&target, cname.as_c_str()) {
+                Ok(v) => reply.size(v as u32),
+                Err(err) => reply.error(core_err_to_errno(&err)),
             }
-            reply.size(res as u32);
             return;
         }
         let mut buf = vec![0u8; size as usize];
-        let res = unsafe {
-            libc::fgetxattr(
-                fd_raw,
-                cname.as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                size as usize,
-            )
+        let read_len = match xattr_get_into(&target, cname.as_c_str(), &mut buf) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
         };
-        if res < 0 {
-            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
-            return;
-        }
-        let read_len = res as usize;
         if read_len > size as usize {
             reply.error(libc::ERANGE);
             return;
@@ -7158,32 +7458,28 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &path, false) {
+        let target = match xattr_target_for_path(self.core.as_ref(), &path, false) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
                 return;
             }
         };
-        let _fd_guard = fd_guard;
-        let initial = unsafe { libc::flistxattr(fd_raw, std::ptr::null_mut(), 0) };
-        if initial < 0 {
-            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
-            return;
-        }
-        let mut buf = vec![0u8; initial as usize];
-        let res = unsafe {
-            libc::flistxattr(
-                fd_raw,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len() as libc::size_t,
-            )
+        let initial = match xattr_list_size(&target) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
         };
-        if res < 0 {
-            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
-            return;
-        }
-        let list_len = res as usize;
+        let mut buf = vec![0u8; initial];
+        let list_len = match xattr_list_into(&target, &mut buf) {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(core_err_to_errno(&err));
+                return;
+            }
+        };
         buf.truncate(list_len);
         let mut filtered = Vec::new();
         let mut start = 0usize;
@@ -7235,17 +7531,15 @@ impl FuserFilesystem for LongNameFsV2Fuser {
                 return;
             }
         };
-        let (fd_raw, fd_guard) = match raw_fd_for_xattr(self.core.as_ref(), &path, true) {
+        let target = match xattr_target_for_path(self.core.as_ref(), &path, true) {
             Ok(v) => v,
             Err(err) => {
                 reply.error(core_err_to_errno(&err));
                 return;
             }
         };
-        let _fd_guard = fd_guard;
-        let res = unsafe { libc::fremovexattr(fd_raw, cname.as_ptr()) };
-        if res < 0 {
-            reply.error(core_err_to_errno(&io::Error::last_os_error().into()));
+        if let Err(err) = xattr_remove(&target, cname.as_c_str()) {
+            reply.error(core_err_to_errno(&err));
             return;
         }
         reply.ok();
@@ -7450,6 +7744,192 @@ mod tests {
     }
 
     #[test]
+    fn rename_overwrite_clears_replaced_inode_parent_mapping() {
+        let tmp = TempDir::new();
+        fs::write(tmp.path().join("a"), b"a").unwrap();
+        fs::write(tmp.path().join("b"), b"b").unwrap();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+        let fs = LongNameFsV2Fuser::new(
+            config,
+            MAX_SEGMENT_ON_DISK,
+            Some(Duration::from_secs(60)),
+            1024,
+            IndexSync::Off,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            false,
+            false,
+            PassthroughMetaFdConfig::disabled(),
+        )
+        .unwrap();
+
+        let root_fd = fs.core.cached_root_fd().unwrap();
+        let stat_a = fstatat(root_fd.as_fd(), c"a", AtFlags::AT_SYMLINK_NOFOLLOW).unwrap();
+        let stat_b = fstatat(root_fd.as_fd(), c"b", AtFlags::AT_SYMLINK_NOFOLLOW).unwrap();
+        let a = fs.ensure_child_entry(ROOT_INODE, OsStr::new("a"), b"a".to_vec(), stat_a, 1);
+        let b = fs.ensure_child_entry(ROOT_INODE, OsStr::new("b"), b"b".to_vec(), stat_b, 1);
+
+        let replaced = fs.lookup_existing_child_inode(ROOT_INODE, OsStr::new("/"), OsStr::new("b"));
+        fs.core
+            .rename_with_flags(
+                OsStr::new("/"),
+                OsStr::new("a"),
+                OsStr::new("/"),
+                OsStr::new("b"),
+                0,
+            )
+            .unwrap();
+
+        let renamed = fs
+            .apply_rename_inode_bookkeeping(
+                ROOT_INODE,
+                OsStr::new("a"),
+                ROOT_INODE,
+                OsStr::new("b"),
+                OsStr::new("/"),
+                replaced,
+            )
+            .unwrap()
+            .expect("renamed inode should resolve");
+        assert_eq!(renamed, a.ino);
+
+        let moved = fs.inode_store.get(a.ino).unwrap();
+        assert_eq!(moved.parent, ROOT_INODE);
+        assert_eq!(moved.name, OsStr::new("b"));
+        assert!(
+            moved
+                .parents
+                .iter()
+                .any(|p| p.parent == ROOT_INODE && p.name == OsStr::new("b"))
+        );
+
+        let replaced = fs.inode_store.get(b.ino).unwrap();
+        assert!(
+            !replaced
+                .parents
+                .iter()
+                .any(|p| p.parent == ROOT_INODE && p.name == OsStr::new("b"))
+        );
+        assert!(matches!(
+            fs.inode_store.get_path(b.ino),
+            Err(CoreError::StaleInode)
+        ));
+    }
+
+    #[test]
+    fn post_mutation_bookkeeping_does_not_create_zero_lookup_inode() {
+        let tmp = TempDir::new();
+        fs::write(tmp.path().join("a"), b"a").unwrap();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+        let fs = LongNameFsV2Fuser::new(
+            config,
+            MAX_SEGMENT_ON_DISK,
+            Some(Duration::from_secs(60)),
+            1024,
+            IndexSync::Off,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            false,
+            false,
+            PassthroughMetaFdConfig::disabled(),
+        )
+        .unwrap();
+
+        fs.core
+            .rename_with_flags(
+                OsStr::new("/"),
+                OsStr::new("a"),
+                OsStr::new("/"),
+                OsStr::new("b"),
+                0,
+            )
+            .unwrap();
+
+        let renamed = fs
+            .apply_rename_inode_bookkeeping(
+                ROOT_INODE,
+                OsStr::new("a"),
+                ROOT_INODE,
+                OsStr::new("b"),
+                OsStr::new("/"),
+                None,
+            )
+            .unwrap();
+        assert!(
+            renamed.is_none(),
+            "rename bookkeeping should not create inode for uncached backend"
+        );
+    }
+
+    #[test]
+    fn unlink_bookkeeping_miss_does_not_create_zero_lookup_inode() {
+        let tmp = TempDir::new();
+        fs::write(tmp.path().join("u"), b"u").unwrap();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+        let fs = LongNameFsV2Fuser::new(
+            config,
+            MAX_SEGMENT_ON_DISK,
+            Some(Duration::from_secs(60)),
+            1024,
+            IndexSync::Off,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            false,
+            false,
+            PassthroughMetaFdConfig::disabled(),
+        )
+        .unwrap();
+
+        let root_fd = fs.core.cached_root_fd().unwrap();
+        let stat = fstatat(root_fd.as_fd(), c"u", AtFlags::AT_SYMLINK_NOFOLLOW).unwrap();
+        let backend_key = backend_key_from_stat(&stat);
+        assert!(fs.inode_store.get_by_backend(backend_key).is_none());
+
+        let removed = fs.apply_unlink_inode_bookkeeping(
+            ROOT_INODE,
+            OsStr::new("u"),
+            b"u",
+            stat,
+        );
+        assert!(removed.is_none());
+        assert!(fs.inode_store.get_by_backend(backend_key).is_none());
+    }
+
+    #[test]
+    fn rmdir_bookkeeping_miss_does_not_create_zero_lookup_inode() {
+        let tmp = TempDir::new();
+        fs::create_dir(tmp.path().join("d")).unwrap();
+        let config = Config::open_backend(tmp.path().clone(), false, false).unwrap();
+        let fs = LongNameFsV2Fuser::new(
+            config,
+            MAX_SEGMENT_ON_DISK,
+            Some(Duration::from_secs(60)),
+            1024,
+            IndexSync::Off,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            false,
+            false,
+            PassthroughMetaFdConfig::disabled(),
+        )
+        .unwrap();
+
+        let root_fd = fs.core.cached_root_fd().unwrap();
+        let stat = fstatat(root_fd.as_fd(), c"d", AtFlags::AT_SYMLINK_NOFOLLOW).unwrap();
+        let backend_key = backend_key_from_stat(&stat);
+        assert!(fs.inode_store.get_by_backend(backend_key).is_none());
+
+        let removed = fs.apply_rmdir_inode_bookkeeping(
+            ROOT_INODE,
+            OsStr::new("d"),
+            b"d",
+            stat,
+        );
+        assert!(removed.is_none());
+        assert!(fs.inode_store.get_by_backend(backend_key).is_none());
+    }
+
+    #[test]
     fn map_segment_for_create_detects_existing_long_name() {
         let state = DirState {
             index: Arc::new(RwLock::new(IndexState {
@@ -7525,6 +8005,95 @@ mod tests {
         let fd = openat_nofollow_for_xattr(dir_fd.as_fd(), name.as_c_str()).unwrap();
         let got = get_internal_rawname(fd.as_fd()).unwrap();
         assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn raw_fd_for_xattr_write_intent_allows_directory() {
+        let tmp = TempDir::new();
+        let config = Config::open_backend(tmp.path().to_path_buf(), false, false).unwrap();
+        let core = LongNameFsCore::new(
+            config,
+            MAX_SEGMENT_ON_DISK,
+            Some(Duration::from_secs(1)),
+            IndexSync::Off,
+        )
+        .unwrap();
+
+        let res = xattr_target_for_path(&core, OsStr::new("/"), true);
+        assert!(res.is_ok(), "expected write_intent dir open to succeed: {res:?}");
+    }
+
+    #[test]
+    fn symlink_xattr_uses_procfs_lxattr_fallback() {
+        let tmp = TempDir::new();
+        let config = Config::open_backend(tmp.path().to_path_buf(), false, false).unwrap();
+        let core = match LongNameFsCore::new(
+            config,
+            MAX_SEGMENT_ON_DISK,
+            Some(Duration::from_secs(1)),
+            IndexSync::Off,
+        ) {
+            Ok(core) => core,
+            Err(CoreError::Io(ioe))
+                if matches!(
+                    ioe.raw_os_error(),
+                    Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EPERM)
+                ) =>
+            {
+                return;
+            }
+            Err(err) => panic!("LongNameFsCore::new failed: {err:?}"),
+        };
+        let root_fd = core.cached_root_fd().unwrap();
+        symlinkat("target", root_fd.as_fd(), c"link").unwrap();
+
+        let target = xattr_target_for_path(&core, OsStr::new("/link"), true).unwrap();
+        assert!(
+            matches!(target, XattrTarget::ProcPath(_)),
+            "expected symlink no-follow to use procfs fallback"
+        );
+
+        let xname = CString::new("user.task3.symlink").unwrap();
+        let value = b"task3-value";
+
+        if let Err(CoreError::Io(ioe)) = xattr_set(&target, xname.as_c_str(), value, 0) {
+            if matches!(
+                ioe.raw_os_error(),
+                Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EPERM)
+            ) {
+                return;
+            }
+            panic!("xattr_set failed: {ioe:?}");
+        }
+
+        let sz = xattr_get_size(&target, xname.as_c_str()).unwrap();
+        let mut got = vec![0u8; sz];
+        let read_len = xattr_get_into(&target, xname.as_c_str(), &mut got).unwrap();
+        got.truncate(read_len);
+        assert_eq!(got, value);
+
+        let list_len = xattr_list_size(&target).unwrap();
+        let mut list_buf = vec![0u8; list_len];
+        let list_read = xattr_list_into(&target, &mut list_buf).unwrap();
+        list_buf.truncate(list_read);
+        assert!(
+            list_buf
+                .windows(xname.as_bytes_with_nul().len())
+                .any(|w| w == xname.as_bytes_with_nul()),
+            "expected listxattr to include key"
+        );
+
+        xattr_remove(&target, xname.as_c_str()).unwrap();
+        let err = xattr_get_size(&target, xname.as_c_str()).unwrap_err();
+        if let CoreError::Io(ioe) = err {
+            assert_eq!(
+                ioe.raw_os_error(),
+                Some(libc::ENODATA),
+                "unexpected errno after removexattr"
+            );
+        } else {
+            panic!("unexpected error type after removexattr: {err:?}");
+        }
     }
 
     #[test]

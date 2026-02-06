@@ -112,6 +112,11 @@ impl InodeStore {
         shard.entries.get(&ino).cloned()
     }
 
+    pub fn get_by_backend(&self, backend: BackendKey) -> Option<InodeEntry> {
+        let ino = self.backend_map.read().get(&backend).copied()?;
+        self.get(ino)
+    }
+
     pub fn get_path(&self, ino: InodeId) -> CoreResult<OsString> {
         if ino == ROOT_INODE {
             return Ok(OsString::from("/"));
@@ -546,5 +551,39 @@ mod tests {
                 .iter()
                 .any(|p| p.name == "b" && p.backend_name == b"bb".to_vec())
         );
+    }
+
+    #[test]
+    fn get_by_backend_returns_none_when_missing() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        assert!(
+            store
+                .get_by_backend(BackendKey { dev: 99, ino: 99 })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn get_by_backend_returns_entry_when_present() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let child = store.lookup_or_create(
+            BackendKey { dev: 2, ino: 3 },
+            InodeKind::File,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("hit"),
+                backend_name: b"hit".to_vec(),
+            },
+        );
+
+        let hit = store
+            .get_by_backend(BackendKey { dev: 2, ino: 3 })
+            .expect("backend key should resolve existing inode");
+        assert_eq!(hit.ino, child.ino);
+        assert_eq!(hit.name, OsString::from("hit"));
     }
 }
