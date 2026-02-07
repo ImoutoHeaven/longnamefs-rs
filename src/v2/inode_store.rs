@@ -260,7 +260,9 @@ impl InodeStore {
             return None;
         }
         let removed = shard.entries.remove(&ino)?;
-        backend_map.remove(&removed.backend);
+        if backend_map.get(&removed.backend).copied() == Some(ino) {
+            backend_map.remove(&removed.backend);
+        }
         Some(removed)
     }
 
@@ -291,7 +293,9 @@ impl InodeStore {
             return None;
         }
         let removed = shard.entries.remove(&ino)?;
-        backend_map.remove(&removed.backend);
+        if backend_map.get(&removed.backend).copied() == Some(ino) {
+            backend_map.remove(&removed.backend);
+        }
         Some(removed)
     }
 
@@ -370,6 +374,8 @@ impl Default for InodeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn get_path_reconstructs_from_parents() {
@@ -640,6 +646,159 @@ mod tests {
             store
                 .get_by_backend(backend)
                 .expect("backend should resolve to new inode")
+                .ino,
+            reused.ino
+        );
+    }
+
+    #[test]
+    fn dec_lookup_cleanup_keeps_reused_backend_mapping() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let backend = BackendKey { dev: 7, ino: 21 };
+        let old_parent = ParentName {
+            parent: ROOT_INODE,
+            name: OsString::from("old"),
+            backend_name: b"old".to_vec(),
+        };
+        let old = store.lookup_or_create(backend, InodeKind::File, old_parent.clone());
+        let _ = store.inc_open(old.ino);
+        let _ = store
+            .remove_parent_name(old.ino, &old_parent)
+            .expect("old inode should stay while open");
+
+        let reused = store.get_or_insert(
+            backend,
+            InodeKind::File,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("new"),
+                backend_name: b"new".to_vec(),
+            },
+            1,
+        );
+        assert_ne!(reused.ino, old.ino);
+
+        let _ = store.dec_open(old.ino);
+        let removed = store
+            .dec_lookup(old.ino, 1)
+            .expect("old inode should be removed when lookup reaches zero");
+        assert_eq!(removed.ino, old.ino);
+
+        assert_eq!(
+            store
+                .get_by_backend(backend)
+                .expect("backend mapping should remain on reused inode")
+                .ino,
+            reused.ino
+        );
+    }
+
+    #[test]
+    fn dec_open_cleanup_keeps_reused_backend_mapping() {
+        let store = InodeStore::new();
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let backend = BackendKey { dev: 7, ino: 31 };
+        let old_parent = ParentName {
+            parent: ROOT_INODE,
+            name: OsString::from("old"),
+            backend_name: b"old".to_vec(),
+        };
+        let old = store.lookup_or_create(backend, InodeKind::File, old_parent.clone());
+        let _ = store.inc_open(old.ino);
+        let _ = store
+            .remove_parent_name(old.ino, &old_parent)
+            .expect("old inode should stay while open");
+        let _ = store.dec_lookup(old.ino, 1);
+
+        let reused = store.get_or_insert(
+            backend,
+            InodeKind::File,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("new"),
+                backend_name: b"new".to_vec(),
+            },
+            1,
+        );
+        assert_ne!(reused.ino, old.ino);
+
+        let removed = store
+            .dec_open(old.ino)
+            .expect("old inode should be removed when open reaches zero");
+        assert_eq!(removed.ino, old.ino);
+
+        assert_eq!(
+            store
+                .get_by_backend(backend)
+                .expect("backend mapping should remain on reused inode")
+                .ino,
+            reused.ino
+        );
+    }
+
+    #[test]
+    fn concurrent_cleanup_keeps_reused_backend_mapping() {
+        let store = Arc::new(InodeStore::new());
+        store.init_root(BackendKey { dev: 1, ino: 1 });
+
+        let backend = BackendKey { dev: 7, ino: 41 };
+        let old_parent = ParentName {
+            parent: ROOT_INODE,
+            name: OsString::from("old"),
+            backend_name: b"old".to_vec(),
+        };
+        let old = store.lookup_or_create(backend, InodeKind::File, old_parent.clone());
+        let _ = store.inc_open(old.ino);
+        let _ = store
+            .remove_parent_name(old.ino, &old_parent)
+            .expect("old inode should stay while open");
+
+        let reused = store.get_or_insert(
+            backend,
+            InodeKind::File,
+            ParentName {
+                parent: ROOT_INODE,
+                name: OsString::from("new"),
+                backend_name: b"new".to_vec(),
+            },
+            1,
+        );
+        assert_ne!(reused.ino, old.ino);
+
+        let start = Arc::new(Barrier::new(3));
+        let store_for_lookup = Arc::clone(&store);
+        let start_for_lookup = Arc::clone(&start);
+        let lookup_handle = thread::spawn(move || {
+            start_for_lookup.wait();
+            store_for_lookup.dec_lookup(old.ino, 1)
+        });
+
+        let store_for_open = Arc::clone(&store);
+        let start_for_open = Arc::clone(&start);
+        let open_handle = thread::spawn(move || {
+            start_for_open.wait();
+            store_for_open.dec_open(old.ino)
+        });
+
+        start.wait();
+        let lookup_removed = lookup_handle
+            .join()
+            .expect("lookup thread should not panic");
+        let open_removed = open_handle.join().expect("open thread should not panic");
+
+        let removed_count = lookup_removed.is_some() as u8 + open_removed.is_some() as u8;
+        assert_eq!(
+            removed_count, 1,
+            "exactly one cleanup path should remove old inode"
+        );
+        assert!(store.get(old.ino).is_none());
+        assert_eq!(
+            store
+                .get_by_backend(backend)
+                .expect("backend mapping should remain on reused inode")
                 .ino,
             reused.ino
         );

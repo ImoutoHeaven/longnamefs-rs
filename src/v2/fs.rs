@@ -957,6 +957,11 @@ fn validate_rename_flags_v2(flags: u32) -> CoreResult<()> {
     }
     let rename_flags =
         RenameFlags::from_bits(flags).ok_or_else(|| CoreError::from_errno(libc::EINVAL))?;
+    if rename_flags.contains(RenameFlags::RENAME_NOREPLACE)
+        && rename_flags.contains(RenameFlags::RENAME_EXCHANGE)
+    {
+        return Err(CoreError::from_errno(libc::EINVAL));
+    }
     if rename_flags == RenameFlags::RENAME_NOREPLACE {
         return Ok(());
     }
@@ -8858,6 +8863,13 @@ mod tests {
     fn rename_supported_but_unimplemented_flags_stay_unsupported() {
         let err = validate_rename_flags_v2(libc::RENAME_EXCHANGE).unwrap_err();
         assert_eq!(core_err_to_errno(&err), libc::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn rename_noreplace_exchange_combination_returns_einval() {
+        let err =
+            validate_rename_flags_v2(libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE).unwrap_err();
+        assert_eq!(core_err_to_errno(&err), libc::EINVAL);
     }
 
     #[test]
