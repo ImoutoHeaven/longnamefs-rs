@@ -74,10 +74,10 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 **v2 (xattr + index, incompatible with C/v1 backends)**
 - Uses the fuser adapter exclusively; the `--fuse-impl` switch is ignored for v2.
 - `--max-name-len`: maximum logical segment length accepted (default 1024; returns `ENAMETOOLONG`/`EINVAL` when exceeded).
-- `--index-sync` (`batch` default): `always` flush index on every mutation, `batch` flushes when 128 pending changes or 5s elapsed, `off` disables background flush (index rebuild will recover).
+- `--index-sync` (`batch` default): `always` flushes pending index work immediately after each mutation, `batch` flushes when 128 pending changes or 5s elapsed, `off` disables background flush (index rebuild will recover).
 - `--attr-ttl-ms`: TTL for v2 attr/entry replies in milliseconds (default 1000). Set to 0 to disable kernel caching.
 - `--open-ttl-ms`: TTL for v2 attr/entry replies of *open regular files* in milliseconds. Defaults to `--attr-ttl-ms` when omitted.
-- `--enable-passthrough` (default off): request FUSE passthrough (kernel 7.40+ with `FUSE_PASSTHROUGH` required; fuser `abi-7-40` feature is compiled in by default). On failure to negotiate, IO automatically falls back to userspace and logs the reason once per process start.
+- `--enable-passthrough` (default off): request FUSE passthrough (kernel 7.40+ with `FUSE_PASSTHROUGH` required; fuser `abi-7-40` feature is compiled in by default). If passthrough negotiation is not accepted at mount/init time, v2 disables passthrough for that session and continues with userspace IO.
 - `--enable-writeback-cache` (default off): request FUSE writeback cache. When accepted, the kernel may buffer/merge writes; durability still requires fsync/fdatasync.
 - `--enable-passthrough-meta-fd` (default off): enable caching/promoting a per-handle metadata FD when passthrough is active (reduces metadata overhead at the cost of extra FDs).
 - `--passthrough-meta-fd-max` (default 1024): maximum cached meta FDs to keep.
@@ -96,12 +96,15 @@ Behavior
 - Read/write, create, rename, link, symlink, mkdir/mknod, truncate, chmod/chown, utimens, and statfs mirror the C implementation when using `--backend-layout v1`.
 - With `--backend-layout v1`, writeback caching is requested unconditionally (there is currently no CLI toggle). When the kernel honors it, writes may be buffered/merged in the page cache, so durability relies on explicit `fsync`/`fdatasync` (close does not force a sync) and the kernel's asynchronous flushes.
 - With `--backend-layout v2`, writeback caching is **opt-in** via `--enable-writeback-cache`.
+- In v2, runtime passthrough userspace fallback warnings are emitted per fallback event when a request cannot keep using passthrough after mount/init.
 - Directory listings reconstruct original names and cache entries per-directory for the configured TTL (default 1s) and invalidate on mutations to cut repeated backend I/O. In v2 the same TTL controls an LRU of directory FDs to reduce open/close churn when resolving deep paths.
 - Operations on `/` interact directly with the backend directory (chmod/chown/utimens supported; truncate disallowed).
 - Extended attributes (get/set/list/remove) are forwarded to backend objects; `position` must be zero on Linux.
 - In v2 generic xattr handling, symlink `no-follow` operations first try `openat(..., O_NOFOLLOW)` and, if that fails with `ELOOP`, fall back to `/proc/self/fd/...` path-based `l* xattr` (`lgetxattr/lsetxattr/llistxattr/lremovexattr`).
 - O_PATH-based xattr access also falls back to `/proc/self/fd/...` path-based `l* xattr` when the kernel returns `EBADF`; both fallback paths require procfs to be available.
 - In v2 rename overwrite bookkeeping, target replacement cleanup is guarded by in-process serialization plus replaced-child snapshot validation, preventing stale snapshots from removing unrelated inode parent/name mappings.
+- In v2, `short -> long` rename uses the same rawname metadata path for regular files, symlinks, fifo nodes, and unix-domain sockets. If the backend rejects the required rawname metadata write for that object type, the rename returns that error before any backend rename commits.
+- In v2, `RENAME_NOREPLACE` requires `renameat2`; when `renameat2` is unavailable, the operation returns `EOPNOTSUPP` before mutating the backend namespace.
 - For both v2 procfs xattr fallback paths, when procfs is unavailable and fallback returns `ENOENT`/`ENOTDIR`, the original semantic errno (`ELOOP`/`EBADF`) is preserved.
 - `readdirplus` returns names with attributes; `flush`/`fsyncdir` are implemented; `poll` is accepted (returns no ready events).
 - In v2, `readdirplus` materialization now installs child entries with a live lookup reference so later `forget` decrements match the kernel lookup lifecycle (no underflow/mismatched ref tracking).

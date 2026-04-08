@@ -13,7 +13,10 @@ use fs::LongNameFs;
 use fuse3::MountOptions;
 use fuse3::path::PathFilesystem;
 use fuse3::path::Session;
-use fuser::{MountOption as FuserMountOption, Session as FuserSession};
+use fuser::{
+    Config as FuserConfig, MountOption as FuserMountOption, Session as FuserSession,
+    SessionACL as FuserSessionACL,
+};
 #[cfg(unix)]
 use futures_util::future::poll_fn;
 #[cfg(unix)]
@@ -57,9 +60,9 @@ fn detach_mountpoint_lazy(path: &std::path::Path) -> anyhow::Result<()> {
 
 #[derive(Parser, Debug)]
 #[command(name = "longnamefs-rs")]
-#[command(about = "FUSE3 long file name shim compatible with the C longnamefs backend layout")]
+#[command(about = "FUSE long file name shim")]
 struct Cli {
-    /// Backend layout version (v1: current hash+namefile; v2: xattr+index, WIP).
+    /// Backend layout version (v1: current hash+namefile; v2: xattr+index, incompatible with v1/C backends).
     #[arg(long, value_enum, default_value_t = BackendLayout::V1)]
     backend_layout: BackendLayout,
 
@@ -147,7 +150,7 @@ struct Cli {
     #[arg(long, default_value_t = 5000)]
     passthrough_meta_fd_cooldown_ms: u64,
 
-    /// v2 index flush strategy: always sync, batch by time/ops, or off (no flush).
+    /// v2 index flush strategy: always flush pending index work, batch by time/ops, or off (no flush).
     #[arg(long, value_enum, default_value_t = IndexSyncCli::Batch)]
     index_sync: IndexSyncCli,
 
@@ -243,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
         }
         BackendLayout::V2 => {
             eprintln!(
-                "WARNING: backend layout v2 is experimental and incompatible with v1 data; use a dedicated empty backend directory."
+                "WARNING: backend layout v2 is incompatible with v1/C backends; use a dedicated empty backend directory."
             );
             if cli.fuse_impl == FuseImpl::Fuse3 {
                 eprintln!("v2 now only supports the fuser adapter; falling back to fuser.");
@@ -407,19 +410,27 @@ fn run_mount_fuser(
     allow_other: bool,
     nonempty: bool,
 ) -> anyhow::Result<()> {
-    let mut options = vec![
+    let mut config = FuserConfig::default();
+    config.mount_options = vec![
         FuserMountOption::RW,
         FuserMountOption::FSName("longnamefs-rs".to_string()),
         FuserMountOption::Subtype("ln2".to_string()),
     ];
+    config.acl = FuserSessionACL::Owner;
     if allow_other {
-        options.push(FuserMountOption::AllowOther);
+        config.acl = FuserSessionACL::All;
     }
     if nonempty {
-        options.push(FuserMountOption::CUSTOM("nonempty".to_string()));
+        config
+            .mount_options
+            .push(FuserMountOption::CUSTOM("nonempty".to_string()));
     }
     let notifier = fs.notifier_handle();
-    let mut session = FuserSession::new(fs, mountpoint, &options).map_err(anyhow::Error::from)?;
+    let session = FuserSession::new(fs, mountpoint, &config).map_err(anyhow::Error::from)?;
     notifier.set(session.notifier());
-    session.run().map_err(anyhow::Error::from)
+    session
+        .spawn()
+        .map_err(anyhow::Error::from)?
+        .join()
+        .map_err(anyhow::Error::from)
 }
