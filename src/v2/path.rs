@@ -1,14 +1,11 @@
 #![allow(dead_code)]
 
 use crate::v2::error::{CoreError, CoreResult};
-use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
 pub const INTERNAL_PREFIX: &str = ".__ln2_";
 pub const MAX_SEGMENT_ON_DISK: usize = 255;
-pub const HASH_BYTES: usize = 16; // SHA-256 前 16 字节 → 32 hex
-pub const MAX_COLLISION_SUFFIX: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentKind {
@@ -20,10 +17,11 @@ pub fn is_reserved_prefix(raw: &[u8]) -> bool {
     raw.starts_with(INTERNAL_PREFIX.as_bytes())
 }
 
-pub fn classify_segment(raw: &[u8], max_name_len: usize) -> CoreResult<SegmentKind> {
-    if raw.len() > max_name_len {
-        return Err(CoreError::NameTooLong);
-    }
+pub fn is_stable_long_object_backend_name(raw: &[u8]) -> bool {
+    crate::v2::object_id::is_stable_long_object_name(raw)
+}
+
+pub fn classify_committed_segment(raw: &[u8]) -> CoreResult<SegmentKind> {
     if is_reserved_prefix(raw) {
         return Err(CoreError::ReservedPrefix);
     }
@@ -33,18 +31,11 @@ pub fn classify_segment(raw: &[u8], max_name_len: usize) -> CoreResult<SegmentKi
     Ok(SegmentKind::Long)
 }
 
-pub fn encode_long_name(raw: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(raw);
-    let digest = hasher.finalize();
-    hex::encode(&digest[..HASH_BYTES])
-}
-
-pub fn backend_basename_from_hash(hash_hex: &str, suffix: Option<u32>) -> String {
-    match suffix {
-        None => format!("{INTERNAL_PREFIX}{hash_hex}"),
-        Some(k) => format!("{INTERNAL_PREFIX}{hash_hex}~{k}"),
+pub fn classify_segment(raw: &[u8], max_name_len: usize) -> CoreResult<SegmentKind> {
+    if raw.len() > max_name_len {
+        return Err(CoreError::NameTooLong);
     }
+    classify_committed_segment(raw)
 }
 
 pub fn normalize_osstr(value: &OsStr) -> Vec<u8> {

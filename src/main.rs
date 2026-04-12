@@ -61,6 +61,9 @@ fn detach_mountpoint_lazy(path: &std::path::Path) -> anyhow::Result<()> {
 #[derive(Parser, Debug)]
 #[command(name = "longnamefs-rs")]
 #[command(about = "FUSE long file name shim")]
+#[command(
+    long_about = "FUSE long file name shim\n\nBackend layout v2 is a strict crash-ACID format that is incompatible with v1/C backends and rejects legacy hash-derived long-name backends. v2 requires an exclusive-writer backend lock via .ln2_fs_lock. Committed long objects use stable .__ln2_obj_<id> backend names. Long-involving rename semantics are strict no-replace and return EEXIST on distinct destination conflicts. Long hardlinks are rejected with EPERM. The v2 index and journal are recoverable acceleration structures, not commit points. Durability comes from the transaction file protocol plus required object and parent-directory syncs, not index flushing."
+)]
 struct Cli {
     /// Backend layout version (v1: current hash+namefile; v2: xattr+index, incompatible with v1/C backends).
     #[arg(long, value_enum, default_value_t = BackendLayout::V1)]
@@ -246,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
         }
         BackendLayout::V2 => {
             eprintln!(
-                "WARNING: backend layout v2 is incompatible with v1/C backends; use a dedicated empty backend directory."
+                "WARNING: backend layout v2 is incompatible with v1/C and legacy hash-derived backends, requires an exclusive-writer .ln2_fs_lock backend lock, and should use a dedicated backend directory."
             );
             if cli.fuse_impl == FuseImpl::Fuse3 {
                 eprintln!("v2 now only supports the fuser adapter; falling back to fuser.");

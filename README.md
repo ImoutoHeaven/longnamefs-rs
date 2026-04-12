@@ -6,6 +6,16 @@ Rust FUSE implementation (v1 via fuse3 async, v2 via fuser sync) of a “long fi
 - **v1 (hash + namefile)**: matches the original C `longnamefs` layout; safe to share the same backend directory with the C implementation.
 - **v2 (xattr + index)**: a new backend, not compatible with v1/C; use a fresh/dedicated backend directory. Long-name hardlinks are rejected by design.
 
+v2 strict crash-ACID requirements:
+
+- v2 requires an exclusive-writer backend lock via `.ln2_fs_lock`.
+- v2 committed long objects use stable `.__ln2_obj_<id>` backend names.
+- v2 rejects legacy hash-derived long-name backend formats.
+- v2 long-involving rename semantics are strict no-replace and return `EEXIST` on distinct destination conflicts.
+- v2 rejects long hardlinks with `EPERM`.
+- v2 index and journal state are recoverable acceleration structures, not commit points.
+- v2 durability comes from the transaction file protocol plus required object and parent-directory syncs, not index flushing.
+
 Requirements
 ------------
 - Runtime dependencies:
@@ -73,8 +83,9 @@ longnamefs-rs --backend /path/to/backend /path/to/mountpoint \
 
 **v2 (xattr + index, incompatible with C/v1 backends)**
 - Uses the fuser adapter exclusively; the `--fuse-impl` switch is ignored for v2.
+- Requires an exclusive-writer backend lock held through `.ln2_fs_lock`; a second writer mount on the same backend is rejected.
 - `--max-name-len`: maximum logical segment length accepted (default 1024; returns `ENAMETOOLONG`/`EINVAL` when exceeded).
-- `--index-sync` (`batch` default): `always` flushes pending index work immediately after each mutation, `batch` flushes when 128 pending changes or 5s elapsed, `off` disables background flush (index rebuild will recover).
+- `--index-sync` (`batch` default): `always` flushes pending index work immediately after each mutation, `batch` flushes when 128 pending changes or 5s elapsed, `off` disables background flush (index rebuild will recover). Index/journal are recoverable acceleration structures, not commit points.
 - `--attr-ttl-ms`: TTL for v2 attr/entry replies in milliseconds (default 1000). Set to 0 to disable kernel caching.
 - `--open-ttl-ms`: TTL for v2 attr/entry replies of *open regular files* in milliseconds. Defaults to `--attr-ttl-ms` when omitted.
 - `--enable-passthrough` (default off): request FUSE passthrough (kernel 7.40+ with `FUSE_PASSTHROUGH` required; fuser `abi-7-40` feature is compiled in by default). If passthrough negotiation is not accepted at mount/init time, v2 disables passthrough for that session and continues with userspace IO.
@@ -111,7 +122,8 @@ Behavior
 - In v2, root `setattr` with `size` now returns `EISDIR`, and `rename` with unsupported flag bits now returns `EINVAL`.
 - In v2 xattr procfs fallbacks, symlink/`O_PATH` fallback targets hold a parent-dir fd guard so `/proc/self/fd/...` paths stay valid for the full xattr call.
 - In v2 inode-fd rebuild paths and v1 pathmap fd-cache duplication paths, dup operations use CLOEXEC-safe helpers so duplicated fds do not leak across exec.
-- With `--backend-layout v1`, long names are stored in `<hash>n` namefiles and remain compatible with the C implementation. With `--backend-layout v2`, long names are mapped to internal `.__ln2_*` entries with the original bytes stored in `user.ln2.rawname`; FS-internal `.ln2_fs_*` entries (index/journal/tmp/probes) are hidden from listings, and long-name hardlinks are rejected.
+- With `--backend-layout v1`, long names are stored in `<hash>n` namefiles and remain compatible with the C implementation. With `--backend-layout v2`, committed long names are mapped to stable `.__ln2_obj_<id>` backend entries with the original bytes stored in `user.ln2.rawname`; legacy hash-derived backends are rejected. FS-internal `.ln2_fs_*` entries (index/journal/tmp/probes) are hidden from listings, long-involving rename is strict no-replace and returns `EEXIST` on distinct destination conflicts, and long-name hardlinks are rejected with `EPERM`.
+- With `--backend-layout v2`, committed namespace durability comes from the correctness-critical transaction file protocol plus required object and parent-directory syncs, not from index flushing.
 - On SIGINT/SIGTERM the process attempts a lazy unmount (`MNT_DETACH`) and then exits immediately (it does not try to drain in-flight IO).
 
 systemd example

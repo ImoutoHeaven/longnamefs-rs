@@ -6,6 +6,9 @@ pub enum CoreError {
     NameTooLong,
     ReservedPrefix,
     InternalMeta,
+    LockConflict,
+    Poisoned,
+    BadFormat,
     NotFound,
     AlreadyExists,
     NoSpace,
@@ -20,6 +23,7 @@ impl CoreError {
     pub fn from_errno(errno: i32) -> Self {
         match errno {
             libc::ENAMETOOLONG => CoreError::NameTooLong,
+            libc::EBUSY => CoreError::LockConflict,
             libc::ENOENT => CoreError::NotFound,
             libc::EEXIST => CoreError::AlreadyExists,
             libc::ENOSPC => CoreError::NoSpace,
@@ -28,6 +32,8 @@ impl CoreError {
             libc::EMLINK => CoreError::TooManyLinks,
             libc::ESTALE => CoreError::StaleInode,
             libc::EOPNOTSUPP => CoreError::Unsupported,
+            libc::EINVAL => CoreError::BadFormat,
+            libc::EIO => CoreError::Poisoned,
             _ => CoreError::Io(io::Error::from_raw_os_error(errno)),
         }
     }
@@ -58,7 +64,9 @@ pub fn core_err_to_errno(err: &CoreError) -> i32 {
     match err {
         CoreError::Io(ioe) => ioe.raw_os_error().unwrap_or(libc::EIO),
         CoreError::NameTooLong => libc::ENAMETOOLONG,
-        CoreError::ReservedPrefix | CoreError::InternalMeta => libc::EINVAL,
+        CoreError::ReservedPrefix | CoreError::InternalMeta | CoreError::BadFormat => libc::EINVAL,
+        CoreError::LockConflict => libc::EBUSY,
+        CoreError::Poisoned => libc::EIO,
         CoreError::NotFound => libc::ENOENT,
         CoreError::AlreadyExists => libc::EEXIST,
         CoreError::NoSpace => libc::ENOSPC,

@@ -43,6 +43,11 @@ impl Config {
         self.backend_fd.as_fd()
     }
 
+    #[allow(dead_code)]
+    pub fn backend_path(&self) -> &PathBuf {
+        &self.backend_path
+    }
+
     pub fn sync_data(&self) -> bool {
         self.sync_data
     }

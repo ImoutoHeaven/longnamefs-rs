@@ -9,7 +9,10 @@ pub mod error;
 pub mod fs;
 pub mod index;
 pub mod inode_store;
+pub mod lock;
+pub mod object_id;
 pub mod path;
+pub mod txn;
 
 #[allow(unused_imports)]
 pub use fs::{IndexSync, LongNameFsCore, LongNameFsV2Fuser, PassthroughMetaFdConfig};

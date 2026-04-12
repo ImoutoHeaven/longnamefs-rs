@@ -4,6 +4,7 @@ use crate::v2::path::MAX_SEGMENT_ON_DISK;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::symlink;
 
 struct ProcfsTestGuard;
@@ -86,8 +87,12 @@ fn rename_overwrite_clears_replaced_inode_parent_mapping() {
             OsStr::new("a"),
             ROOT_INODE,
             OsStr::new("b"),
-            OsStr::new("/"),
-            replaced,
+            RenameBookkeepingSnapshot {
+                replaced_child: replaced,
+                replaced_backend: replaced.map(|snapshot| snapshot.backend),
+                renamed_backend: Some(a.backend),
+                renamed_backend_name: Some(b"b".to_vec()),
+            },
         )
         .unwrap()
         .expect("renamed inode should resolve");
@@ -178,11 +183,15 @@ fn rename_bookkeeping_ignores_stale_replaced_snapshot() {
             OsStr::new("a"),
             ROOT_INODE,
             OsStr::new("b"),
-            OsStr::new("/"),
-            Some(ReplacedChildSnapshot {
-                ino: c.ino,
-                backend: b.backend,
-            }),
+            RenameBookkeepingSnapshot {
+                replaced_child: Some(ReplacedChildSnapshot {
+                    ino: c.ino,
+                    backend: b.backend,
+                }),
+                replaced_backend: Some(b.backend),
+                renamed_backend: Some(a.backend),
+                renamed_backend_name: Some(b"b".to_vec()),
+            },
         )
         .unwrap()
         .expect("renamed inode should resolve");
@@ -234,8 +243,7 @@ fn post_mutation_bookkeeping_does_not_create_zero_lookup_inode() {
             OsStr::new("a"),
             ROOT_INODE,
             OsStr::new("b"),
-            OsStr::new("/"),
-            None,
+            RenameBookkeepingSnapshot::default(),
         )
         .unwrap();
     assert!(
@@ -304,6 +312,13 @@ fn rmdir_bookkeeping_miss_does_not_create_zero_lookup_inode() {
 
 #[test]
 fn map_segment_for_create_detects_existing_long_name() {
+    let tmp = TempDir::new();
+    let dir_fd = nix::fcntl::open(
+        tmp.path(),
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
     let state = DirState {
         index: Arc::new(RwLock::new(IndexState {
             index: DirIndex::new(),
@@ -318,16 +333,18 @@ fn map_segment_for_create_detects_existing_long_name() {
         attr_cache: HashMap::new(),
     };
     let raw = vec![b'x'; MAX_SEGMENT_ON_DISK + 8];
-    let first = map_segment_for_create(&state, &raw, raw.len() + 4).unwrap();
-    let backend_name = match first.0 {
-        BackendName::Internal(ref name) => name.clone(),
-        BackendName::Short(_) => panic!("expected internal backend name for long segment"),
-    };
-    {
-        let mut guard = state.index.write();
-        guard.index.upsert(backend_name.clone(), raw.clone());
-    }
-    let err = map_segment_for_create(&state, &raw, raw.len() + 4).unwrap_err();
+    let mut state = state;
+    let backend_name = format_long_object_name(1);
+    let backend_c = CString::new(backend_name.clone()).unwrap();
+    let _fd = nix::fcntl::openat(
+        dir_fd.as_fd(),
+        backend_c.as_c_str(),
+        OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .unwrap();
+    set_internal_rawname_at(dir_fd.as_fd(), backend_c.as_c_str(), &raw).unwrap();
+    let err = map_segment_for_create(dir_fd.as_fd(), &mut state, &raw, raw.len() + 4).unwrap_err();
     assert!(matches!(err, CoreError::AlreadyExists));
 }
 
@@ -435,9 +452,25 @@ fn probe_rawname_write_support_via_lxattr(
     }
 }
 
-fn expected_internal_backend_path(tmp: &TempDir, logical_name: &str) -> std::path::PathBuf {
-    let backend = backend_basename_from_hash(&encode_long_name(logical_name.as_bytes()), None);
-    tmp.path().join(backend)
+fn has_internal_backend_with_rawname(tmp: &TempDir, logical_name: &str) -> bool {
+    let dir_fd = nix::fcntl::open(
+        tmp.path(),
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    fs::read_dir(tmp.path()).unwrap().any(|entry| {
+        let entry = entry.unwrap();
+        let bytes = entry.file_name().as_os_str().as_bytes().to_vec();
+        if !crate::v2::object_id::is_stable_long_object_name(&bytes) {
+            return false;
+        }
+        let c_name = CString::new(bytes).unwrap();
+        matches!(
+            get_internal_rawname_at(dir_fd.as_fd(), c_name.as_c_str()),
+            Ok(raw) if raw == logical_name.as_bytes()
+        )
+    })
 }
 
 fn probe_symlink_rawname_support_independently() -> bool {
@@ -476,7 +509,6 @@ fn assert_rename_upgrade_outcome(
     result: CoreResult<DirInvalidation>,
 ) {
     let source_path = tmp.path().join(source_name);
-    let backend_path = expected_internal_backend_path(tmp, logical_name);
 
     if rawname_supported {
         assert!(
@@ -488,8 +520,8 @@ fn assert_rename_upgrade_outcome(
             "{kind} source should be gone after committed rename"
         );
         assert!(
-            fs::symlink_metadata(&backend_path).is_ok(),
-            "{kind} backend entry should be moved to the internal long-name target"
+            has_internal_backend_with_rawname(tmp, logical_name),
+            "{kind} backend entry should be committed under a stable internal long-name target"
         );
         return;
     }
@@ -507,7 +539,7 @@ fn assert_rename_upgrade_outcome(
         "{kind} source must remain in place when metadata write fails before commit"
     );
     assert!(
-        fs::symlink_metadata(&backend_path).is_err(),
+        !has_internal_backend_with_rawname(tmp, logical_name),
         "{kind} backend rename target must not exist when commit never happened"
     );
 }
@@ -638,9 +670,8 @@ fn rename_upgrade_backend_rename_failure_cleans_staged_source_rawname() {
     core.resolve_dir(OsStr::new("/")).unwrap();
 
     let long_name = "z".repeat(MAX_SEGMENT_ON_DISK + 8);
-    let hash = encode_long_name(long_name.as_bytes());
-    let occupied_base = backend_basename_from_hash(&hash, None);
-    let occupied_suffix = backend_basename_from_hash(&hash, Some(1));
+    let occupied_base = String::from_utf8_lossy(&format_long_object_name(1)).into_owned();
+    let occupied_suffix = String::from_utf8_lossy(&format_long_object_name(2)).into_owned();
 
     for (backend_name, rawname) in [
         (&occupied_base, format!("{long_name}-occupied-base")),
@@ -680,8 +711,7 @@ fn rename_upgrade_backend_rename_failure_cleans_staged_source_rawname() {
 }
 
 #[test]
-fn rename_long_to_long_refresh_failure_restores_source_name() {
-    let _serial = lock_test_hooks();
+fn rename_long_to_long_same_dir_preserves_backend_identity() {
     let tmp = TempDir::new();
     let fs = new_longname_test_fs(&tmp, false, false);
     let src = "s".repeat(MAX_SEGMENT_ON_DISK + 10);
@@ -689,49 +719,511 @@ fn rename_long_to_long_refresh_failure_restores_source_name() {
     let created = create_result(&fs, ROOT_INODE, OsStr::new(&src), 0o644, libc::O_RDWR).unwrap();
     release_result(&fs, created.ino, created.fh).unwrap();
 
-    fs.core.resolve_dir(OsStr::new("/")).unwrap();
-
-    let dst_hash = encode_long_name(dst.as_bytes());
-    let colliding_backend = backend_basename_from_hash(&dst_hash, None);
-    fs::write(tmp.path().join(&colliding_backend), b"collision").unwrap();
-
-    let result = rename_result(
+    rename_result(
         &fs,
         ROOT_INODE,
         OsStr::new(&src),
         ROOT_INODE,
         OsStr::new(&dst),
-        libc::RENAME_NOREPLACE,
-    );
-
-    let err = result.expect_err("rename should surface the refresh failure");
-    assert_eq!(err, libc::ENODATA);
+        0,
+    )
+    .unwrap();
     assert!(
-        lookup_entry_result(&fs, ROOT_INODE, OsStr::new(&src)).is_ok(),
-        "source name must be restored when refresh fails after src->tmp"
+        lookup_entry_result(&fs, ROOT_INODE, OsStr::new(&src)).is_err(),
+        "source name must disappear after committed same-dir rename"
     );
     assert!(
-        lookup_entry_result(&fs, ROOT_INODE, OsStr::new(&dst)).is_err(),
-        "destination name must not appear when refresh fails before final rename"
+        lookup_entry_result(&fs, ROOT_INODE, OsStr::new(&dst)).is_ok(),
+        "destination name must appear after committed same-dir rename"
     );
     let root_fd = fs.core.cached_root_fd().unwrap();
     let src_backend_c = CString::new(created.backend_name.clone()).unwrap();
     assert_eq!(
         get_internal_rawname_at(root_fd.as_fd(), src_backend_c.as_c_str()).unwrap(),
-        src.as_bytes(),
-        "source backend entry must keep its original rawname after rollback"
+        dst.as_bytes(),
+        "same-dir rename must update rawname on the existing stable backend entry"
+    );
+}
+
+#[test]
+fn rename_long_to_long_same_dir_rawname_write_failure_clears_txn_and_keeps_mount_usable() {
+    let _serial = lock_test_hooks();
+    let tmp = TempDir::new();
+    let fs = new_always_sync_fs(&tmp);
+    let src = long_name("same-dir-rawname-fail-src");
+    let dst = long_name("same-dir-rawname-fail-dst");
+    let followup = long_name("same-dir-rawname-fail-followup");
+    let created = create_result(&fs, ROOT_INODE, OsStr::new(&src), 0o644, libc::O_RDWR).unwrap();
+    let backend_path = tmp.path().join(OsStr::from_bytes(&created.backend_name));
+    release_result(&fs, created.ino, created.fh).unwrap();
+    crate::v2::txn::reset_test_rollback_inflight_txn_calls();
+
+    let err = {
+        let _hook = force_internal_rawname_errno(libc::EOPNOTSUPP);
+        rename_result(
+            &fs,
+            ROOT_INODE,
+            OsStr::new(&src),
+            ROOT_INODE,
+            OsStr::new(&dst),
+            0,
+        )
+        .unwrap_err()
+    };
+
+    assert_eq!(err, libc::EOPNOTSUPP);
+    assert_eq!(crate::v2::txn::test_rollback_inflight_txn_calls(), 0);
+    assert!(!tmp.path().join(".ln2_fs_txn").exists());
+    assert!(lookup_entry_result(&fs, ROOT_INODE, OsStr::new(&src)).is_ok());
+    assert_eq!(
+        lookup_entry_result(&fs, ROOT_INODE, OsStr::new(&dst)).unwrap_err(),
+        libc::ENOENT
+    );
+    assert_eq!(read_rawname_xattr(&backend_path), src.as_bytes());
+
+    let followup_created =
+        create_result(&fs, ROOT_INODE, OsStr::new(&followup), 0o644, libc::O_RDWR).unwrap();
+    release_result(&fs, followup_created.ino, followup_created.fh).unwrap();
+    assert!(lookup_entry_result(&fs, ROOT_INODE, OsStr::new(&followup)).is_ok());
+}
+
+#[test]
+fn long_to_long_cross_dir_uses_one_stable_backend_name() {
+    let tmp = TempDir::new();
+    let fs = new_always_sync_fs(&tmp);
+    let src_dir = mkdir_result(&fs, ROOT_INODE, OsStr::new("src"), 0o755).unwrap();
+    let dst_dir = mkdir_result(&fs, ROOT_INODE, OsStr::new("dst"), 0o755).unwrap();
+    let src = long_name("cross-dir-src");
+    let dst = long_name("cross-dir-dst");
+
+    let created = create_result(&fs, src_dir.ino, OsStr::new(&src), 0o644, libc::O_RDWR).unwrap();
+    let old_backend = created.backend_name.clone();
+    release_result(&fs, created.ino, created.fh).unwrap();
+
+    rename_result(
+        &fs,
+        src_dir.ino,
+        OsStr::new(&src),
+        dst_dir.ino,
+        OsStr::new(&dst),
+        0,
+    )
+    .unwrap();
+
+    let renamed = lookup_entry_result(&fs, dst_dir.ino, OsStr::new(&dst)).unwrap();
+    assert_eq!(
+        backend_name_for_ino_result(&fs, renamed.ino).unwrap(),
+        old_backend
+    );
+    assert!(lookup_entry_result(&fs, src_dir.ino, OsStr::new(&src)).is_err());
+}
+
+#[test]
+fn rename_long_to_long_cross_dir_rawname_write_failure_clears_txn_and_keeps_mount_usable() {
+    let _serial = lock_test_hooks();
+    let tmp = TempDir::new();
+    let fs = new_always_sync_fs(&tmp);
+    let src_dir = mkdir_result(&fs, ROOT_INODE, OsStr::new("rawname-src"), 0o755).unwrap();
+    let dst_dir = mkdir_result(&fs, ROOT_INODE, OsStr::new("rawname-dst"), 0o755).unwrap();
+    let src = long_name("cross-dir-rawname-fail-src");
+    let dst = long_name("cross-dir-rawname-fail-dst");
+    let followup = long_name("cross-dir-rawname-fail-followup");
+    let created = create_result(&fs, src_dir.ino, OsStr::new(&src), 0o644, libc::O_RDWR).unwrap();
+    let backend_path = tmp
+        .path()
+        .join("rawname-src")
+        .join(OsStr::from_bytes(&created.backend_name));
+    release_result(&fs, created.ino, created.fh).unwrap();
+    crate::v2::txn::reset_test_rollback_inflight_txn_calls();
+
+    let err = {
+        let _hook = force_internal_rawname_errno(libc::EOPNOTSUPP);
+        rename_result(
+            &fs,
+            src_dir.ino,
+            OsStr::new(&src),
+            dst_dir.ino,
+            OsStr::new(&dst),
+            0,
+        )
+        .unwrap_err()
+    };
+
+    assert_eq!(err, libc::EOPNOTSUPP);
+    assert_eq!(crate::v2::txn::test_rollback_inflight_txn_calls(), 0);
+    assert!(!tmp.path().join(".ln2_fs_txn").exists());
+    assert!(lookup_entry_result(&fs, src_dir.ino, OsStr::new(&src)).is_ok());
+    assert_eq!(
+        lookup_entry_result(&fs, dst_dir.ino, OsStr::new(&dst)).unwrap_err(),
+        libc::ENOENT
+    );
+    assert_eq!(read_rawname_xattr(&backend_path), src.as_bytes());
+
+    let followup_created =
+        create_result(&fs, dst_dir.ino, OsStr::new(&followup), 0o644, libc::O_RDWR).unwrap();
+    release_result(&fs, followup_created.ino, followup_created.fh).unwrap();
+    assert!(lookup_entry_result(&fs, dst_dir.ino, OsStr::new(&followup)).is_ok());
+}
+
+#[test]
+fn long_to_long_same_dir_does_not_create_hidden_midpoint_entry() {
+    let tmp = TempDir::new();
+    let fs = new_always_sync_fs(&tmp);
+    let src = long_name("same-dir-midpoint-src");
+    let dst = long_name("same-dir-midpoint-dst");
+    let created = create_result(&fs, ROOT_INODE, OsStr::new(&src), 0o644, libc::O_RDWR).unwrap();
+    release_result(&fs, created.ino, created.fh).unwrap();
+
+    rename_result(
+        &fs,
+        ROOT_INODE,
+        OsStr::new(&src),
+        ROOT_INODE,
+        OsStr::new(&dst),
+        0,
+    )
+    .unwrap();
+
+    assert!(
+        !fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .any(|name| name.as_os_str().as_bytes().starts_with(b".ln2_fs_rtmp_"))
+    );
+}
+
+#[test]
+fn long_to_long_cross_dir_does_not_create_hidden_midpoint_entry() {
+    let tmp = TempDir::new();
+    let fs = new_always_sync_fs(&tmp);
+    let src_dir = mkdir_result(&fs, ROOT_INODE, OsStr::new("src-mid"), 0o755).unwrap();
+    let dst_dir = mkdir_result(&fs, ROOT_INODE, OsStr::new("dst-mid"), 0o755).unwrap();
+    let src = long_name("cross-dir-midpoint-src");
+    let dst = long_name("cross-dir-midpoint-dst");
+    let created = create_result(&fs, src_dir.ino, OsStr::new(&src), 0o644, libc::O_RDWR).unwrap();
+    release_result(&fs, created.ino, created.fh).unwrap();
+
+    rename_result(
+        &fs,
+        src_dir.ino,
+        OsStr::new(&src),
+        dst_dir.ino,
+        OsStr::new(&dst),
+        0,
+    )
+    .unwrap();
+
+    for dir in [tmp.path().join("src-mid"), tmp.path().join("dst-mid")] {
+        assert!(
+            !fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .any(|name| name.as_os_str().as_bytes().starts_with(b".ln2_fs_rtmp_"))
+        );
+    }
+}
+
+#[test]
+fn long_involving_rename_rejects_distinct_destination_with_eexist() {
+    let tmp = TempDir::new();
+    let fs = new_always_sync_fs(&tmp);
+
+    fs::write(tmp.path().join("short-src"), b"a").unwrap();
+    let long_dst_1 = long_name("exists-long-1");
+    let created_1 = create_result(
+        &fs,
+        ROOT_INODE,
+        OsStr::new(&long_dst_1),
+        0o644,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    release_result(&fs, created_1.ino, created_1.fh).unwrap();
+    assert_eq!(
+        rename_result(
+            &fs,
+            ROOT_INODE,
+            OsStr::new("short-src"),
+            ROOT_INODE,
+            OsStr::new(&long_dst_1),
+            0
+        )
+        .unwrap_err(),
+        libc::EEXIST,
+    );
+
+    fs::write(tmp.path().join("short-dst"), b"b").unwrap();
+    let long_src_2 = long_name("exists-long-2");
+    let created_2 = create_result(
+        &fs,
+        ROOT_INODE,
+        OsStr::new(&long_src_2),
+        0o644,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    release_result(&fs, created_2.ino, created_2.fh).unwrap();
+    assert_eq!(
+        rename_result(
+            &fs,
+            ROOT_INODE,
+            OsStr::new(&long_src_2),
+            ROOT_INODE,
+            OsStr::new("short-dst"),
+            0
+        )
+        .unwrap_err(),
+        libc::EEXIST,
+    );
+
+    let long_src_3 = long_name("exists-long-3-src");
+    let long_dst_3 = long_name("exists-long-3-dst");
+    let created_3_src = create_result(
+        &fs,
+        ROOT_INODE,
+        OsStr::new(&long_src_3),
+        0o644,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    let created_3_dst = create_result(
+        &fs,
+        ROOT_INODE,
+        OsStr::new(&long_dst_3),
+        0o644,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    release_result(&fs, created_3_src.ino, created_3_src.fh).unwrap();
+    release_result(&fs, created_3_dst.ino, created_3_dst.fh).unwrap();
+    assert_eq!(
+        rename_result(
+            &fs,
+            ROOT_INODE,
+            OsStr::new(&long_src_3),
+            ROOT_INODE,
+            OsStr::new(&long_dst_3),
+            0
+        )
+        .unwrap_err(),
+        libc::EEXIST,
+    );
+
+    let src_dir = mkdir_result(&fs, ROOT_INODE, OsStr::new("src-eexist"), 0o755).unwrap();
+    let dst_dir = mkdir_result(&fs, ROOT_INODE, OsStr::new("dst-eexist"), 0o755).unwrap();
+    let long_src_4 = long_name("exists-long-4-src");
+    let long_dst_4 = long_name("exists-long-4-dst");
+    let created_4_src = create_result(
+        &fs,
+        src_dir.ino,
+        OsStr::new(&long_src_4),
+        0o644,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    let created_4_dst = create_result(
+        &fs,
+        dst_dir.ino,
+        OsStr::new(&long_dst_4),
+        0o644,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    release_result(&fs, created_4_src.ino, created_4_src.fh).unwrap();
+    release_result(&fs, created_4_dst.ino, created_4_dst.fh).unwrap();
+    assert_eq!(
+        rename_result(
+            &fs,
+            src_dir.ino,
+            OsStr::new(&long_src_4),
+            dst_dir.ino,
+            OsStr::new(&long_dst_4),
+            0
+        )
+        .unwrap_err(),
+        libc::EEXIST,
+    );
+}
+
+#[test]
+fn long_involving_rename_noreplace_does_not_require_renameat2() {
+    let tmp = TempDir::new();
+    fs::write(tmp.path().join("short-src"), b"a").unwrap();
+    let long_dst = "n".repeat(MAX_SEGMENT_ON_DISK + 8);
+    let collision = format_long_object_name(1);
+    fs::write(tmp.path().join(OsStr::from_bytes(&collision)), b"occupied").unwrap();
+
+    let mut core = new_longname_test_core(&tmp, false);
+    core.supports_renameat2 = false;
+
+    let root_fd = core.cached_root_fd().unwrap();
+    let collision_c = CString::new(collision).unwrap();
+    set_internal_rawname_at(root_fd.as_fd(), collision_c.as_c_str(), long_dst.as_bytes()).unwrap();
+
+    let err = core
+        .rename_with_flags(
+            OsStr::new("/"),
+            OsStr::new("short-src"),
+            OsStr::new("/"),
+            OsStr::new(&long_dst),
+            libc::RENAME_NOREPLACE,
+        )
+        .unwrap_err();
+
+    assert_eq!(core_err_to_errno(&err), libc::EEXIST);
+    assert!(tmp.path().join("short-src").exists());
+    assert!(!tmp.path().join(".ln2_fs_txn").exists());
+}
+
+#[test]
+fn long_hardlink_creation_is_rejected_with_eperm() {
+    let tmp = TempDir::new();
+    let fs = new_always_sync_fs(&tmp);
+    let name = long_name("hardlink-src");
+    let created = create_result(&fs, ROOT_INODE, OsStr::new(&name), 0o644, libc::O_RDWR).unwrap();
+    release_result(&fs, created.ino, created.fh).unwrap();
+
+    let err = link_result(&fs, created.ino, ROOT_INODE, OsStr::new("linked")).unwrap_err();
+    assert_eq!(err, libc::EPERM);
+}
+
+#[test]
+fn hardlink_long_destination_is_rejected_with_eperm() {
+    let tmp = TempDir::new();
+    fs::write(tmp.path().join("short-src"), b"payload").unwrap();
+    let fs = new_always_sync_fs(&tmp);
+    let src = lookup_entry_result(&fs, ROOT_INODE, OsStr::new("short-src")).unwrap();
+    let long_dst = long_name("hardlink-dst");
+
+    let err = link_result(&fs, src.ino, ROOT_INODE, OsStr::new(&long_dst)).unwrap_err();
+    assert_eq!(err, libc::EPERM);
+}
+
+#[test]
+fn short_to_long_rename_rejects_multiply_linked_non_directory() {
+    let tmp = TempDir::new();
+    fs::write(tmp.path().join("short-src"), b"payload").unwrap();
+    fs::hard_link(tmp.path().join("short-src"), tmp.path().join("short-peer")).unwrap();
+    let fs = new_always_sync_fs(&tmp);
+    let long_dst = long_name("linked-long-dst");
+
+    let err = rename_result(
+        &fs,
+        ROOT_INODE,
+        OsStr::new("short-src"),
+        ROOT_INODE,
+        OsStr::new(&long_dst),
+        0,
+    )
+    .unwrap_err();
+    assert_eq!(err, libc::EPERM);
+}
+
+#[test]
+fn short_rename_between_same_inode_hardlinks_is_noop_and_preserves_aliases() {
+    let tmp = TempDir::new();
+    fs::write(tmp.path().join("short-src"), b"payload").unwrap();
+    fs::hard_link(tmp.path().join("short-src"), tmp.path().join("short-dst")).unwrap();
+    let fs = new_always_sync_fs(&tmp);
+
+    let src = lookup_entry_result(&fs, ROOT_INODE, OsStr::new("short-src")).unwrap();
+    let dst = lookup_entry_result(&fs, ROOT_INODE, OsStr::new("short-dst")).unwrap();
+    assert_eq!(src.ino, dst.ino, "setup must point both names at one inode");
+
+    let renamed = rename_result(
+        &fs,
+        ROOT_INODE,
+        OsStr::new("short-src"),
+        ROOT_INODE,
+        OsStr::new("short-dst"),
+        0,
+    )
+    .unwrap();
+    assert!(renamed.used_callback_path);
+
+    let cached = inode_entry_result(&fs, src.ino).unwrap();
+    assert_eq!(cached.parent, ROOT_INODE);
+    assert!(
+        cached
+            .parents
+            .iter()
+            .any(|p| p.parent == ROOT_INODE && p.name == OsStr::new("short-src"))
     );
     assert!(
-        fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let name = CString::new(entry.file_name().as_os_str().as_bytes()).ok()?;
-                get_internal_rawname_at(root_fd.as_fd(), name.as_c_str()).ok()
-            })
-            .all(|raw| raw != dst.as_bytes()),
-        "failed rename must not strand a backend entry staged under the destination rawname"
+        cached
+            .parents
+            .iter()
+            .any(|p| p.parent == ROOT_INODE && p.name == OsStr::new("short-dst"))
     );
+
+    let src_after = lookup_entry_result(&fs, ROOT_INODE, OsStr::new("short-src")).unwrap();
+    let dst_after = lookup_entry_result(&fs, ROOT_INODE, OsStr::new("short-dst")).unwrap();
+    assert_eq!(src_after.ino, dst_after.ino);
+    assert_eq!(src_after.ino, src.ino);
+    assert!(
+        cached
+            .parents
+            .iter()
+            .any(|p| p.parent == ROOT_INODE && p.name == OsStr::new("short-src"))
+    );
+    assert!(
+        cached
+            .parents
+            .iter()
+            .any(|p| p.parent == ROOT_INODE && p.name == OsStr::new("short-dst"))
+    );
+    assert_eq!(fs::metadata(tmp.path().join("short-src")).unwrap().nlink(), 2);
+    assert_eq!(fs::metadata(tmp.path().join("short-dst")).unwrap().nlink(), 2);
+}
+
+#[test]
+fn short_rename_noreplace_between_same_inode_hardlinks_returns_eexist() {
+    let tmp = TempDir::new();
+    fs::write(tmp.path().join("short-src"), b"payload").unwrap();
+    fs::hard_link(tmp.path().join("short-src"), tmp.path().join("short-dst")).unwrap();
+    let core = new_test_core(&tmp, false);
+
+    if !core.supports_renameat2 {
+        return;
+    }
+
+    let err = core
+        .rename_with_flags(
+            OsStr::new("/"),
+            OsStr::new("short-src"),
+            OsStr::new("/"),
+            OsStr::new("short-dst"),
+            libc::RENAME_NOREPLACE,
+        )
+        .expect_err("same-inode noreplace rename must still report EEXIST");
+
+    assert_eq!(core_err_to_errno(&err), libc::EEXIST);
+    assert!(tmp.path().join("short-src").exists());
+    assert!(tmp.path().join("short-dst").exists());
+}
+
+#[test]
+fn short_rename_noreplace_same_inode_without_renameat2_fails_closed() {
+    let tmp = TempDir::new();
+    fs::write(tmp.path().join("short-src"), b"payload").unwrap();
+    fs::hard_link(tmp.path().join("short-src"), tmp.path().join("short-dst")).unwrap();
+    let mut core = new_test_core(&tmp, false);
+    core.supports_renameat2 = false;
+
+    let err = core
+        .rename_with_flags(
+            OsStr::new("/"),
+            OsStr::new("short-src"),
+            OsStr::new("/"),
+            OsStr::new("short-dst"),
+            libc::RENAME_NOREPLACE,
+        )
+        .expect_err("same-inode noreplace rename must fail closed without renameat2");
+
+    assert_eq!(core_err_to_errno(&err), libc::EOPNOTSUPP);
+    assert!(tmp.path().join("short-src").exists());
+    assert!(tmp.path().join("short-dst").exists());
+    assert!(!tmp.path().join(".ln2_fs_txn").exists());
 }
 
 #[test]
@@ -761,11 +1253,8 @@ fn set_internal_rawname_at_preserves_symlink_errno_when_procfs_is_unavailable() 
 fn rename_noreplace_without_renameat2_returns_eopnotsupp_before_mutation() {
     let tmp = TempDir::new();
     fs::write(tmp.path().join("a"), b"a").unwrap();
-    let core = new_test_core(&tmp, false);
-
-    if core.supports_renameat2 {
-        return;
-    }
+    let mut core = new_test_core(&tmp, false);
+    core.supports_renameat2 = false;
 
     let result = core.rename_with_flags(
         OsStr::new("/"),

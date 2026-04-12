@@ -1,8 +1,10 @@
 use super::*;
+use crate::v2::txn::{TxnRecord, write_txn_record};
 use std::fs;
 use std::io::Write;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +32,325 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn backend_root_fd(backend_root: &Path) -> OwnedFd {
+    nix::fcntl::open(
+        backend_root,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap()
+}
+
+fn segment_vecs(segments: &[&[u8]]) -> Vec<Vec<u8>> {
+    segments.iter().map(|segment| segment.to_vec()).collect()
+}
+
+pub(super) fn set_rawname_xattr(path: &Path, raw: &[u8]) {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new("user.ln2.rawname").unwrap();
+    let rc = unsafe {
+        libc::lsetxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            raw.as_ptr() as *const libc::c_void,
+            raw.len(),
+            0,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "lsetxattr failed: {:?}",
+        std::io::Error::last_os_error()
+    );
+}
+
+pub(super) fn read_rawname_xattr(path: &Path) -> Vec<u8> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new("user.ln2.rawname").unwrap();
+    let size =
+        unsafe { libc::lgetxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+    assert!(
+        size >= 0,
+        "lgetxattr size failed: {:?}",
+        std::io::Error::last_os_error()
+    );
+    let mut buf = vec![0u8; size as usize];
+    let got = unsafe {
+        libc::lgetxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    assert!(
+        got >= 0,
+        "lgetxattr read failed: {:?}",
+        std::io::Error::last_os_error()
+    );
+    buf.truncate(got as usize);
+    buf
+}
+
+pub(super) fn maybe_read_rawname_xattr(path: &Path) -> Option<Vec<u8>> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new("user.ln2.rawname").unwrap();
+    let size =
+        unsafe { libc::lgetxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENODATA) => return None,
+            _ => panic!("lgetxattr size failed: {err:?}"),
+        }
+    }
+
+    let mut buf = vec![0u8; size as usize];
+    let got = unsafe {
+        libc::lgetxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    assert!(
+        got >= 0,
+        "lgetxattr read failed: {:?}",
+        std::io::Error::last_os_error()
+    );
+    buf.truncate(got as usize);
+    Some(buf)
+}
+
+pub(super) fn new_always_sync_fs(backend: &TempDir) -> LongNameFsV2Fuser {
+    let config = Config::open_backend(backend.path().clone(), false, false).unwrap();
+    LongNameFsV2Fuser::new(
+        config,
+        1024,
+        Some(Duration::from_secs(60)),
+        1024,
+        IndexSync::Always,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        false,
+        false,
+        PassthroughMetaFdConfig::disabled(),
+    )
+    .unwrap()
+}
+
+pub(super) fn long_name(seed: &str) -> String {
+    format!(
+        "{seed}-{}",
+        "x".repeat(crate::v2::path::MAX_SEGMENT_ON_DISK + 8)
+    )
+}
+
+pub(super) fn write_same_dir_long_rename_txn(
+    backend_root: &Path,
+    backend_name: &[u8],
+    old_raw: &[u8],
+    new_raw: &[u8],
+    parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let record = TxnRecord::rename_long_to_long_same_dir(
+        segment_vecs(parent_segments),
+        backend_name.to_vec(),
+        old_raw.to_vec(),
+        new_raw.to_vec(),
+        libc::S_IFREG,
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_create_long_txn(
+    backend_root: &Path,
+    backend_name: &[u8],
+    rawname: &[u8],
+    parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let object_id = crate::v2::object_id::parse_long_object_id(backend_name).unwrap();
+    let record = TxnRecord::create_long(
+        object_id,
+        backend_name.to_vec(),
+        segment_vecs(parent_segments),
+        rawname.to_vec(),
+        b".ln2_fs_ctmp_seeded_create_long".to_vec(),
+        libc::S_IFREG,
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_create_short_txn(
+    backend_root: &Path,
+    backend_name: &[u8],
+    parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let record = TxnRecord::create_short(
+        segment_vecs(parent_segments),
+        backend_name.to_vec(),
+        libc::S_IFREG,
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_link_short_txn(
+    backend_root: &Path,
+    old_backend_name: &[u8],
+    new_backend_name: &[u8],
+    old_parent_segments: &[&[u8]],
+    new_parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let record = TxnRecord::link_short(
+        segment_vecs(old_parent_segments),
+        segment_vecs(new_parent_segments),
+        old_backend_name.to_vec(),
+        new_backend_name.to_vec(),
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_short_to_short_txn(
+    backend_root: &Path,
+    old_backend_name: &[u8],
+    new_backend_name: &[u8],
+    old_parent_segments: &[&[u8]],
+    new_parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let record = TxnRecord::rename_short_to_short(
+        segment_vecs(old_parent_segments),
+        segment_vecs(new_parent_segments),
+        old_backend_name.to_vec(),
+        new_backend_name.to_vec(),
+        None,
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_short_to_long_txn(
+    backend_root: &Path,
+    old_backend_name: &[u8],
+    new_backend_name: &[u8],
+    new_rawname: &[u8],
+    old_parent_segments: &[&[u8]],
+    new_parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let object_id = crate::v2::object_id::parse_long_object_id(new_backend_name).unwrap();
+    let record = TxnRecord::rename_short_to_long(
+        object_id,
+        segment_vecs(old_parent_segments),
+        segment_vecs(new_parent_segments),
+        old_backend_name.to_vec(),
+        new_backend_name.to_vec(),
+        new_rawname.to_vec(),
+        libc::S_IFREG,
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_long_to_short_txn(
+    backend_root: &Path,
+    stable_backend_name: &[u8],
+    old_rawname: &[u8],
+    new_backend_name: &[u8],
+    old_parent_segments: &[&[u8]],
+    new_parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let record = TxnRecord::rename_long_to_short(
+        segment_vecs(old_parent_segments),
+        segment_vecs(new_parent_segments),
+        stable_backend_name.to_vec(),
+        old_rawname.to_vec(),
+        new_backend_name.to_vec(),
+        libc::S_IFREG,
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_cross_dir_long_rename_txn(
+    backend_root: &Path,
+    backend_name: &[u8],
+    old_raw: &[u8],
+    new_raw: &[u8],
+    old_parent_segments: &[&[u8]],
+    new_parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let record = TxnRecord::rename_long_to_long_cross_dir(
+        segment_vecs(old_parent_segments),
+        segment_vecs(new_parent_segments),
+        backend_name.to_vec(),
+        old_raw.to_vec(),
+        new_raw.to_vec(),
+        libc::S_IFREG,
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_unlink_long_txn(
+    backend_root: &Path,
+    stable_backend_name: &[u8],
+    quarantine_backend_name: &[u8],
+    rawname: &[u8],
+    parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let record = TxnRecord::unlink_long(
+        segment_vecs(parent_segments),
+        stable_backend_name.to_vec(),
+        quarantine_backend_name.to_vec(),
+        rawname.to_vec(),
+        libc::S_IFREG,
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_unlink_short_txn(
+    backend_root: &Path,
+    backend_name: &[u8],
+    quarantine_backend_name: &[u8],
+    parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let record = TxnRecord::unlink_short(
+        segment_vecs(parent_segments),
+        backend_name.to_vec(),
+        quarantine_backend_name.to_vec(),
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn write_remove_dir_txn(
+    backend_root: &Path,
+    old_backend_name: &[u8],
+    quarantine_backend_name: &[u8],
+    parent_segments: &[&[u8]],
+) {
+    let root_fd = backend_root_fd(backend_root);
+    let record = TxnRecord::remove_dir(
+        segment_vecs(parent_segments),
+        old_backend_name.to_vec(),
+        quarantine_backend_name.to_vec(),
+    );
+    write_txn_record(root_fd.as_fd(), &record).unwrap();
+}
+
+pub(super) fn backend_name_for_ino_result(
+    fs: &LongNameFsV2Fuser,
+    ino: u64,
+) -> Result<Vec<u8>, i32> {
+    fs.test_backend_name_for_ino(ino)
 }
 
 pub(super) fn opath_rawname_ebadf(dir_fd: BorrowedFd<'_>, name: &CStr) -> bool {
@@ -96,6 +417,21 @@ where
         libc::close(read_fd);
         (result, buf)
     }
+}
+
+pub(super) fn run_current_test_with_env_and_capture_stderr(
+    test_name: &str,
+    env_key: &str,
+    env_value: &OsStr,
+) -> Output {
+    let current_exe = std::env::current_exe().expect("current test binary path should exist");
+    Command::new(current_exe)
+        .arg(test_name)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(env_key, env_value)
+        .output()
+        .expect("child test process should start")
 }
 
 pub(super) struct TestNotifierRecorder {
@@ -183,12 +519,36 @@ pub(super) fn force_fsync_errno(errno: i32) -> TestErrnoHookGuard {
     install_test_errno_hook(set_test_force_fsync_errno, errno)
 }
 
+pub(super) fn force_parent_dir_fsync_errno(errno: i32) -> TestErrnoHookGuard {
+    install_test_errno_hook(set_test_force_parent_dir_fsync_errno, errno)
+}
+
 pub(super) fn force_fdatasync_errno(errno: i32) -> TestErrnoHookGuard {
     install_test_errno_hook(set_test_force_fdatasync_errno, errno)
 }
 
 pub(super) fn force_internal_rawname_errno(errno: i32) -> TestErrnoHookGuard {
     install_test_errno_hook(set_test_force_internal_rawname_errno, errno)
+}
+
+pub(super) fn force_rename_bookkeeping_errno(errno: i32) -> TestErrnoHookGuard {
+    install_test_errno_hook(set_test_force_rename_bookkeeping_errno, errno)
+}
+
+pub(super) fn force_post_clear_delete_errno(errno: i32) -> TestErrnoHookGuard {
+    install_test_errno_hook(set_test_force_post_clear_delete_errno, errno)
+}
+
+pub(super) fn force_txn_write_errno(errno: i32) -> TestErrnoHookGuard {
+    install_test_errno_hook(set_test_force_txn_write_errno, errno)
+}
+
+pub(super) fn force_txn_clear_errno(errno: i32) -> TestErrnoHookGuard {
+    install_test_errno_hook(set_test_force_txn_clear_errno, errno)
+}
+
+pub(super) fn force_txn_recovery_errno(errno: i32) -> TestErrnoHookGuard {
+    install_test_errno_hook(set_test_force_txn_recovery_errno, errno)
 }
 
 pub(super) fn force_list_iter_skip_errno(errno: i32) -> TestErrnoHookGuard {
@@ -221,11 +581,108 @@ impl Drop for TestPostCommitFlushPauseGuard {
     }
 }
 
-pub(super) fn pause_next_post_commit_flush() -> TestPostCommitFlushPauseGuard {
+pub(super) fn pause_next_post_commit_flush(
+    fs: &LongNameFsV2Fuser,
+) -> TestPostCommitFlushPauseGuard {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    super::install_test_pause_post_commit_flush(ready_tx, release_rx);
+    let target = fs.test_root_dir_cache_key();
+    super::install_test_pause_post_commit_flush(target, ready_tx, release_rx);
     TestPostCommitFlushPauseGuard {
+        ready_rx,
+        release_tx: Some(release_tx),
+    }
+}
+
+pub(super) struct TestTxnBeforeClearPauseGuard {
+    ready_rx: mpsc::Receiver<()>,
+    release_tx: Option<mpsc::Sender<()>>,
+}
+
+impl TestTxnBeforeClearPauseGuard {
+    pub(super) fn wait_until_blocked(&self) {
+        self.ready_rx
+            .recv()
+            .expect("txn clear pause hook should report when clear is blocked");
+    }
+
+    pub(super) fn wait_until_blocked_timeout(&self, timeout: Duration) -> bool {
+        match self.ready_rx.recv_timeout(timeout) {
+            Ok(()) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("txn clear pause hook disconnected before reporting readiness")
+            }
+        }
+    }
+
+    pub(super) fn release(&mut self) {
+        if let Some(tx) = self.release_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for TestTxnBeforeClearPauseGuard {
+    fn drop(&mut self) {
+        super::clear_test_pause_next_txn_before_clear();
+        self.release();
+    }
+}
+
+pub(super) fn pause_next_txn_before_clear(fs: &LongNameFsV2Fuser) -> TestTxnBeforeClearPauseGuard {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    super::install_test_pause_next_txn_before_clear(fs, ready_tx, release_rx);
+    TestTxnBeforeClearPauseGuard {
+        ready_rx,
+        release_tx: Some(release_tx),
+    }
+}
+
+pub(super) struct TestRenamePostCommitPauseGuard {
+    ready_rx: mpsc::Receiver<()>,
+    release_tx: Option<mpsc::Sender<()>>,
+}
+
+impl TestRenamePostCommitPauseGuard {
+    pub(super) fn wait_until_blocked(&self) {
+        self.ready_rx
+            .recv()
+            .expect("rename post-commit pause hook should report when bookkeeping is blocked");
+    }
+
+    pub(super) fn wait_until_blocked_timeout(&self, timeout: Duration) -> bool {
+        match self.ready_rx.recv_timeout(timeout) {
+            Ok(()) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("rename post-commit pause hook disconnected before reporting readiness")
+            }
+        }
+    }
+
+    pub(super) fn release(&mut self) {
+        if let Some(tx) = self.release_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for TestRenamePostCommitPauseGuard {
+    fn drop(&mut self) {
+        super::clear_test_pause_next_rename_post_commit();
+        self.release();
+    }
+}
+
+pub(super) fn pause_next_rename_post_commit(
+    fs: &LongNameFsV2Fuser,
+) -> TestRenamePostCommitPauseGuard {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    super::install_test_pause_next_rename_post_commit(fs, ready_tx, release_rx);
+    TestRenamePostCommitPauseGuard {
         ready_rx,
         release_tx: Some(release_tx),
     }
@@ -254,12 +711,36 @@ pub(super) fn set_test_force_fsync_errno(errno: Option<i32>) {
     super::set_test_force_fsync_errno(errno);
 }
 
+pub(super) fn set_test_force_parent_dir_fsync_errno(errno: Option<i32>) {
+    super::set_test_force_parent_dir_fsync_errno(errno);
+}
+
 pub(super) fn set_test_force_fdatasync_errno(errno: Option<i32>) {
     super::set_test_force_fdatasync_errno(errno);
 }
 
 pub(super) fn set_test_force_internal_rawname_errno(errno: Option<i32>) {
     super::set_test_force_internal_rawname_errno(errno);
+}
+
+pub(super) fn set_test_force_rename_bookkeeping_errno(errno: Option<i32>) {
+    super::set_test_force_rename_bookkeeping_errno_for_tests(errno);
+}
+
+pub(super) fn set_test_force_post_clear_delete_errno(errno: Option<i32>) {
+    super::set_test_force_post_clear_delete_errno(errno);
+}
+
+pub(super) fn set_test_force_txn_write_errno(errno: Option<i32>) {
+    super::set_test_force_txn_write_errno(errno);
+}
+
+pub(super) fn set_test_force_txn_clear_errno(errno: Option<i32>) {
+    super::set_test_force_txn_clear_errno(errno);
+}
+
+pub(super) fn set_test_force_txn_recovery_errno(errno: Option<i32>) {
+    super::set_test_force_txn_recovery_errno(errno);
 }
 
 pub(super) fn set_test_force_list_iter_skip_errno(errno: Option<i32>) {
@@ -334,6 +815,15 @@ pub(super) fn unlink_result(
     name: &OsStr,
 ) -> Result<TestEmptySuccess, i32> {
     fs.test_unlink(parent, name)
+}
+
+pub(super) fn link_result(
+    fs: &LongNameFsV2Fuser,
+    ino: u64,
+    newparent: u64,
+    newname: &OsStr,
+) -> Result<TestEntrySuccess, i32> {
+    fs.test_link(ino, newparent, newname)
 }
 
 pub(super) fn rmdir_result(fs: &LongNameFsV2Fuser, parent: u64, name: &OsStr) -> Result<(), i32> {
@@ -476,6 +966,14 @@ pub(super) fn lookup_entry_result(
 ) -> Result<InodeEntry, i32> {
     fs.test_lookup_entry(parent, name)
         .map_err(|err| core_err_to_errno(&err))
+}
+
+pub(super) fn inode_entry_result(fs: &LongNameFsV2Fuser, ino: u64) -> Result<InodeEntry, i32> {
+    fs.test_inode_entry(ino)
+}
+
+pub(super) fn hold_dir_read_guard(fs: &LongNameFsV2Fuser, ino: u64) -> Result<impl Drop, i32> {
+    fs.test_hold_dir_read_guard(ino)
 }
 
 #[cfg(feature = "abi-7-40")]

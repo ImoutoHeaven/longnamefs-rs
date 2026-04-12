@@ -169,6 +169,48 @@ impl InodeStore {
         Ok(path)
     }
 
+    pub fn get_backend_path_segments(&self, ino: InodeId) -> CoreResult<Vec<Vec<u8>>> {
+        if ino == ROOT_INODE {
+            return Ok(Vec::new());
+        }
+
+        {
+            let shard = self.shard(ino).read();
+            if let Some(entry) = shard.entries.get(&ino)
+                && entry.parent == ROOT_INODE
+                && entry.name.is_empty()
+                && entry.parents.is_empty()
+            {
+                return Err(CoreError::StaleInode);
+            }
+        }
+
+        let mut components = Vec::new();
+        let mut current_ino = ino;
+        let mut depth = 0usize;
+        const MAX_DEPTH: usize = 256;
+
+        while current_ino != ROOT_INODE {
+            if depth >= MAX_DEPTH {
+                return Err(CoreError::InternalMeta);
+            }
+            let shard = self.shard(current_ino).read();
+            let entry = shard.entries.get(&current_ino).ok_or(CoreError::NotFound)?;
+            if entry.backend_name.is_empty() {
+                return Err(CoreError::InternalMeta);
+            }
+            components.push(entry.backend_name.clone());
+            if entry.parent == current_ino {
+                return Err(CoreError::InternalMeta);
+            }
+            current_ino = entry.parent;
+            depth += 1;
+        }
+
+        components.reverse();
+        Ok(components)
+    }
+
     pub fn move_entry(&self, ino: InodeId, new_parent: ParentName) -> CoreResult<InodeEntry> {
         let mut shard = self.shard(ino).write();
         let entry = shard.entries.get_mut(&ino).ok_or(CoreError::NotFound)?;
